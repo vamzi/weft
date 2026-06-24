@@ -15,7 +15,7 @@ weft-datasource = { workspace = true }
 # Phase 0 backend. The whole workspace shares this one `arrow` (re-exported below) so
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.
 # Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
-datafusion = "43"
+datafusion = "54"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -22,6 +22,11 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+/// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
+const MAX_MSG: usize = 256 * 1024 * 1024;
+/// Rows per Arrow result chunk, so a single gRPC message never carries an oversized batch.
+const CHUNK_ROWS: usize = 8192;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -99,21 +104,30 @@ impl SparkConnectService for WeftService {
 
         let batches = self.engine.sql(&sql).await.map_err(err_to_status)?;
 
-        let mut responses = Vec::with_capacity(batches.len() + 1);
+        let mut responses = Vec::new();
         for batch in &batches {
-            let data = encode_ipc_stream(batch)
-                .map_err(|e| Status::internal(format!("arrow ipc encode: {e}")))?;
-            responses.push(self.response(
-                &session_id,
-                &operation_id,
-                sc::execute_plan_response::ResponseType::ArrowBatch(
-                    sc::execute_plan_response::ArrowBatch {
-                        row_count: batch.num_rows() as i64,
-                        data,
-                        ..Default::default()
-                    },
-                ),
-            ));
+            // Slice wide results into row-chunks so no single gRPC message is oversized
+            // (Spark Connect's ArrowBatch chunking model).
+            let n = batch.num_rows();
+            let mut off = 0;
+            while off < n {
+                let len = (n - off).min(CHUNK_ROWS);
+                let slice = batch.slice(off, len);
+                let data = encode_ipc_stream(&slice)
+                    .map_err(|e| Status::internal(format!("arrow ipc encode: {e}")))?;
+                responses.push(self.response(
+                    &session_id,
+                    &operation_id,
+                    sc::execute_plan_response::ResponseType::ArrowBatch(
+                        sc::execute_plan_response::ArrowBatch {
+                            row_count: len as i64,
+                            data,
+                            ..Default::default()
+                        },
+                    ),
+                ));
+                off += len;
+            }
         }
         // Terminal marker — reattachable execution (PySpark 3.5+) expects it.
         responses.push(self.response(
@@ -301,7 +315,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.port)
         .parse()
         .map_err(|e| Error::Io(format!("bad listen addr: {e}")))?;
-    let service = SparkConnectServiceServer::new(WeftService::new());
+    let service = SparkConnectServiceServer::new(WeftService::new())
+        .max_decoding_message_size(MAX_MSG)
+        .max_encoding_message_size(MAX_MSG);
     tonic::transport::Server::builder()
         .add_service(service)
         .serve(addr)

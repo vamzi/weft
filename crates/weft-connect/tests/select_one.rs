@@ -24,7 +24,7 @@ async fn select_one_over_grpc_returns_1() {
     for _ in 0..50 {
         match SparkConnectServiceClient::connect(endpoint.clone()).await {
             Ok(c) => {
-                client = Some(c);
+                client = Some(c.max_decoding_message_size(256 * 1024 * 1024));
                 break;
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,

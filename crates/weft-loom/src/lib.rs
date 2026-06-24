@@ -40,20 +40,31 @@ impl Engine {
     /// process) — important when running ClickBench on a memory-constrained box. Unset
     /// (the default) keeps the unbounded pool, so local/test behavior is unchanged.
     pub fn new() -> Self {
+        use datafusion::prelude::SessionConfig;
+
+        let mut config = SessionConfig::new();
+        if let Some(p) = std::env::var("WEFT_TARGET_PARTITIONS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            config = config.with_target_partitions(p);
+        }
+
         let ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
         {
             Some(bytes) => {
                 use datafusion::execution::memory_pool::FairSpillPool;
-                use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-                use datafusion::prelude::SessionConfig;
+                use datafusion::execution::runtime_env::RuntimeEnvBuilder;
                 use std::sync::Arc;
-                let rt = RuntimeConfig::new().with_memory_pool(Arc::new(FairSpillPool::new(bytes)));
-                let env = RuntimeEnv::try_new(rt).expect("runtime env");
-                SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(env))
+                let env = RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::new(FairSpillPool::new(bytes)))
+                    .build_arc()
+                    .expect("runtime env");
+                SessionContext::new_with_config_rt(config, env)
             }
-            None => SessionContext::new(),
+            None => SessionContext::new_with_config(config),
         };
         Self { ctx }
     }
