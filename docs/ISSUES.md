@@ -72,14 +72,17 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   server, runs `SELECT 1` over gRPC, decodes Arrow, asserts `1`). **The full 43-query
   ClickBench suite also runs over this live server** via `weft-bench clickbench-grpc`
   (`CREATE EXTERNAL TABLE` + queries -> Parquet scan -> Arrow IPC, **43/43**).
-  **PySpark parity (DONE):** the `SqlCommand.input` path is handled (`spark.sql(...)` — a query
-  returns a lazy `SqlCommandResult` relation handle, a DDL/DML command runs eagerly and returns a
-  `LocalRelation`; `LocalRelation` execution is wired for the `.show()` step), and
-  `AnalyzePlan(Schema)` returns the result schema with Arrow→Spark `DataType` conversion
-  (`weft-connect::types`). Covered by `crates/weft-connect/tests/pyspark_parity.rs` (3 tests).
-  **Still open:** real `Config` get/set and reattach buffering. Validated with a Rust gRPC client
-  shaping the exact PySpark-4.x request messages (not stock PySpark — avoids the local Python 3.14
-  / pyarrow wheel risk).
+  **PySpark parity (DONE — validated against stock PySpark):** stock `pyspark-connect 4.0` on
+  Python 3.11 drives the server end-to-end — `spark.sql(...).{collect,toPandas,show}()`, DDL
+  (create + collect), GROUP BY/AVG, filters, `range()`. Implemented: `SqlCommand.input`
+  (`spark.sql` — query → lazy `SqlCommandResult` relation handle; DDL/DML → eager exec +
+  `LocalRelation`), `LocalRelation` execution, the `ShowString` relation (`.show()` formats a box
+  table), `AnalyzePlan(Schema)` with Arrow→Spark `DataType` conversion (`weft-connect::types`),
+  real `Config` get/set (a session store seeded with `spark.sql.session.timeZone=UTC`), and a
+  zero-row/zero-column result always emitting a schema-carrying `ArrowBatch` (so `collect()`'s
+  `assert table is not None` holds). Covered by `crates/weft-connect/tests/pyspark_parity.rs`
+  (6 tests). **Still open:** reattach buffering, and the DataFrame-API relation surface
+  (`Filter`/`Aggregate`/`Join`/… nodes — today only SQL/LocalRelation/ShowString are handled).
 - **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
   Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
   counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI
