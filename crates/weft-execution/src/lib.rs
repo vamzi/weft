@@ -7,6 +7,8 @@
 //! divergence lane — Sail's cluster mode is new (Feb 2026) and its ClickBench is
 //! single-process-per-query.
 
+pub mod flight;
+
 use weft_common::Result;
 
 /// Execution mode for a query.
