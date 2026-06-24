@@ -26,6 +26,26 @@ use arrow::record_batch::RecordBatch;
 /// Backend identifier reported in `EXPLAIN`.
 pub const NAME: &str = "loom";
 
+/// Parse a `usize` tuning knob from the environment (absent / unparseable → `None`).
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|s| s.parse().ok())
+}
+
+/// Parse a boolean tuning knob from the environment. Accepts `1/0`, `true/false`, `on/off`
+/// (case-insensitive); absent / unrecognized → `None`.
+fn env_bool(key: &str) -> Option<bool> {
+    match std::env::var(key)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -39,15 +59,23 @@ impl Engine {
     /// that size (DataFusion spills aggregations/sorts to disk instead of OOM-killing the
     /// process) — important when running ClickBench on a memory-constrained box. Unset
     /// (the default) keeps the unbounded pool, so local/test behavior is unchanged.
+    ///
+    /// Phase 1.4 margin-push knobs, each applied only when its env var is set (so the default
+    /// behavior is unchanged and the values can be swept on a benchmark box without a rebuild):
+    /// - `WEFT_TARGET_PARTITIONS` (usize) — scan/aggregation parallelism (default = vCPUs).
+    /// - `WEFT_BATCH_SIZE` (usize) — vectorized batch size (default 8192).
+    /// - `WEFT_COALESCE_BATCHES` (bool) — coalesce small batches after filtering.
+    /// - `WEFT_REPARTITION_AGGREGATIONS` (bool) — repartition before aggregation for parallelism
+    ///   (the lever most likely to move the high-card `GROUP BY` queries Q32–Q34).
     pub fn new() -> Self {
         use datafusion::prelude::SessionConfig;
 
         let mut config = SessionConfig::new();
-        if let Some(p) = std::env::var("WEFT_TARGET_PARTITIONS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
+        if let Some(p) = env_usize("WEFT_TARGET_PARTITIONS") {
             config = config.with_target_partitions(p);
+        }
+        if let Some(n) = env_usize("WEFT_BATCH_SIZE") {
+            config = config.with_batch_size(n);
         }
         // ClickBench-winning scan settings (mirrors DataFusion's published entry + what Sail
         // tunes): push filters into the Parquet decoder, reorder them by selectivity, read
@@ -59,6 +87,12 @@ impl Engine {
             opts.execution.parquet.reorder_filters = true;
             opts.execution.parquet.binary_as_string = true;
             opts.execution.parquet.schema_force_view_types = true;
+            if let Some(b) = env_bool("WEFT_COALESCE_BATCHES") {
+                opts.execution.coalesce_batches = b;
+            }
+            if let Some(b) = env_bool("WEFT_REPARTITION_AGGREGATIONS") {
+                opts.optimizer.repartition_aggregations = b;
+            }
         }
 
         let ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
@@ -93,6 +127,66 @@ impl Engine {
         df.collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Build the optimized DataFusion physical plan for `query`. The driver side of
+    /// distributed execution uses this to obtain a serializable plan to split into stages.
+    pub async fn physical_plan(
+        &self,
+        query: &str,
+    ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let df = self
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        df.create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Execute an already-built physical plan to record batches (the worker side of a stage).
+    pub async fn execute_plan(
+        &self,
+        plan: std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> Result<Vec<RecordBatch>> {
+        datafusion::physical_plan::collect(plan, self.ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Register an in-memory table of `batches` under `name` — the worker-side landing zone
+    /// for shuffle input, so a downstream stage can read it as an ordinary table.
+    pub fn register_batches(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        use datafusion::datasource::MemTable;
+        use std::sync::Arc;
+
+        let schema = match batches.first() {
+            Some(b) => b.schema(),
+            None => return Err(Error::Plan(format!("register `{name}`: no batches"))),
+        };
+        let table = MemTable::try_new(schema, vec![batches])
+            .map_err(|e| Error::Execution(format!("mem table `{name}`: {e}")))?;
+        self.ctx
+            .register_table(name, Arc::new(table))
+            .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
+        Ok(())
+    }
+
+    /// Snapshot of the session state, for building a `FunctionRegistry`/codec when
+    /// deserializing physical-plan fragments shipped from the driver.
+    pub fn session_state(&self) -> datafusion::execution::context::SessionState {
+        self.ctx.state()
+    }
+
+    /// Register a Parquet file or directory under `name` (a thin wrapper over DataFusion's
+    /// reader, so callers needn't depend on DataFusion's option types).
+    pub async fn register_parquet(&self, name: &str, path: &str) -> Result<()> {
+        use datafusion::prelude::ParquetReadOptions;
+        self.ctx
+            .register_parquet(name, path, ParquetReadOptions::default())
+            .await
+            .map_err(|e| Error::Execution(format!("register parquet `{name}`: {e}")))
     }
 
     /// Register a Delta Lake table directory under `name` — resolves active files from the
@@ -179,6 +273,36 @@ mod tests {
         let engine = Engine::new();
         let batches = engine.sql("SELECT 40 + 2 AS answer").await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn physical_plan_round_trips_through_execute() {
+        let engine = Engine::new();
+        let plan = engine.physical_plan("SELECT 1 AS x").await.unwrap();
+        let batches = engine.execute_plan(plan).await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_batches_is_queryable() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20, 30]))])
+                .unwrap();
+        let engine = Engine::new();
+        engine.register_batches("t", vec![batch]).unwrap();
+        let out = engine.sql("SELECT SUM(v) AS s FROM t").await.unwrap();
+        let s = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(s, 60);
     }
 
     #[tokio::test]

@@ -1446,6 +1446,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-proto"
+version = "54.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dd15a1ba5d3af93808241065c6c44dbca8296a189845e8a587c45c07bf0ffae"
+dependencies = [
+ "arrow",
+ "chrono",
+ "datafusion-catalog",
+ "datafusion-catalog-listing",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-datasource-arrow",
+ "datafusion-datasource-csv",
+ "datafusion-datasource-json",
+ "datafusion-datasource-parquet",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions-table",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-proto-common",
+ "object_store",
+ "prost 0.14.4",
+]
+
+[[package]]
+name = "datafusion-proto-common"
+version = "54.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90042982cf9462eb06a0b81f92efa4188dae871e7ea3ab8dc61aa9c9349b2530"
+dependencies = [
+ "arrow",
+ "datafusion-common",
+ "prost 0.14.4",
+]
+
+[[package]]
 name = "datafusion-pruning"
 version = "54.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3814,6 +3852,8 @@ dependencies = [
  "tokio",
  "weft-common",
  "weft-connect",
+ "weft-execution",
+ "weft-loom",
 ]
 
 [[package]]
@@ -3855,7 +3895,10 @@ name = "weft-execution"
 version = "0.0.0"
 dependencies = [
  "arrow-flight",
+ "datafusion",
+ "datafusion-proto",
  "futures",
+ "prost 0.14.4",
  "tokio",
  "tonic 0.14.6",
  "weft-common",
