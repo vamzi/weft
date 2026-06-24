@@ -40,6 +40,11 @@ tpch-coverage:
   stage: test
   script: ["cargo run -p weft-bench -- tpch"]
 
+# Correctness: gRPC/Arrow-IPC results must equal engine-direct (tie-tolerant) + ground-truth.
+correctness-check:
+  stage: test
+  script: ["cargo run -p weft-bench -- correctness --rows 5000"]
+
 # Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
 # (Enabled once weft-loom executes queries — Phase 0.)
 correctness:

@@ -12,6 +12,7 @@
 //!
 //! Usage: `cargo run -p weft-bench [--release] -- {clickbench|clickbench-grpc} [--rows N]`
 
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,11 +22,13 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::ArrowWriter;
 use sc::spark_connect_service_client::SparkConnectServiceClient;
 use tonic::transport::Channel;
 use weft_connect::{serve, ServerConfig};
+use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
@@ -413,6 +416,183 @@ async fn exec_sql_grpc(
     Ok(rows)
 }
 
+/// Flatten result batches into sorted `col0|col1|…` row strings for order-independent
+/// comparison (uses the same Arrow value formatter for every type).
+fn normalize(batches: &[RecordBatch]) -> Vec<String> {
+    let opts = FormatOptions::default();
+    let mut rows = Vec::new();
+    for b in batches {
+        let fmts: Vec<ArrayFormatter> = b
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c, &opts).expect("formatter"))
+            .collect();
+        for r in 0..b.num_rows() {
+            let cells: Vec<String> = fmts.iter().map(|f| f.value(r).to_string()).collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn row_count(b: &[RecordBatch]) -> usize {
+    b.iter().map(|x| x.num_rows()).sum()
+}
+
+/// Sorted values of the last column (the one `ORDER BY` typically ranks on).
+fn last_col_values(batches: &[RecordBatch]) -> Vec<String> {
+    let opts = FormatOptions::default();
+    let mut v = Vec::new();
+    for b in batches {
+        if b.num_columns() == 0 {
+            continue;
+        }
+        let fmt = ArrayFormatter::try_new(b.column(b.num_columns() - 1), &opts).expect("formatter");
+        for r in 0..b.num_rows() {
+            v.push(fmt.value(r).to_string());
+        }
+    }
+    v.sort();
+    v
+}
+
+/// Two results are equivalent if they're identical, OR (for `ORDER BY … LIMIT` queries with
+/// ties) they have the same row count and the same multiset of ranking values — tie
+/// membership among equal-valued rows is allowed to differ between the two scan paths.
+fn equivalent(e: &[RecordBatch], g: &[RecordBatch]) -> bool {
+    normalize(e) == normalize(g)
+        || (row_count(e) == row_count(g) && last_col_values(e) == last_col_values(g))
+}
+
+/// Run a query over gRPC and decode the Arrow IPC responses back into record batches.
+async fn exec_sql_grpc_batches(
+    client: &mut SparkConnectServiceClient<Channel>,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    let request = sc::ExecutePlanRequest {
+        session_id: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+        plan: Some(sc::Plan {
+            op_type: Some(sc::plan::OpType::Root(sc::Relation {
+                common: None,
+                rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                    query: sql.to_string(),
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    };
+    let mut stream = client
+        .execute_plan(request)
+        .await
+        .map_err(|e| e.message().to_string())?
+        .into_inner();
+    let mut out = Vec::new();
+    while let Some(msg) = stream
+        .message()
+        .await
+        .map_err(|e| e.message().to_string())?
+    {
+        if let Some(sc::execute_plan_response::ResponseType::ArrowBatch(b)) = msg.response_type {
+            if b.data.is_empty() {
+                continue;
+            }
+            let reader =
+                StreamReader::try_new(Cursor::new(b.data), None).map_err(|e| e.to_string())?;
+            for rb in reader {
+                out.push(rb.map_err(|e| e.to_string())?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Correctness mode: for every ClickBench query, assert the gRPC/Arrow-IPC result equals the
+/// engine-direct result (lossless transport), plus ground-truth anchors from the generator.
+async fn run_correctness(rows: usize) {
+    let rows = rows.min(10_000);
+    eprintln!("[correctness] synthetic `hits`: {rows} rows; engine-direct vs live gRPC …\n");
+    let (schema, batch) = build_batch(rows);
+
+    let engine = Engine::new();
+    let table = MemTable::try_new(schema, vec![vec![batch.clone()]]).expect("memtable");
+    engine
+        .ctx()
+        .register_table("hits", Arc::new(table))
+        .expect("register hits");
+
+    let dir = std::env::temp_dir().join("weft-bench");
+    std::fs::create_dir_all(&dir).ok();
+    let parquet = dir.join("hits_corr.parquet");
+    write_parquet(&parquet, &batch);
+    let parquet_abs = parquet.canonicalize().expect("canonicalize");
+    tokio::spawn(async move {
+        let _ = serve(ServerConfig { port: GRPC_PORT }).await;
+    });
+    let mut client = connect_retry(&format!("http://127.0.0.1:{GRPC_PORT}")).await;
+    exec_sql_grpc_batches(
+        &mut client,
+        &format!(
+            "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{}'",
+            parquet_abs.display()
+        ),
+    )
+    .await
+    .expect("create external table");
+
+    let queries = load_queries();
+    let (mut matched, mut mismatched, mut errored) = (0usize, Vec::new(), Vec::new());
+    for (idx, q) in queries.iter().enumerate() {
+        match (
+            engine.sql(q).await,
+            exec_sql_grpc_batches(&mut client, q).await,
+        ) {
+            (Ok(e), Ok(g)) if equivalent(&e, &g) => matched += 1,
+            (Ok(_), Ok(_)) => {
+                mismatched.push(idx);
+                eprintln!("Q{idx:<2} MISMATCH (engine != gRPC)");
+            }
+            (e, g) => {
+                errored.push(idx);
+                eprintln!("Q{idx:<2} ERROR e={:?} g={:?}", e.err(), g.err());
+            }
+        }
+    }
+
+    // Ground-truth anchors (computed from the deterministic generator).
+    let mut anchor_fail = 0;
+    let count = engine
+        .sql("SELECT COUNT(*) FROM hits")
+        .await
+        .expect("count");
+    if normalize(&count) != vec![rows.to_string()] {
+        anchor_fail += 1;
+        eprintln!("anchor COUNT(*) FAIL: {:?}", normalize(&count));
+    }
+    let dates = engine
+        .sql("SELECT MIN(\"EventDate\"), MAX(\"EventDate\") FROM hits")
+        .await
+        .expect("dates");
+    if normalize(&dates) != vec!["2013-07-01|2013-07-31".to_string()] {
+        anchor_fail += 1;
+        eprintln!("anchor EventDate range FAIL: {:?}", normalize(&dates));
+    }
+
+    eprintln!(
+        "\n=== correctness: {}/{} ClickBench queries match engine==gRPC; \
+         {} mismatched, {} errored; anchors: {} ===",
+        matched,
+        queries.len(),
+        mismatched.len(),
+        errored.len(),
+        if anchor_fail == 0 { "ok" } else { "FAIL" },
+    );
+    if !mismatched.is_empty() || !errored.is_empty() || anchor_fail > 0 {
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -426,6 +606,7 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows).await,
+        Some("correctness") => run_correctness(rows).await,
         Some("tpch") => tpch::run().await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}; try `clickbench` or `clickbench-grpc`");
