@@ -33,11 +33,23 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   (`delta_active_files` replays `_delta_log`; `iceberg_active_files` walks metadata.json →
   manifest-list → manifests via avro), then DataFusion 54's native reader. `Engine::register_
   delta`/`register_iceberg`, both tested. v1 limits: no DV / MoR deletes / partition pruning.
-- **1.4 — IN PROGRESS:** margin-push DataFusion knobs are now env-tunable in `Engine::new`
-  (`WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`, `WEFT_REPARTITION_AGGREGATIONS`, alongside the
-  existing `WEFT_TARGET_PARTITIONS`) so a sweep needs no rebuild. The sweep itself (Q32/Q33/Q34/Q28
-  on real c6a) is the remaining paid step; honest expectation is config plateaus near the DF54
-  ceiling, in which case the durable margin is the Phase 2 HVM2 path, not a native CPU operator.
+- **1.4 — config sweep DONE; conclusion: we're at the DataFusion 54 ceiling.** Knobs are
+  env-tunable in `Engine::new` (`WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`,
+  `WEFT_REPARTITION_AGGREGATIONS`, alongside `WEFT_TARGET_PARTITIONS`). Swept locally against the
+  synthetic ClickBench at 3 M rows (`scratchpad/local-sweep.sh`, 11 configs, hot=min(try2,try3)):
+  - **The defaults are optimal.** Baseline hot total 0.368 s. Lowering `target_partitions`
+    (tp4 +137%, tp8 +18%) or disabling `repartition_aggregations` (+83%) is sharply worse —
+    driven almost entirely by the high-card `GROUP BY` (Q32 `WatchID,ClientIP`): 0.029 s at default
+    vs **0.233 s at tp4 (8×)** and **0.198 s with repart-agg off (7×)**. The default parallelism is
+    exactly what that query needs.
+  - Only `batch_size` ≥ 32 K showed a win (~6% total, mostly the string/regex/scan queries
+    Q23/Q28) — too marginal and too synthetic-specific to hardcode (larger batches also raise
+    transient memory against the spill pool on the real 32 GB box). Left env-tunable to validate on
+    a real c6a run before any default change.
+  - **Takeaway (matches the original honest expectation):** config can't move the margin; DF54's
+    hash-agg is already strong. The durable separation comes from the **Phase 2 HVM2 GPU path**, not
+    CPU config. Caveat: synthetic/local signal, not the c6a absolutes — a real run would only need
+    to confirm the `batch_size` candidate.
 - **1.5a — DONE:** single-stage driver/worker over Arrow Flight (`weft-execution::flight`).
 - **1.5b — DONE (local MVP):** multi-stage distributed shuffle. `partial-agg → hash shuffle by key
   → final-agg` over Arrow Flight: a prost `StageTicket`/`ShuffleReadTicket` control envelope, FNV
