@@ -129,6 +129,17 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
+    /// Resolve the result schema of `query` without executing it — the logical-plan schema.
+    /// Used by Spark Connect `AnalyzePlan(Schema)` (PySpark `df.schema` / `printSchema`).
+    pub async fn schema(&self, query: &str) -> Result<arrow::datatypes::SchemaRef> {
+        let df = self
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
+    }
+
     /// Build the optimized DataFusion physical plan for `query`. The driver side of
     /// distributed execution uses this to obtain a serializable plan to split into stages.
     pub async fn physical_plan(

@@ -72,10 +72,14 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   server, runs `SELECT 1` over gRPC, decodes Arrow, asserts `1`). **The full 43-query
   ClickBench suite also runs over this live server** via `weft-bench clickbench-grpc`
   (`CREATE EXTERNAL TABLE` + queries -> Parquet scan -> Arrow IPC, **43/43**).
-  **Remaining for full PySpark parity:** the `SqlCommand` `input` path (PySpark's `spark.sql`
-  uses it over the deprecated `sql` field), `AnalyzePlan(Schema)` with Arrow→Spark type
-  conversion, real `Config` get/set, and reattach buffering. Validated with a Rust gRPC client
-  (not PySpark) to avoid the local Python 3.14 / pyarrow wheel risk.
+  **PySpark parity (DONE):** the `SqlCommand.input` path is handled (`spark.sql(...)` — a query
+  returns a lazy `SqlCommandResult` relation handle, a DDL/DML command runs eagerly and returns a
+  `LocalRelation`; `LocalRelation` execution is wired for the `.show()` step), and
+  `AnalyzePlan(Schema)` returns the result schema with Arrow→Spark `DataType` conversion
+  (`weft-connect::types`). Covered by `crates/weft-connect/tests/pyspark_parity.rs` (3 tests).
+  **Still open:** real `Config` get/set and reattach buffering. Validated with a Rust gRPC client
+  shaping the exact PySpark-4.x request messages (not stock PySpark — avoids the local Python 3.14
+  / pyarrow wheel risk).
 - **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
   Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
   counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI
