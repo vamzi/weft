@@ -78,6 +78,33 @@ async fn run(
     out
 }
 
+/// First Utf8 cell across any ArrowBatch in the responses.
+fn first_string(resps: &[sc::execute_plan_response::ResponseType]) -> Option<String> {
+    use weft_loom::arrow::array::{Array, StringArray};
+    for r in resps {
+        if let sc::execute_plan_response::ResponseType::ArrowBatch(b) = r {
+            let reader = StreamReader::try_new(std::io::Cursor::new(b.data.clone()), None).ok()?;
+            for rb in reader {
+                let rb = rb.ok()?;
+                if let Some(c) = rb.column(0).as_any().downcast_ref::<StringArray>() {
+                    if !c.is_empty() {
+                        return Some(c.value(0).to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Count ArrowBatch responses.
+fn arrow_batch_count(resps: &[sc::execute_plan_response::ResponseType]) -> usize {
+    resps
+        .iter()
+        .filter(|r| matches!(r, sc::execute_plan_response::ResponseType::ArrowBatch(_)))
+        .count()
+}
+
 /// First i64 value across any ArrowBatch in the responses.
 fn first_i64(resps: &[sc::execute_plan_response::ResponseType]) -> Option<i64> {
     for r in resps {
@@ -145,6 +172,88 @@ async fn sql_command_ddl_executes_eagerly() {
         Some(42),
         "the eagerly-created table is queryable"
     );
+}
+
+#[tokio::test]
+async fn show_string_renders_a_table() {
+    let mut client = boot(50594).await;
+    // PySpark `.show()` shape: a ShowString relation wrapping the query.
+    let plan = sc::Plan {
+        op_type: Some(sc::plan::OpType::Root(sc::Relation {
+            common: None,
+            rel_type: Some(sc::relation::RelType::ShowString(Box::new(
+                sc::ShowString {
+                    input: Some(Box::new(sql_relation("SELECT 7 AS x"))),
+                    num_rows: 20,
+                    truncate: 20,
+                    vertical: false,
+                },
+            ))),
+        })),
+    };
+    let resps = run(&mut client, plan).await;
+    let table = first_string(&resps).expect("a show_string cell");
+    assert!(table.contains('x'), "header present:\n{table}");
+    assert!(table.contains('7'), "value present:\n{table}");
+    assert!(table.contains('+'), "box-drawing present:\n{table}");
+}
+
+#[tokio::test]
+async fn empty_result_still_emits_a_batch() {
+    let mut client = boot(50596).await;
+    // A zero-row result must still emit at least one ArrowBatch — PySpark `collect()` asserts it
+    // received a RecordBatch, otherwise the table is None.
+    let resps = run(&mut client, root(sql_relation("SELECT 1 AS x WHERE 1 = 0"))).await;
+    assert!(
+        arrow_batch_count(&resps) >= 1,
+        "a 0-row result must still emit an ArrowBatch"
+    );
+}
+
+#[tokio::test]
+async fn config_set_then_get_roundtrips() {
+    let mut client = boot(50597).await;
+    let op = |op_type| sc::ConfigRequest {
+        session_id: SESSION.to_string(),
+        operation: Some(sc::config_request::Operation {
+            op_type: Some(op_type),
+        }),
+        ..Default::default()
+    };
+    // Set my.key=hi.
+    client
+        .config(op(sc::config_request::operation::OpType::Set(
+            sc::config_request::Set {
+                pairs: vec![sc::KeyValue {
+                    key: "my.key".to_string(),
+                    value: Some("hi".to_string()),
+                }],
+                silent: None,
+            },
+        )))
+        .await
+        .expect("config set");
+    // Get my.key + the seeded timezone default.
+    let resp = client
+        .config(op(sc::config_request::operation::OpType::Get(
+            sc::config_request::Get {
+                keys: vec![
+                    "my.key".to_string(),
+                    "spark.sql.session.timeZone".to_string(),
+                ],
+            },
+        )))
+        .await
+        .expect("config get")
+        .into_inner();
+    let get = |k: &str| {
+        resp.pairs
+            .iter()
+            .find(|p| p.key == k)
+            .and_then(|p| p.value.clone())
+    };
+    assert_eq!(get("my.key").as_deref(), Some("hi"));
+    assert_eq!(get("spark.sql.session.timeZone").as_deref(), Some("UTC"));
 }
 
 #[tokio::test]

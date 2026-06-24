@@ -3,10 +3,11 @@
 //! Implements `SparkConnectService` so an unmodified PySpark / Spark SQL client connects
 //! via `sc://host:port`. `ExecutePlan` runs a SQL relation, a PySpark `SqlCommand`
 //! (`spark.sql(...)` — a query returns a lazy `SqlCommandResult` relation handle; a DDL/DML
-//! command runs eagerly and returns its result as a `LocalRelation`), or a `LocalRelation`
-//! → DataFusion ([`weft_loom::Engine`]) → Arrow IPC + `ResultComplete`. `AnalyzePlan` answers
-//! `SparkVersion` and `Schema` (with Arrow→Spark type conversion in [`types`]); `Config` is
-//! handled enough for session bootstrap.
+//! command runs eagerly and returns its result as a `LocalRelation`), a `LocalRelation`, or a
+//! `ShowString` (`DataFrame.show()`) → DataFusion ([`weft_loom::Engine`]) → Arrow IPC +
+//! `ResultComplete`. `AnalyzePlan` answers `SparkVersion` and `Schema` (with Arrow→Spark type
+//! conversion in [`types`]); `Config` get/set is a real session store. Validated end-to-end
+//! against stock `pyspark-connect` 4.0 (`spark.sql(...).{collect,toPandas,show}()` + DDL).
 //!
 //! Request path: gRPC `Plan` → SQL / relation → [`weft_loom`] → Arrow IPC back out.
 
@@ -55,6 +56,8 @@ pub struct WeftService {
     engine: Arc<Engine>,
     /// Server-side session idempotency key (per server lifetime).
     server_session_id: String,
+    /// Session SQL config (`spark.sql.*`), set/queried via the `Config` RPC.
+    config: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Default for WeftService {
@@ -66,9 +69,13 @@ impl Default for WeftService {
 impl WeftService {
     /// Build a service with a fresh DataFusion-backed engine.
     pub fn new() -> Self {
+        // Seed the defaults PySpark reads during normal operation (e.g. Arrow→pandas timezone).
+        let mut config = std::collections::HashMap::new();
+        config.insert("spark.sql.session.timeZone".to_string(), "UTC".to_string());
         Self {
             engine: Arc::new(Engine::new()),
             server_session_id: Uuid::new_v4().to_string(),
+            config: std::sync::Mutex::new(config),
         }
     }
 
@@ -98,10 +105,12 @@ impl WeftService {
     ) -> std::result::Result<Vec<sc::ExecutePlanResponse>, Status> {
         let mut responses = Vec::new();
         for batch in batches {
-            // Slice wide results into row-chunks so no single gRPC message is oversized.
+            // Slice wide results into row-chunks so no single gRPC message is oversized. A
+            // zero-row batch still emits exactly one (empty) ArrowBatch so the client always
+            // receives a RecordBatch — PySpark's `collect()` asserts it got at least one.
             let n = batch.num_rows();
             let mut off = 0;
-            while off < n {
+            loop {
                 let len = (n - off).min(CHUNK_ROWS);
                 let slice = batch.slice(off, len);
                 let data = encode_ipc_stream(&slice)
@@ -118,15 +127,25 @@ impl WeftService {
                     ),
                 ));
                 off += len;
+                if off >= n {
+                    break;
+                }
             }
         }
-        responses.push(self.response(
+        // Carry the result schema on the terminal response (Spark sends this "when collect is
+        // called"), so the client builds a correctly-typed table even for an empty / zero-column
+        // result (e.g. a DDL command) where no usable ArrowBatch exists.
+        let mut complete = self.response(
             session_id,
             operation_id,
             sc::execute_plan_response::ResponseType::ResultComplete(
                 sc::execute_plan_response::ResultComplete {},
             ),
-        ));
+        );
+        if let Some(first) = batches.first() {
+            complete.schema = Some(types::schema_to_spark(first.schema().as_ref()));
+        }
+        responses.push(complete);
         Ok(responses)
     }
 
@@ -193,6 +212,82 @@ impl WeftService {
             )),
         }
     }
+
+    /// Evaluate a relation to record batches. Handles `ShowString` (PySpark `.show()`) by
+    /// formatting its child into a single-cell string table; everything else falls through to
+    /// [`Self::base_relation_batches`].
+    async fn eval_relation(
+        &self,
+        rel: &sc::Relation,
+    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        if let Some(sc::relation::RelType::ShowString(s)) = rel.rel_type.as_ref() {
+            let child = s
+                .input
+                .as_deref()
+                .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
+            let batches = self.base_relation_batches(child).await?;
+            let text = show_string(&batches, s.num_rows, s.truncate)?;
+            return Ok(vec![show_string_batch(text)]);
+        }
+        self.base_relation_batches(rel).await
+    }
+
+    /// Evaluate a `Sql` or `LocalRelation` to record batches, always carrying the schema (an empty
+    /// result yields one zero-row batch so the client still receives a typed, non-null table).
+    async fn base_relation_batches(
+        &self,
+        rel: &sc::Relation,
+    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        match rel.rel_type.as_ref() {
+            Some(sc::relation::RelType::Sql(sql)) => {
+                let mut batches = self.engine.sql(&sql.query).await.map_err(err_to_status)?;
+                // A 0-row result must still carry its schema so the client gets a typed (empty)
+                // table. Re-derive the schema only for queries — `engine.schema` plans via
+                // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
+                if batches.is_empty() && is_query(&sql.query) {
+                    let schema = self
+                        .engine
+                        .schema(&sql.query)
+                        .await
+                        .map_err(err_to_status)?;
+                    batches.push(RecordBatch::new_empty(schema));
+                }
+                Ok(batches)
+            }
+            Some(sc::relation::RelType::LocalRelation(lr)) => {
+                let data = lr.data.as_deref().unwrap_or_default();
+                let reader = StreamReader::try_new(Cursor::new(data.to_vec()), None)
+                    .map_err(|e| Status::internal(format!("decode local relation: {e}")))?;
+                let schema = reader.schema();
+                let mut batches = reader
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| Status::internal(format!("decode local relation: {e}")))?;
+                if batches.is_empty() {
+                    batches.push(RecordBatch::new_empty(schema));
+                }
+                Ok(batches)
+            }
+            other => Err(Status::unimplemented(format!(
+                "unsupported relation: {other:?}"
+            ))),
+        }
+    }
+
+    /// Look up a config key: stored value, else a lenient default (so PySpark's `conf.get` never
+    /// sees `None` and `.lower()`-style client code doesn't crash).
+    fn config_get(&self, key: &str) -> sc::KeyValue {
+        let value = self
+            .config
+            .lock()
+            .expect("config poisoned")
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| config_default(key));
+        sc::KeyValue {
+            key: key.to_string(),
+            value: Some(value),
+        }
+    }
 }
 
 type RespStream =
@@ -215,28 +310,24 @@ impl SparkConnectService for WeftService {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let exec = classify_exec(&req.plan).ok_or_else(|| {
-            Status::unimplemented("unsupported plan; only SQL / SqlCommand / LocalRelation")
-        })?;
-
-        let responses = match exec {
-            // PySpark `spark.sql(...)`: queries return a lazy relation handle; commands (DDL/DML)
-            // run eagerly and return their result as a LocalRelation.
-            Exec::SqlCommand(sql) => {
-                self.run_sql_command(&session_id, &operation_id, &sql)
-                    .await?
-            }
-            // Raw SQL relation/command (our Rust client + `.show()` re-execution): run + stream.
-            Exec::Sql(sql) => {
-                let batches = self.engine.sql(&sql).await.map_err(err_to_status)?;
+        let responses = match req.plan.as_ref().and_then(|p| p.op_type.as_ref()) {
+            // PySpark `spark.sql(...)`: a query returns a lazy relation handle; a DDL/DML command
+            // runs eagerly and returns its result as a LocalRelation.
+            Some(sc::plan::OpType::Command(cmd)) => match cmd.command_type.as_ref() {
+                Some(sc::command::CommandType::SqlCommand(c)) => {
+                    let sql = sql_command_text(c)
+                        .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
+                    self.run_sql_command(&session_id, &operation_id, &sql)
+                        .await?
+                }
+                _ => return Err(Status::unimplemented("unsupported command")),
+            },
+            // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
+            Some(sc::plan::OpType::Root(rel)) => {
+                let batches = self.eval_relation(rel).await?;
                 self.stream_batches(&session_id, &operation_id, &batches)?
             }
-            // A cached LocalRelation (PySpark `.show()` over an eager command's result): echo it.
-            Exec::Local(data) => {
-                let batches = decode_ipc(&data)
-                    .map_err(|e| Status::internal(format!("decode local relation: {e}")))?;
-                self.stream_batches(&session_id, &operation_id, &batches)?
-            }
+            _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
 
         let stream = tokio_stream::iter(responses.into_iter().map(Ok));
@@ -281,11 +372,87 @@ impl SparkConnectService for WeftService {
         &self,
         request: Request<sc::ConfigRequest>,
     ) -> std::result::Result<Response<sc::ConfigResponse>, Status> {
+        use sc::config_request::operation::OpType;
         let req = request.into_inner();
-        // Phase 0: accept everything, return no values. Enough for session bootstrap.
+        let pairs = match req.operation.and_then(|o| o.op_type) {
+            Some(OpType::Set(set)) => {
+                let mut store = self.config.lock().expect("config poisoned");
+                for kv in set.pairs {
+                    match kv.value {
+                        Some(v) => {
+                            store.insert(kv.key, v);
+                        }
+                        None => {
+                            store.remove(&kv.key);
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            Some(OpType::Get(get)) => get.keys.iter().map(|k| self.config_get(k)).collect(),
+            Some(OpType::GetWithDefault(g)) => g
+                .pairs
+                .into_iter()
+                .map(|kv| {
+                    let value = self
+                        .config
+                        .lock()
+                        .expect("config poisoned")
+                        .get(&kv.key)
+                        .cloned()
+                        .or(kv.value);
+                    sc::KeyValue { key: kv.key, value }
+                })
+                .collect(),
+            Some(OpType::GetOption(g)) => g
+                .keys
+                .into_iter()
+                .map(|k| {
+                    let value = self
+                        .config
+                        .lock()
+                        .expect("config poisoned")
+                        .get(&k)
+                        .cloned();
+                    sc::KeyValue { key: k, value }
+                })
+                .collect(),
+            Some(OpType::GetAll(g)) => {
+                let prefix = g.prefix.unwrap_or_default();
+                self.config
+                    .lock()
+                    .expect("config poisoned")
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| sc::KeyValue {
+                        key: k.clone(),
+                        value: Some(v.clone()),
+                    })
+                    .collect()
+            }
+            Some(OpType::Unset(u)) => {
+                let mut store = self.config.lock().expect("config poisoned");
+                for k in u.keys {
+                    store.remove(&k);
+                }
+                Vec::new()
+            }
+            // Everything is modifiable in this session-local store.
+            Some(OpType::IsModifiable(m)) => m
+                .keys
+                .into_iter()
+                .map(|k| sc::KeyValue {
+                    key: k,
+                    value: Some("true".to_string()),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
         Ok(Response::new(sc::ConfigResponse {
             session_id: req.session_id,
             server_side_session_id: self.server_session_id.clone(),
+            pairs,
             ..Default::default()
         }))
     }
@@ -483,12 +650,114 @@ fn encode_ipc_multi(
     Ok(buf)
 }
 
-/// Decode an Arrow IPC stream (a `LocalRelation`'s `data`) back into record batches.
-fn decode_ipc(
-    data: &[u8],
-) -> std::result::Result<Vec<RecordBatch>, weft_loom::arrow::error::ArrowError> {
-    let reader = StreamReader::try_new(Cursor::new(data.to_vec()), None)?;
-    reader.collect()
+/// A lenient default for a config key Spark hasn't set: boolean-ish flags → `"false"`, otherwise
+/// the empty string — so client code that does `value.lower() == "true"` never hits `None`.
+fn config_default(key: &str) -> String {
+    if key.ends_with(".enabled") {
+        "false".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Render record batches as a Spark-style box table for `DataFrame.show()` (`ShowString`). The
+/// exact glyphs aren't asserted by the client — it just prints the returned string.
+fn show_string(
+    batches: &[RecordBatch],
+    num_rows: i32,
+    truncate: i32,
+) -> std::result::Result<String, Status> {
+    use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let Some(schema) = batches.first().map(|b| b.schema()) else {
+        return Ok("++\n++\n".to_string());
+    };
+    let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let max_rows = if num_rows <= 0 {
+        usize::MAX
+    } else {
+        num_rows as usize
+    };
+    let trunc = truncate.max(0) as usize;
+
+    let opts = FormatOptions::default();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    'outer: for b in batches {
+        let fmts = b
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c, &opts))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        for r in 0..b.num_rows() {
+            if rows.len() >= max_rows {
+                break 'outer;
+            }
+            rows.push(
+                fmts.iter()
+                    .map(|f| {
+                        let mut s = f.value(r).to_string();
+                        if trunc > 0 && s.chars().count() > trunc {
+                            s = format!(
+                                "{}...",
+                                &s.chars().take(trunc.saturating_sub(3)).collect::<String>()
+                            );
+                        }
+                        s
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let rule = {
+        let mut s = String::from("+");
+        for w in &widths {
+            s.push_str(&"-".repeat(w + 2));
+            s.push('+');
+        }
+        s
+    };
+    let line = |cells: &[String]| {
+        let mut s = String::from("|");
+        for (i, c) in cells.iter().enumerate() {
+            s.push_str(&format!(" {:>w$} |", c, w = widths[i]));
+        }
+        s
+    };
+    let mut out = String::new();
+    out.push_str(&rule);
+    out.push('\n');
+    out.push_str(&line(&headers));
+    out.push('\n');
+    out.push_str(&rule);
+    out.push('\n');
+    for row in &rows {
+        out.push_str(&line(row));
+        out.push('\n');
+    }
+    out.push_str(&rule);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Wrap a `ShowString` result string as the single-cell `show_string` relation PySpark expects.
+fn show_string_batch(text: String) -> RecordBatch {
+    use weft_loom::arrow::array::StringArray;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "show_string",
+        DataType::Utf8,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![text]))])
+        .expect("show_string batch")
 }
 
 fn err_to_status(e: Error) -> Status {
