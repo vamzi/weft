@@ -22,3 +22,6 @@ bench/**/results/*.json
 .idea/
 .vscode/
 .DS_Store
+
+# Session-scoped AWS runner: keypair PEM, state, sweep scripts (never commit secrets)
+scratchpad/
