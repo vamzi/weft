@@ -95,29 +95,44 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
-    /// Register a Delta Lake table (by directory path) under `name`.
-    ///
-    /// Resolves the table's active data files from its `_delta_log` (via
-    /// [`weft_datasource::delta_active_files`]) and exposes them as a DataFusion listing table
-    /// over the native Parquet reader — no Delta-crate DataFusion-version coupling.
+    /// Register a Delta Lake table directory under `name` — resolves active files from the
+    /// `_delta_log` (via [`weft_datasource::delta_active_files`]), then the native reader.
     pub async fn register_delta(&self, name: &str, table_path: &str) -> Result<()> {
+        let files = weft_datasource::delta_active_files(table_path)?;
+        self.register_parquet_files(name, table_path, files).await
+    }
+
+    /// Register an Iceberg table directory under `name` — resolves data files from the current
+    /// snapshot's manifests (via [`weft_datasource::iceberg_active_files`]), then the reader.
+    pub async fn register_iceberg(&self, name: &str, table_path: &str) -> Result<()> {
+        let files = weft_datasource::iceberg_active_files(table_path)?;
+        self.register_parquet_files(name, table_path, files).await
+    }
+
+    /// Expose a set of Parquet files as a DataFusion listing table — the version-safe seam both
+    /// lakehouse readers share (resolve the format to files, then use DataFusion 54's reader).
+    async fn register_parquet_files(
+        &self,
+        name: &str,
+        table_path: &str,
+        files: Vec<std::path::PathBuf>,
+    ) -> Result<()> {
         use datafusion::datasource::file_format::parquet::ParquetFormat;
         use datafusion::datasource::listing::{
             ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
         };
         use std::sync::Arc;
 
-        let files = weft_datasource::delta_active_files(table_path)?;
         if files.is_empty() {
             return Err(Error::Plan(format!(
-                "delta table `{table_path}` has no active files"
+                "table `{table_path}` has no active data files"
             )));
         }
         let urls = files
             .iter()
             .map(|p| {
                 ListingTableUrl::parse(p.to_string_lossy())
-                    .map_err(|e| Error::Io(format!("bad delta file path {}: {e}", p.display())))
+                    .map_err(|e| Error::Io(format!("bad file path {}: {e}", p.display())))
             })
             .collect::<Result<Vec<_>>>()?;
         let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
@@ -126,12 +141,12 @@ impl Engine {
             .with_listing_options(opts)
             .infer_schema(&state)
             .await
-            .map_err(|e| Error::Execution(format!("delta infer schema: {e}")))?;
+            .map_err(|e| Error::Execution(format!("infer schema: {e}")))?;
         let table = ListingTable::try_new(config)
-            .map_err(|e| Error::Execution(format!("delta listing table: {e}")))?;
+            .map_err(|e| Error::Execution(format!("listing table: {e}")))?;
         self.ctx
             .register_table(name, Arc::new(table))
-            .map_err(|e| Error::Execution(format!("register delta `{name}`: {e}")))?;
+            .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
         Ok(())
     }
 
