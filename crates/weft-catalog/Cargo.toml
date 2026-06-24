@@ -1,0 +1,12 @@
+[package]
+name = "weft-catalog"
+description = "Catalog providers: Unity (Iceberg REST + temp credentials), Glue, Hive Metastore, in-memory."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+# TODO(deps): reqwest (Iceberg REST + Unity temporary-table-credentials), serde_json, object_store

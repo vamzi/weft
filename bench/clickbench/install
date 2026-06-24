@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Install the Weft server + a stock PySpark client for the ClickBench harness.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# 1. build the weft server
+( cd ../.. && cargo build --release --bin weft )
+export PATH="$(cd ../../target/release && pwd):$PATH"
+
+# 2. python client (stock pyspark Spark Connect client — Weft is the server)
+python3 -m venv myenv
+# shellcheck disable=SC1091
+source myenv/bin/activate
+pip install --upgrade pip
+pip install "pyspark-client" pandas psutil duckdb   # duckdb = correctness oracle
+
+# 3. vendor the full 43 queries from upstream
+wget -q --continue \
+  'https://raw.githubusercontent.com/ClickHouse/ClickBench/main/clickhouse/queries.sql' \
+  -O queries.sql || echo "kept local anchor queries.sql" >&2
+
+echo "install complete." >&2
