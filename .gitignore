@@ -16,7 +16,7 @@ bench/**/hits.parquet
 bench/**/hits_*.parquet
 bench/**/*.tbl
 bench/**/result.csv
-bench/**/results/local-*.json
+bench/**/results/*.json
 
 # Editor / OS
 .idea/

@@ -8,9 +8,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = root.join("spark/connect");
 
     // Compile every vendored file so all transitively-reachable messages are generated.
+    // Skip macOS AppleDouble sidecars (`._foo.proto`) that a careless tar can introduce —
+    // they share the `.proto` extension but are not valid protobuf/UTF-8.
     let protos: Vec<PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "proto").unwrap_or(false))
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("._"))
+                .unwrap_or(false)
+        })
         .collect();
 
     let file_descriptors = protox::compile(&protos, [&root])?;
