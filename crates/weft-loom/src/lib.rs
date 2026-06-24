@@ -34,10 +34,28 @@ pub struct Engine {
 
 impl Engine {
     /// Create a fresh engine with default session state.
+    ///
+    /// If `WEFT_MEMORY_LIMIT_BYTES` is set, the engine runs with a bounded spill pool of
+    /// that size (DataFusion spills aggregations/sorts to disk instead of OOM-killing the
+    /// process) — important when running ClickBench on a memory-constrained box. Unset
+    /// (the default) keeps the unbounded pool, so local/test behavior is unchanged.
     pub fn new() -> Self {
-        Self {
-            ctx: SessionContext::new(),
-        }
+        let ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(bytes) => {
+                use datafusion::execution::memory_pool::FairSpillPool;
+                use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+                use datafusion::prelude::SessionConfig;
+                use std::sync::Arc;
+                let rt = RuntimeConfig::new().with_memory_pool(Arc::new(FairSpillPool::new(bytes)));
+                let env = RuntimeEnv::try_new(rt).expect("runtime env");
+                SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(env))
+            }
+            None => SessionContext::new(),
+        };
+        Self { ctx }
     }
 
     /// Run a SQL string and collect the result as Arrow record batches.
