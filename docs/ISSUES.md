@@ -18,6 +18,19 @@ message failures), and a bounded spill pool (`WEFT_MEMORY_LIMIT_BYTES`) so the h
 spill instead of OOM-killing on 32 GB. Heaviest queries today: Q23 8.98 s (`SELECT *`+LIKE+sort),
 Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Phase 1 targets.
 
+## Phase 1 progress
+
+- **1.1 — DataFusion ClickBench tuning (DONE).** Parquet filter pushdown + reorder +
+  `binary_as_string` + StringView. Real c6a.4xlarge, 14.78 GB, 43/43:
+  **52.85 s → 45.51 s (−14%), now ~19% under Sail's 56.3 s.** Standout: Q23 `SELECT *`+LIKE+sort
+  **8.98 s → 0.64 s (14×)** as late materialization finally kicks in. Caveat: margin still rides
+  partly on DataFusion 54 + warm server; durable separation needs native operators.
+- **Next targets** (config can't help these): Q32 8.08 s (`GROUP BY WatchID, ClientIP`, ~100 M
+  near-unique groups), Q28 4.0 s (regex), Q33/Q34 ~3.6 s. Plus distributed MVP + Delta/Iceberg
+  reads per plan §4.
+- Reusable benchmarking instance: `scratchpad/c6a.sh {up|run|stop|start|down}` (stopped between
+  runs; data + build cache persist on EBS).
+
 ## Progress
 
 - **#1 — DONE (core slice).** A real tonic `SparkConnectService` is live: vendored protos
