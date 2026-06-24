@@ -81,8 +81,20 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   real `Config` get/set (a session store seeded with `spark.sql.session.timeZone=UTC`), and a
   zero-row/zero-column result always emitting a schema-carrying `ArrowBatch` (so `collect()`'s
   `assert table is not None` holds). Covered by `crates/weft-connect/tests/pyspark_parity.rs`
-  (6 tests). **Still open:** reattach buffering, and the DataFrame-API relation surface
-  (`Filter`/`Aggregate`/`Join`/… nodes — today only SQL/LocalRelation/ShowString are handled).
+  (6 tests).
+- **DataFrame API (DONE — validated against stock PySpark).** Spark Connect relation/expression
+  trees lower to DataFusion logical plans in `weft-connect::translate` (no SQL): `Read`, `Project`,
+  `Filter`, `Aggregate` (groupBy/agg incl. `count(*)`/multi-agg/no-group), `Sort`, `Limit`/`Offset`,
+  `Join` (inner/outer/semi/anti/cross; `using`-column coalescing **and** `plan_id`-resolved
+  conditions like `df.a == df2.b`, incl. self-joins), `SetOp` (union/intersect/except),
+  `Deduplicate`, `Range`, `SubqueryAlias`, `WithColumns`/`WithColumnsRenamed`, `Drop`, `ToDf`,
+  `Hint`/`Repartition` (no-ops); expressions incl. literals, columns, operators, scalar/aggregate
+  functions (registry), `Alias`, `Cast`, `when`/`otherwise`, `isin`, `like`, `between`, `*`.
+  Stress-validated with stock `pyspark-connect 4.0`: createDataFrame, select/filter/withColumn/
+  rename/drop, groupBy.agg, orderBy/limit, distinct, joins (incl. self-join), union, string fns,
+  when/isin/like, `show`/`collect`/`toPandas`. Rust tests in `tests/dataframe_api.rs`.
+  **Still open:** window functions, pivot, UDFs (`CommonInlineUserDefinedFunction`), `Unpivot`,
+  `NA`/`Stat` ops, `Catalog`/`MlRelation`, streaming, reattach buffering.
 - **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
   Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
   counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI

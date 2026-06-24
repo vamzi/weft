@@ -5,9 +5,12 @@
 //! (`spark.sql(...)` — a query returns a lazy `SqlCommandResult` relation handle; a DDL/DML
 //! command runs eagerly and returns its result as a `LocalRelation`), a `LocalRelation`, or a
 //! `ShowString` (`DataFrame.show()`) → DataFusion ([`weft_loom::Engine`]) → Arrow IPC +
-//! `ResultComplete`. `AnalyzePlan` answers `SparkVersion` and `Schema` (with Arrow→Spark type
+//! `ResultComplete`. The **DataFrame API** lowers Spark Connect relation/expression trees
+//! (`Project`/`Filter`/`Aggregate`/`Join`/`Sort`/`SetOp`/… and their expressions) to DataFusion
+//! logical plans in [`translate`], so `df.select(...).filter(...).groupBy(...).agg(...)` runs
+//! without SQL. `AnalyzePlan` answers `SparkVersion` and `Schema` (with Arrow→Spark type
 //! conversion in [`types`]); `Config` get/set is a real session store. Validated end-to-end
-//! against stock `pyspark-connect` 4.0 (`spark.sql(...).{collect,toPandas,show}()` + DDL).
+//! against stock `pyspark-connect` 4.0 (`spark.sql(...)` + the DataFrame API).
 //!
 //! Request path: gRPC `Plan` → SQL / relation → [`weft_loom`] → Arrow IPC back out.
 
@@ -31,6 +34,7 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+mod translate;
 mod types;
 
 /// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
@@ -69,9 +73,16 @@ impl Default for WeftService {
 impl WeftService {
     /// Build a service with a fresh DataFusion-backed engine.
     pub fn new() -> Self {
-        // Seed the defaults PySpark reads during normal operation (e.g. Arrow→pandas timezone).
+        // Seed the defaults PySpark reads during normal operation (Arrow→pandas timezone; the
+        // local-relation cache threshold `createDataFrame` parses as an int).
         let mut config = std::collections::HashMap::new();
-        config.insert("spark.sql.session.timeZone".to_string(), "UTC".to_string());
+        for (k, v) in [
+            ("spark.sql.session.timeZone", "UTC"),
+            ("spark.sql.session.localRelationCacheThreshold", "67108864"),
+            ("spark.sql.execution.arrow.maxRecordsPerBatch", "10000"),
+        ] {
+            config.insert(k.to_string(), v.to_string());
+        }
         Self {
             engine: Arc::new(Engine::new()),
             server_session_id: Uuid::new_v4().to_string(),
@@ -198,18 +209,50 @@ impl WeftService {
         &self,
         plan: &Option<sc::Plan>,
     ) -> std::result::Result<weft_loom::arrow::datatypes::SchemaRef, Status> {
-        match classify_exec(plan) {
-            Some(Exec::Sql(sql)) | Some(Exec::SqlCommand(sql)) => {
-                self.engine.schema(&sql).await.map_err(err_to_status)
+        match plan.as_ref().and_then(|p| p.op_type.as_ref()) {
+            Some(sc::plan::OpType::Command(cmd)) => match cmd.command_type.as_ref() {
+                Some(sc::command::CommandType::SqlCommand(c)) => {
+                    let sql = sql_command_text(c)
+                        .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
+                    self.engine.schema(&sql).await.map_err(err_to_status)
+                }
+                _ => Err(Status::unimplemented(
+                    "AnalyzePlan(Schema): unsupported command",
+                )),
+            },
+            Some(sc::plan::OpType::Root(rel)) => self.relation_schema(rel).await,
+            _ => Err(Status::unimplemented("AnalyzePlan(Schema): empty plan")),
+        }
+    }
+
+    /// The result schema of a relation — SQL/LocalRelation directly, ShowString is one string
+    /// column, everything else via the relation translator's logical plan.
+    async fn relation_schema(
+        &self,
+        rel: &sc::Relation,
+    ) -> std::result::Result<weft_loom::arrow::datatypes::SchemaRef, Status> {
+        use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+        match rel.rel_type.as_ref() {
+            Some(sc::relation::RelType::Sql(sql)) => {
+                self.engine.schema(&sql.query).await.map_err(err_to_status)
             }
-            Some(Exec::Local(data)) => {
-                let reader = StreamReader::try_new(Cursor::new(data), None)
+            Some(sc::relation::RelType::LocalRelation(lr)) => {
+                let data = lr.data.as_deref().unwrap_or_default();
+                let reader = StreamReader::try_new(Cursor::new(data.to_vec()), None)
                     .map_err(|e| Status::internal(format!("decode local relation: {e}")))?;
                 Ok(reader.schema())
             }
-            None => Err(Status::unimplemented(
-                "AnalyzePlan(Schema): unsupported plan shape",
-            )),
+            Some(sc::relation::RelType::ShowString(_)) => {
+                Ok(Arc::new(Schema::new(vec![Field::new(
+                    "show_string",
+                    DataType::Utf8,
+                    false,
+                )])))
+            }
+            _ => {
+                let plan = translate::to_plan(self.engine.ctx(), rel).await?;
+                Ok(Arc::new(plan.schema().as_arrow().clone()))
+            }
         }
     }
 
@@ -267,9 +310,21 @@ impl WeftService {
                 }
                 Ok(batches)
             }
-            other => Err(Status::unimplemented(format!(
-                "unsupported relation: {other:?}"
-            ))),
+            // Everything else (Project/Filter/Aggregate/Join/… — the DataFrame API) lowers to a
+            // DataFusion logical plan and executes. A 0-row result still carries its schema.
+            _ => {
+                let plan = translate::to_plan(self.engine.ctx(), rel).await?;
+                let schema = Arc::new(plan.schema().as_arrow().clone());
+                let mut batches = self
+                    .engine
+                    .execute_logical_plan(plan)
+                    .await
+                    .map_err(err_to_status)?;
+                if batches.is_empty() {
+                    batches.push(RecordBatch::new_empty(schema));
+                }
+                Ok(batches)
+            }
         }
     }
 
@@ -542,32 +597,6 @@ impl SparkConnectService for WeftService {
         _request: Request<sc::GetStatusRequest>,
     ) -> std::result::Result<Response<sc::GetStatusResponse>, Status> {
         Ok(Response::new(sc::GetStatusResponse::default()))
-    }
-}
-
-/// How an `ExecutePlan` request should be run.
-enum Exec {
-    /// A PySpark `SqlCommand` — query stays lazy, command runs eagerly (see [`WeftService::run_sql_command`]).
-    SqlCommand(String),
-    /// A raw SQL relation/command — execute and stream the result.
-    Sql(String),
-    /// A `LocalRelation` carrying Arrow IPC — decode and stream it back.
-    Local(Vec<u8>),
-}
-
-/// Classify a Spark Connect plan into how to run it. `None` for unsupported shapes.
-fn classify_exec(plan: &Option<sc::Plan>) -> Option<Exec> {
-    match plan.as_ref()?.op_type.as_ref()? {
-        sc::plan::OpType::Root(rel) => match rel.rel_type.as_ref()? {
-            sc::relation::RelType::Sql(sql) => Some(Exec::Sql(sql.query.clone())),
-            sc::relation::RelType::LocalRelation(lr) => lr.data.clone().map(Exec::Local),
-            _ => None,
-        },
-        sc::plan::OpType::Command(cmd) => match cmd.command_type.as_ref()? {
-            sc::command::CommandType::SqlCommand(c) => sql_command_text(c).map(Exec::SqlCommand),
-            _ => None,
-        },
-        _ => None,
     }
 }
 

@@ -156,6 +156,21 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
+    /// Execute a DataFusion logical plan to record batches — the seam the Spark Connect relation
+    /// translator uses to run lowered `DataFrame` plans.
+    pub async fn execute_logical_plan(
+        &self,
+        plan: datafusion::logical_expr::LogicalPlan,
+    ) -> Result<Vec<RecordBatch>> {
+        self.ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
     /// Execute an already-built physical plan to record batches (the worker side of a stage).
     pub async fn execute_plan(
         &self,
