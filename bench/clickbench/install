@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
-# Install the Weft server + a stock PySpark client for the ClickBench harness.
+# Install build prerequisites for the Weft ClickBench entry (Amazon Linux 2023 or Ubuntu).
 set -euo pipefail
-cd "$(dirname "$0")"
 
-# 1. build the weft server
-( cd ../.. && cargo build --release --bin weft )
-export PATH="$(cd ../../target/release && pwd):$PATH"
+if command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y gcc gcc-c++ make cmake openssl-devel pkgconfig curl tar gzip
+elif command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update
+  sudo apt-get install -y build-essential cmake pkg-config libssl-dev curl tar gzip
+fi
 
-# 2. python client (stock pyspark Spark Connect client — Weft is the server)
-python3 -m venv myenv
-# shellcheck disable=SC1091
-source myenv/bin/activate
-pip install --upgrade pip
-pip install "pyspark-client" pandas psutil duckdb   # duckdb = correctness oracle
+# Rust 1.90+ (the runtime crates need a recent compiler).
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
 
-# 3. vendor the full 43 queries from upstream
-wget -q --continue \
-  'https://raw.githubusercontent.com/ClickHouse/ClickBench/main/clickhouse/queries.sql' \
-  -O queries.sql || echo "kept local anchor queries.sql" >&2
-
-echo "install complete." >&2
+echo "[install] done. Next: ./bench/clickbench/benchmark.sh"

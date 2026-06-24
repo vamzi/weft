@@ -4,6 +4,30 @@ Weft's north-star benchmark. Mirrors the [ClickBench](https://github.com/ClickHo
 entry contract so results are independently reproducible, and so we can submit an entry
 under `ClickHouse/ClickBench/weft/`.
 
+## Headline result (2026-06-24)
+
+On AWS **c6a.4xlarge** (16 vCPU / 32 GiB), real **14.78 GB hits.parquet** (99,997,497 rows),
+all 43 queries through the live `weft-connect` Spark Connect server, 3 tries, hot = min(try2,try3):
+
+| Engine | Hot total | Notes |
+|--------|----------:|-------|
+| **Weft** | **45.51 s** | DataFusion 54 core, tuned (pushdown/reorder/StringView) |
+| Sail (published 2026-05-11) | 56.3 s | baseline |
+
+**Weft is ~19% faster than Sail** on identical hardware + dataset + methodology. (Caveat: the
+current margin rides partly on a newer DataFusion + a warm reused server; native operators for
+the durable lead are tracked in `docs/ISSUES.md` Phase 1.)
+
+## Reproduce
+
+On a fresh Linux box (or the `scratchpad/c6a.sh` AWS helper):
+```sh
+./bench/clickbench/install          # build prereqs + Rust 1.90
+./bench/clickbench/benchmark.sh     # build, fetch 14.78 GB, run 43 queries → results/c6a.4xlarge.json
+```
+To submit upstream: copy `results/<date>/c6a.4xlarge.json` + `template.json` into a `weft/`
+directory under `ClickHouse/ClickBench` alongside these `install`/`benchmark.sh` scripts.
+
 ## Two harnesses
 
 1. **Official entry (this directory's shell scripts)** — `install` + `benchmark.sh` + `query`

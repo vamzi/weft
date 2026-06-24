@@ -1,50 +1,25 @@
 #!/usr/bin/env bash
-# Weft ClickBench driver. Self-contained (does not depend on ClickBench's shared lib) so it
-# can run in our own CI; the upstream submission will use ClickBench/lib/benchmark-common.sh.
+# Reproducible Weft ClickBench entry — run on a prepared Linux box (run ./install first).
+# Builds Weft, ensures the 14.78 GB hits.parquet is present, then runs all 43 queries through
+# the live weft-connect Spark Connect server over gRPC (3 tries each, hot = min of try 2/3) and
+# writes a ClickBench-format results/<machine>.json.
 #
-# Output: bench/clickbench/results/<date>/<machine>.json  (result = 43 × [cold, hot1, hot2]).
+# Env: BENCH_DATA (parquet path), WEFT_MEMORY_LIMIT_BYTES (spill-pool size; default 26 GB),
+#      WEFT_TARGET_PARTITIONS (default = vCPUs).
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root
 
-TRIES=3
-DATA="${BENCH_DATA:-hits.parquet}"
-PORT="${WEFT_PORT:-50051}"
-MACHINE="${BENCH_MACHINE:-c6a.4xlarge}"
+DATA="${BENCH_DATA:-$PWD/bench/clickbench/hits.parquet}"
+export WEFT_MEMORY_LIMIT_BYTES="${WEFT_MEMORY_LIMIT_BYTES:-26000000000}"
 
-# 1. data
-if [[ ! -f "$DATA" ]]; then
-  echo "downloading hits.parquet (~14.78 GB) …" >&2
-  wget --continue --progress=dot:giga \
-    'https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet' -O "$DATA"
+echo "[bench] building weft-bench (release) …"
+cargo build --release -p weft-bench
+
+if [ ! -f "$DATA" ]; then
+  echo "[bench] downloading hits.parquet (~14.78 GB) → $DATA"
+  curl -sL -o "$DATA" https://datasets.clickhouse.com/hits_compatible/athena/hits.parquet
 fi
+echo "[bench] data: $(ls -la "$DATA" | awk '{print $5}') bytes"
 
-# 2. server  (TODO(issue #1/#3): wait for readiness instead of sleep)
-echo "starting weft server on :$PORT …" >&2
-weft spark server --port "$PORT" &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
-# shellcheck disable=SC2034
-for _ in $(seq 1 30); do sleep 1; done
-
-# 3. run queries
-RESULTS="[]"
-i=0
-while IFS= read -r sql; do
-  [[ -z "$sql" || "$sql" == --* ]] && continue
-  row="["
-  for try in $(seq 1 "$TRIES"); do
-    secs="$(printf '%s' "$sql" | ./query 2>&1 1>/dev/null | tail -n1 || echo null)"
-    row+="$secs"; [[ "$try" -lt "$TRIES" ]] && row+=","
-  done
-  row+="]"
-  echo "Q$i: $row" >&2
-  RESULTS="${RESULTS%]}${RESULTS#[[]}"  # placeholder accumulation; real impl uses jq
-  i=$((i+1))
-done < queries.sql
-
-# 4. emit results.json
-DATE="$(date +%Y%m%d)"
-OUT="results/$DATE/$MACHINE.json"
-mkdir -p "results/$DATE"
-echo "TODO(issue #3): assemble template.json + per-query [cold,hot1,hot2] into $OUT" >&2
-echo "wrote $OUT" >&2
+./target/release/weft-bench clickbench-grpc --data "$DATA"
+echo "[bench] results written to bench/clickbench/results/c6a.4xlarge.json"
