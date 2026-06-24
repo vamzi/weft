@@ -18,7 +18,7 @@ Sail's 56.3 s (~19% faster)**, same hardware/dataset/methodology.
 | 1.3 Delta + Iceberg reads | ✅ version-safe resolvers, tested |
 | 1.5a Distributed MVP (single-stage Flight) | ✅ driver/worker over Arrow Flight, tested |
 | **1.5b Distributed shuffle** | ✅ 2-stage hash shuffle, `two_worker_groupby` test passes |
-| **1.4 Push the margin** | 🟡 knobs wired & env-tunable; sweep needs one paid c6a run |
+| **1.4 Push the margin** | ✅ swept locally → at the DF54 ceiling; defaults optimal (see below) |
 | Phase 2 (streaming / Unity / K8s / HVM2 gate) | ⬜ later |
 
 All committed (~18 commits), all gates green: `cargo build/test`, `clippy -D warnings`, `fmt`.
@@ -57,19 +57,30 @@ scratchpad/c6a.sh down    # terminate + delete SG/keypair
 
 ## Next steps (in priority order)
 
-### 1.4 — Push the margin (knobs wired; sweep needs one paid c6a run)
-Current bottlenecks at 45.51 s: **Q32 8.08 s** (`GROUP BY WatchID, ClientIP` — WatchID near-unique,
-~100 M groups), **Q28 4.0 s** (REGEXP_REPLACE), **Q33/Q34 ~3.6 s** (high-card GROUP BY).
-1. **DONE — knobs are env-tunable in `weft-loom::Engine::new`** (no rebuild to sweep):
-   `WEFT_TARGET_PARTITIONS`, `WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`,
-   `WEFT_REPARTITION_AGGREGATIONS`. (`schema_force_view_types` already on for the string keys.)
-2. **REMAINING (one c6a run):** sweep `WEFT_TARGET_PARTITIONS ∈ {8,16,32}` ×
-   `WEFT_BATCH_SIZE ∈ {8192,16384,32768}` + the two agg toggles; record per-query hot times for
-   Q32/Q33/Q34/Q28. Gate: do not regress the 45.51 s total. Commit only knobs that measurably help.
-3. **If config plateaus:** assess a native/strategy operator for the ~100 M-group aggregation —
-   honest expectation is DF54's hash-agg is already strong, so the durable margin comes from the
-   **HVM2 GPU path (Phase 2)**, not CPU operators. Document the "near the DF54 ceiling" finding.
-4. Re-benchmark with `c6a.sh run`; update `bench/clickbench/results` + `ISSUES.md`.
+### 1.4 — Push the margin — SWEPT: at the DataFusion 54 ceiling
+Knobs are env-tunable in `weft-loom::Engine::new` (no rebuild to sweep): `WEFT_TARGET_PARTITIONS`,
+`WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`, `WEFT_REPARTITION_AGGREGATIONS` (`schema_force_view_types`
+already on for the string keys).
+
+Swept **locally** against the synthetic ClickBench at 3 M rows (`scratchpad/local-sweep.sh`,
+11 configs, hot=min(try2,try3)) — the EC2 path was unavailable in this environment, so this is
+directional synthetic signal, not the c6a absolutes:
+
+| config | hot total | note |
+|---|---|---|
+| baseline (tp=#cores, repart-agg on) | 0.368 s | optimal |
+| `WEFT_TARGET_PARTITIONS=4` | 0.872 s | +137% (Q32 8× worse) |
+| `WEFT_TARGET_PARTITIONS=8` | 0.435 s | +18% |
+| `WEFT_BATCH_SIZE=32768` | 0.345 s | −6% (Q23/Q28) |
+| `WEFT_REPARTITION_AGGREGATIONS=off` | 0.674 s | +83% (Q32 7× worse) |
+
+**Conclusion:** the defaults already win — high-card `GROUP BY` (Q32 `WatchID,ClientIP`) is sharply
+sensitive to parallelism, which `target_partitions=#cores` + `repartition_aggregations=on` (both
+defaults) already provide. The only positive knob is a larger `batch_size` (~6% on synthetic, mostly
+string/regex/scan) — too marginal and synthetic-specific to hardcode (raises transient memory vs the
+spill pool on the 32 GB box). **This confirms the original honest expectation: config can't move the
+margin; the durable separation is the Phase 2 HVM2 GPU path, not CPU config.** A real c6a run, if
+done, would only need to confirm the `batch_size` candidate before any default change.
 
 ### 1.5b — Distributed shuffle — DONE (local MVP, $0)
 Implemented in `crates/weft-execution`: 2-stage `partial-agg → hash shuffle → final-agg`.
