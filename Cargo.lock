@@ -3548,6 +3548,7 @@ dependencies = [
 name = "weft-datasource"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "weft-common",
 ]
 
