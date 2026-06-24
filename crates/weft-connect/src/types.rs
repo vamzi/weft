@@ -90,6 +90,51 @@ pub fn schema_to_spark(schema: &Schema) -> sc::DataType {
     wrap(Kind::Struct(struct_of(schema.fields())))
 }
 
+/// Convert a Spark Connect [`sc::DataType`] to an Arrow [`DataType`] (the reverse of
+/// [`arrow_to_spark`]) — used to lower `cast` targets. Unmapped kinds error.
+pub fn spark_to_arrow(t: &sc::DataType) -> Result<DataType, tonic::Status> {
+    use datafusion::arrow::datatypes::{Field, TimeUnit};
+    use std::sync::Arc;
+    let kind = t
+        .kind
+        .as_ref()
+        .ok_or_else(|| tonic::Status::invalid_argument("empty DataType"))?;
+    Ok(match kind {
+        Kind::Null(_) => DataType::Null,
+        Kind::Boolean(_) => DataType::Boolean,
+        Kind::Byte(_) => DataType::Int8,
+        Kind::Short(_) => DataType::Int16,
+        Kind::Integer(_) => DataType::Int32,
+        Kind::Long(_) => DataType::Int64,
+        Kind::Float(_) => DataType::Float32,
+        Kind::Double(_) => DataType::Float64,
+        Kind::String(_) => DataType::Utf8,
+        Kind::Binary(_) => DataType::Binary,
+        Kind::Date(_) => DataType::Date32,
+        Kind::Timestamp(_) => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        Kind::TimestampNtz(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Kind::Decimal(d) => {
+            DataType::Decimal128(d.precision.unwrap_or(38) as u8, d.scale.unwrap_or(0) as i8)
+        }
+        Kind::Array(a) => {
+            let inner = a
+                .element_type
+                .as_deref()
+                .ok_or_else(|| tonic::Status::invalid_argument("array.element_type"))?;
+            DataType::List(Arc::new(Field::new(
+                "item",
+                spark_to_arrow(inner)?,
+                a.contains_null,
+            )))
+        }
+        other => {
+            return Err(tonic::Status::unimplemented(format!(
+                "spark→arrow type: {other:?}"
+            )))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

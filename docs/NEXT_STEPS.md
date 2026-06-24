@@ -109,8 +109,15 @@ streaming, and routing `weft spark server --cluster` GROUP BY through `run_distr
   `LocalRelation`), `LocalRelation` exec, `ShowString` (box-table formatting for `.show()`),
   `AnalyzePlan(Schema)` (Arrow→Spark `DataType`), real `Config` get/set, and zero-row results always
   emitting a schema-carrying `ArrowBatch`. 6 gRPC tests in `tests/pyspark_parity.rs`.
-  **Still open:** reattach buffering and the DataFrame-API relation surface
-  (`Filter`/`Aggregate`/`Join`/… — only SQL/LocalRelation/ShowString handled today).
+- **DataFrame API — DONE, validated against stock PySpark** (`weft-connect::translate`): Spark
+  Connect relation/expression trees lower to DataFusion logical plans (no SQL). Covers Read,
+  Project, Filter, Aggregate (groupBy/agg, count(*), multi-agg, no-group), Sort, Limit/Offset, Join
+  (inner/outer/semi/anti/cross; using-column coalescing + `plan_id`-resolved conditions + self-join),
+  SetOp (union/intersect/except), Deduplicate, Range, SubqueryAlias, WithColumns/Renamed, Drop, ToDf,
+  Hint/Repartition; expressions incl. operators, scalar/aggregate functions (registry), Alias, Cast,
+  when/otherwise, isin, like, between, `*`. Stress-tested with `pyspark-connect 4.0`; Rust tests in
+  `tests/dataframe_api.rs`. **Still open:** window functions, pivot, Python UDFs, Unpivot, NA/Stat,
+  Catalog/ML relations, streaming, reattach buffering.
 - Open the upstream PR: copy `results/<date>/c6a.4xlarge.json` + `template.json` under
   `ClickHouse/ClickBench/weft/`.
 
@@ -147,7 +154,8 @@ design — its moat is a *separate* benchmark.)
   and shipped to the instance (it produced a misleading "result" once).
 
 ## Map of the code
-`crates/`: `weft-connect` (Spark Connect gRPC server) · `weft-proto` (generated protos via protox) ·
+`crates/`: `weft-connect` (Spark Connect gRPC server; `translate::{expr,relation}` lowers the
+DataFrame API to DataFusion, `types` does Arrow↔Spark) · `weft-proto` (generated protos via protox) ·
 `weft-loom` (DataFusion 54 engine + lakehouse register) · `weft-datasource` (Delta/Iceberg file
 resolvers) · `weft-execution` (Flight driver/worker + `shuffle::{protocol,partition,codec}` +
 `driver::run_distributed`) · `weft-bench` (ClickBench/TPC-H/correctness
