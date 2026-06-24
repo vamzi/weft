@@ -15,7 +15,10 @@ under `ClickHouse/ClickBench/weft/`.
    `hits` table** built from `hits_schema.tsv`. It proves all 43 queries run to completion and
    emits `results/local-synthetic.json`. It is **for dev/CI coverage only** — synthetic data
    and (by default) debug builds, so its timings are *not* comparable to Sail's absolute
-   numbers. Gated in CI as `clickbench-coverage`. Currently **43/43 pass**.
+   numbers. Gated in CI as `clickbench-coverage`. A second mode, `clickbench-grpc`, runs the
+   same 43 queries through the **live `weft-connect` server over gRPC** (writes synthetic
+   `hits.parquet`, boots the server, `CREATE EXTERNAL TABLE` + queries → Arrow IPC), exercising
+   the full production transport (gated as `clickbench-grpc-coverage`). Both **43/43 pass**.
 
 ## Contract (from ClickBench)
 

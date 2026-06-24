@@ -30,6 +30,11 @@ clickbench-coverage:
   stage: test
   script: ["cargo run -p weft-bench -- clickbench --rows 20000"]
 
+# Full-transport gate: all 43 queries through the live Spark Connect server over gRPC.
+clickbench-grpc-coverage:
+  stage: test
+  script: ["cargo run -p weft-bench -- clickbench-grpc --rows 20000"]
+
 # Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
 # (Enabled once weft-loom executes queries — Phase 0.)
 correctness:
