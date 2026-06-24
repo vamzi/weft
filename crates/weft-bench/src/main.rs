@@ -185,6 +185,7 @@ fn load_queries() -> Vec<String> {
 fn summarize(
     label: &str,
     out_path: &str,
+    machine: &str,
     queries: usize,
     load_secs: f64,
     data_size: usize,
@@ -194,9 +195,9 @@ fn summarize(
 ) {
     let passed = queries - failures.len();
     let out = serde_json::json!({
-        "system": format!("Weft ({label}, synthetic)"),
+        "system": format!("Weft ({label})"),
         "date": "local-synthetic",
-        "machine": "local",
+        "machine": machine,
         "cluster_size": 1,
         "proprietary": "no",
         "hardware": "cpu",
@@ -273,6 +274,7 @@ async fn run_clickbench(rows: usize) {
     summarize(
         "engine-direct",
         "bench/clickbench/results/local-synthetic.json",
+        "local",
         queries.len(),
         load_secs,
         rows,
@@ -282,18 +284,9 @@ async fn run_clickbench(rows: usize) {
     );
 }
 
-/// Live-server: write parquet, boot weft-connect, run everything over gRPC.
-async fn run_clickbench_grpc(rows: usize) {
-    eprintln!("[live-server] generating synthetic `hits.parquet`: {rows} rows × 105 cols …");
-    let gen_start = Instant::now();
-    let (_schema, batch) = build_batch(rows);
-    let dir = std::env::temp_dir().join("weft-bench");
-    std::fs::create_dir_all(&dir).ok();
-    let parquet = dir.join("hits.parquet");
-    write_parquet(&parquet, &batch);
-    let parquet_abs = parquet.canonicalize().expect("canonicalize parquet path");
-    let load_secs = gen_start.elapsed().as_secs_f64();
-
+/// Live-server: boot weft-connect, register `hits` (synthetic parquet, or a real
+/// ClickBench `hits.parquet` via `--data`), and run all 43 queries over gRPC.
+async fn run_clickbench_grpc(rows: usize, data: Option<String>) {
     // Boot the real Spark Connect server in-process.
     tokio::spawn(async move {
         let _ = serve(ServerConfig { port: GRPC_PORT }).await;
@@ -302,13 +295,57 @@ async fn run_clickbench_grpc(rows: usize) {
     let mut client = connect_retry(&endpoint).await;
     eprintln!("connected to live server at {endpoint}");
 
-    let ddl = format!(
-        "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{}'",
-        parquet_abs.display()
-    );
-    exec_sql_grpc(&mut client, &ddl)
+    let setup = Instant::now();
+    let (label, machine, data_size) = if let Some(path) = data.as_deref() {
+        // Real ClickBench data: replicate the official DataFusion setup — an external table
+        // (binary columns read as strings) plus the EventDate-cast view.
+        let abs = std::fs::canonicalize(path).expect("--data path");
+        let size = std::fs::metadata(&abs)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        eprintln!(
+            "[live-server] registering REAL hits.parquet: {} ({size} bytes)",
+            abs.display()
+        );
+        exec_sql_grpc(
+            &mut client,
+            &format!(
+                "CREATE EXTERNAL TABLE hits_raw STORED AS PARQUET LOCATION '{}' \
+                 OPTIONS ('binary_as_string' 'true')",
+                abs.display()
+            ),
+        )
         .await
-        .expect("CREATE EXTERNAL TABLE over gRPC failed");
+        .expect("CREATE EXTERNAL TABLE hits_raw failed");
+        exec_sql_grpc(
+            &mut client,
+            "CREATE VIEW hits AS SELECT * EXCEPT (\"EventDate\"), \
+             CAST(CAST(\"EventDate\" AS INTEGER) AS DATE) AS \"EventDate\" FROM hits_raw",
+        )
+        .await
+        .expect("CREATE VIEW hits failed");
+        ("live-server gRPC (real)", "c6a.4xlarge", size)
+    } else {
+        // Synthetic: generate + write parquet + register as `hits`.
+        eprintln!("[live-server] generating synthetic `hits.parquet`: {rows} rows × 105 cols …");
+        let (_schema, batch) = build_batch(rows);
+        let dir = std::env::temp_dir().join("weft-bench");
+        std::fs::create_dir_all(&dir).ok();
+        let parquet = dir.join("hits.parquet");
+        write_parquet(&parquet, &batch);
+        let abs = parquet.canonicalize().expect("canonicalize parquet path");
+        exec_sql_grpc(
+            &mut client,
+            &format!(
+                "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{}'",
+                abs.display()
+            ),
+        )
+        .await
+        .expect("CREATE EXTERNAL TABLE hits failed");
+        ("live-server gRPC (synthetic)", "local", rows)
+    };
+    let load_secs = setup.elapsed().as_secs_f64();
 
     let queries = load_queries();
     eprintln!("running {} queries × 3 tries over gRPC …\n", queries.len());
@@ -333,12 +370,18 @@ async fn run_clickbench_grpc(rows: usize) {
         report(idx, &tries, err, &mut failures, &mut hot_total);
         results.push(serde_json::Value::Array(tries));
     }
+    let out_path = if data.is_some() {
+        "bench/clickbench/results/c6a.4xlarge.json"
+    } else {
+        "bench/clickbench/results/local-grpc.json"
+    };
     summarize(
-        "live-server gRPC",
-        "bench/clickbench/results/local-grpc.json",
+        label,
+        out_path,
+        machine,
         queries.len(),
         load_secs,
-        rows,
+        data_size,
         results,
         failures,
         hot_total,
@@ -603,9 +646,15 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_ROWS);
 
+    let data = args
+        .iter()
+        .position(|a| a == "--data")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     match args.get(1).map(String::as_str) {
         Some("clickbench") | None => run_clickbench(rows).await,
-        Some("clickbench-grpc") => run_clickbench_grpc(rows).await,
+        Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
         Some("tpch") => tpch::run().await,
         Some(other) => {
