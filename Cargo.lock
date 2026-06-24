@@ -3179,7 +3179,10 @@ dependencies = [
  "datafusion",
  "serde_json",
  "tokio",
+ "tonic",
+ "weft-connect",
  "weft-loom",
+ "weft-proto",
 ]
 
 [[package]]

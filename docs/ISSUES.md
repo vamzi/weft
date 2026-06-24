@@ -9,7 +9,9 @@ parallel, #2 depends on #1.
   compiled with `protox` (no `protoc`), `ExecutePlan(SQL)` runs through DataFusion and streams
   Arrow IPC + `ResultComplete`; `AnalyzePlan(SparkVersion)` + `Config` handle session
   bootstrap. Validated end-to-end by `crates/weft-connect/tests/select_one.rs` (boots the
-  server, runs `SELECT 1` over gRPC, decodes Arrow, asserts `1`).
+  server, runs `SELECT 1` over gRPC, decodes Arrow, asserts `1`). **The full 43-query
+  ClickBench suite also runs over this live server** via `weft-bench clickbench-grpc`
+  (`CREATE EXTERNAL TABLE` + queries -> Parquet scan -> Arrow IPC, **43/43**).
   **Remaining for full PySpark parity:** the `SqlCommand` `input` path (PySpark's `spark.sql`
   uses it over the deprecated `sql` field), `AnalyzePlan(Schema)` with Arrow→Spark type
   conversion, real `Config` get/set, and reattach buffering. Validated with a Rust gRPC client

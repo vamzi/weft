@@ -1,32 +1,41 @@
-//! `weft-bench` — engine-direct benchmark harness.
+//! `weft-bench` — benchmark harness for ClickBench coverage.
 //!
-//! Runs the real ClickBench queries through [`weft_loom::Engine`] (DataFusion) against a
-//! **synthetic `hits` table** so we can prove all 43 queries run to completion locally and
-//! produce a ClickBench-format `results.json`. The real 14 GB run happens on a
-//! `c6a.4xlarge` via the shell harness in `bench/clickbench/` (driven by a Spark Connect
-//! client against the live server). This local harness is for dev/CI coverage, not for
-//! comparison against Sail's absolute numbers (synthetic data, debug builds).
+//! Two modes, both on a **synthetic `hits` table** (the real 14 GB run happens on a
+//! `c6a.4xlarge`; these are dev/CI coverage, timings NOT comparable to Sail's absolutes):
 //!
-//! Usage: `cargo run -p weft-bench [--release] -- clickbench [--rows N]`
+//! - `clickbench`      — engine-direct: runs the 43 queries straight through
+//!   [`weft_loom::Engine`] (DataFusion) over an in-memory table. Fast; the CI coverage gate.
+//! - `clickbench-grpc` — live-server: writes synthetic `hits.parquet`, boots the real
+//!   `weft-connect` Spark Connect server, and drives `CREATE EXTERNAL TABLE` + the 43 queries
+//!   **over gRPC** (Arrow IPC round-trip) via the generated client. Exercises the full
+//!   production transport — the same path the official PySpark harness uses.
+//!
+//! Usage: `cargo run -p weft-bench [--release] -- {clickbench|clickbench-grpc} [--rows N]`
 
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
     ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, StringArray,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
+use datafusion::parquet::arrow::ArrowWriter;
+use sc::spark_connect_service_client::SparkConnectServiceClient;
+use tonic::transport::Channel;
+use weft_connect::{serve, ServerConfig};
 use weft_loom::Engine;
+use weft_proto::spark::connect as sc;
 
-/// Embedded so the binary needs no working-directory assumptions.
 const HITS_SCHEMA_TSV: &str = include_str!("../../../bench/clickbench/hits_schema.tsv");
 const CLICKBENCH_QUERIES: &str = include_str!("../../../bench/clickbench/queries.sql");
 
 /// Days since the Unix epoch for 2013-07-01 (the ClickBench filter window in Q37–Q40).
 const JULY_2013: i32 = 15887;
 const DEFAULT_ROWS: usize = 50_000;
+const GRPC_PORT: u16 = 50552;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -77,12 +86,11 @@ fn columns() -> Vec<(String, Kind)> {
 }
 
 /// Deterministic synthetic value generation, with a few name-aware tweaks so that
-/// filters/joins/LIKE/GROUP BY in the queries actually match some rows.
+/// filters/LIKE/GROUP BY in the queries actually match some rows.
 fn gen_array(name: &str, kind: Kind, n: usize) -> ArrayRef {
     let i32_at = |i: usize| -> i32 {
         match name {
             "CounterID" => (i % 100) as i32, // 62 appears (Q37–Q40 filter)
-            "ClientIP" => (i % 1000) as i32,
             _ => (i % 1000) as i32,
         }
     };
@@ -104,30 +112,16 @@ fn gen_array(name: &str, kind: Kind, n: usize) -> ArrayRef {
     };
     let str_at = |i: usize| -> String {
         match name {
-            "URL" => {
-                if i % 7 == 0 {
-                    "http://google.com/search".to_string()
-                } else {
-                    format!("http://example{}.com/page{}", i % 50, i % 200)
-                }
-            }
-            "Referer" => {
-                if i % 5 == 0 {
-                    "http://www.google.com/path".to_string()
-                } else {
-                    format!("http://ref{}.com/q{}", i % 80, i % 300)
-                }
-            }
-            "Title" => {
-                if i % 6 == 0 {
-                    "Google News Today".to_string()
-                } else {
-                    format!("Title {}", i % 150)
-                }
-            }
+            "URL" if i % 7 == 0 => "http://google.com/search".to_string(),
+            "URL" => format!("http://example{}.com/page{}", i % 50, i % 200),
+            "Referer" if i % 5 == 0 => "http://www.google.com/path".to_string(),
+            "Referer" => format!("http://ref{}.com/q{}", i % 80, i % 300),
+            "Title" if i % 6 == 0 => "Google News Today".to_string(),
+            "Title" => format!("Title {}", i % 150),
+            // many empty — queries filter `SearchPhrase <> ''`
             "SearchPhrase" => {
                 if i % 2 == 0 {
-                    String::new() // many empty — queries filter `SearchPhrase <> ''`
+                    String::new()
                 } else {
                     format!("query {}", i % 120)
                 }
@@ -157,15 +151,8 @@ fn gen_array(name: &str, kind: Kind, n: usize) -> ArrayRef {
     }
 }
 
-async fn run_clickbench(rows: usize) {
+fn build_batch(rows: usize) -> (SchemaRef, RecordBatch) {
     let cols = columns();
-    eprintln!(
-        "generating synthetic `hits`: {} rows × {} columns …",
-        rows,
-        cols.len()
-    );
-
-    let gen_start = Instant::now();
     let fields: Vec<Field> = cols
         .iter()
         .map(|(name, k)| Field::new(name, arrow_type(*k), false))
@@ -176,6 +163,76 @@ async fn run_clickbench(rows: usize) {
         .map(|(name, k)| gen_array(name, *k, rows))
         .collect();
     let batch = RecordBatch::try_new(schema.clone(), arrays).expect("build record batch");
+    (schema, batch)
+}
+
+fn load_queries() -> Vec<String> {
+    CLICKBENCH_QUERIES
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("--"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// ClickBench-format results + summary; exits non-zero if any query failed.
+#[allow(clippy::too_many_arguments)]
+fn summarize(
+    label: &str,
+    out_path: &str,
+    queries: usize,
+    load_secs: f64,
+    data_size: usize,
+    results: Vec<serde_json::Value>,
+    failures: Vec<(usize, String)>,
+    hot_total: f64,
+) {
+    let passed = queries - failures.len();
+    let out = serde_json::json!({
+        "system": format!("Weft ({label}, synthetic)"),
+        "date": "local-synthetic",
+        "machine": "local",
+        "cluster_size": 1,
+        "proprietary": "no",
+        "hardware": "cpu",
+        "tuned": "no",
+        "tags": ["Rust", "DataFusion", "synthetic-data"],
+        "load_time": load_secs,
+        "data_size": data_size,
+        "result": results,
+    });
+    std::fs::create_dir_all("bench/clickbench/results").ok();
+    std::fs::write(out_path, serde_json::to_string_pretty(&out).unwrap()).expect("write results");
+    eprintln!(
+        "\n=== ClickBench [{label}] (synthetic): {passed}/{queries} passed; \
+         hot total (passing) = {hot_total:.3}s ===",
+    );
+    eprintln!("wrote {out_path}");
+    if !failures.is_empty() {
+        eprintln!(
+            "failures: {:?}",
+            failures.iter().map(|(i, _)| i).collect::<Vec<_>>()
+        );
+        std::process::exit(1);
+    }
+}
+
+fn hot_of(tries: &[serde_json::Value]) -> f64 {
+    match (
+        tries.get(1).and_then(|v| v.as_f64()),
+        tries.get(2).and_then(|v| v.as_f64()),
+    ) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        _ => 0.0,
+    }
+}
+
+/// Engine-direct: run the 43 queries straight through DataFusion over an in-memory table.
+async fn run_clickbench(rows: usize) {
+    eprintln!("[engine-direct] generating synthetic `hits`: {rows} rows × 105 cols …");
+    let gen_start = Instant::now();
+    let (schema, batch) = build_batch(rows);
     let load_secs = gen_start.elapsed().as_secs_f64();
 
     let engine = Engine::new();
@@ -185,20 +242,15 @@ async fn run_clickbench(rows: usize) {
         .register_table("hits", Arc::new(table))
         .expect("register hits");
 
-    let queries: Vec<&str> = CLICKBENCH_QUERIES
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("--"))
-        .collect();
+    let queries = load_queries();
     eprintln!("running {} queries × 3 tries …\n", queries.len());
 
-    let mut results: Vec<serde_json::Value> = Vec::with_capacity(queries.len());
-    let mut failures: Vec<(usize, String)> = Vec::new();
-    let mut hot_total = 0.0_f64;
-    let mut passed = 0usize;
+    let mut results = Vec::with_capacity(queries.len());
+    let mut failures = Vec::new();
+    let mut hot_total = 0.0;
 
     for (idx, q) in queries.iter().enumerate() {
-        let mut tries: Vec<serde_json::Value> = Vec::with_capacity(3);
+        let mut tries = Vec::with_capacity(3);
         let mut err: Option<String> = None;
         for _ in 0..3 {
             let t = Instant::now();
@@ -210,56 +262,153 @@ async fn run_clickbench(rows: usize) {
                 }
             }
         }
-        if let Some(e) = err {
-            failures.push((idx, e.lines().next().unwrap_or("").to_string()));
-            eprintln!("Q{:<2} FAIL  {}", idx, failures.last().unwrap().1);
-        } else {
-            passed += 1;
-            // hot = min of try 2 and 3 (ClickBench rule)
-            let hot = match (tries[1].as_f64(), tries[2].as_f64()) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) | (None, Some(a)) => a,
-                _ => 0.0,
-            };
-            hot_total += hot;
-            eprintln!("Q{:<2} ok    hot={:.4}s", idx, hot);
-        }
+        report(idx, &tries, err, &mut failures, &mut hot_total);
         results.push(serde_json::Value::Array(tries));
     }
-
-    let out = serde_json::json!({
-        "system": "Weft (Loom/DataFusion, synthetic)",
-        "date": "local-synthetic",
-        "machine": "local",
-        "cluster_size": 1,
-        "proprietary": "no",
-        "hardware": "cpu",
-        "tuned": "no",
-        "tags": ["Rust", "DataFusion", "synthetic-data"],
-        "load_time": load_secs,
-        "data_size": rows,
-        "result": results,
-    });
-    let dir = "bench/clickbench/results";
-    std::fs::create_dir_all(dir).ok();
-    let path = format!("{dir}/local-synthetic.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap()).expect("write results");
-
-    eprintln!(
-        "\n=== ClickBench (synthetic): {}/{} queries passed; hot total (passing) = {:.3}s ===",
-        passed,
+    summarize(
+        "engine-direct",
+        "bench/clickbench/results/local-synthetic.json",
         queries.len(),
-        hot_total
+        load_secs,
+        rows,
+        results,
+        failures,
+        hot_total,
     );
-    eprintln!("wrote {path}");
-    if !failures.is_empty() {
-        eprintln!(
-            "failures: {:?}",
-            failures.iter().map(|(i, _)| i).collect::<Vec<_>>()
-        );
-        // Non-zero exit so CI notices missing coverage.
-        std::process::exit(1);
+}
+
+/// Live-server: write parquet, boot weft-connect, run everything over gRPC.
+async fn run_clickbench_grpc(rows: usize) {
+    eprintln!("[live-server] generating synthetic `hits.parquet`: {rows} rows × 105 cols …");
+    let gen_start = Instant::now();
+    let (_schema, batch) = build_batch(rows);
+    let dir = std::env::temp_dir().join("weft-bench");
+    std::fs::create_dir_all(&dir).ok();
+    let parquet = dir.join("hits.parquet");
+    write_parquet(&parquet, &batch);
+    let parquet_abs = parquet.canonicalize().expect("canonicalize parquet path");
+    let load_secs = gen_start.elapsed().as_secs_f64();
+
+    // Boot the real Spark Connect server in-process.
+    tokio::spawn(async move {
+        let _ = serve(ServerConfig { port: GRPC_PORT }).await;
+    });
+    let endpoint = format!("http://127.0.0.1:{GRPC_PORT}");
+    let mut client = connect_retry(&endpoint).await;
+    eprintln!("connected to live server at {endpoint}");
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{}'",
+        parquet_abs.display()
+    );
+    exec_sql_grpc(&mut client, &ddl)
+        .await
+        .expect("CREATE EXTERNAL TABLE over gRPC failed");
+
+    let queries = load_queries();
+    eprintln!("running {} queries × 3 tries over gRPC …\n", queries.len());
+
+    let mut results = Vec::with_capacity(queries.len());
+    let mut failures = Vec::new();
+    let mut hot_total = 0.0;
+
+    for (idx, q) in queries.iter().enumerate() {
+        let mut tries = Vec::with_capacity(3);
+        let mut err: Option<String> = None;
+        for _ in 0..3 {
+            let t = Instant::now();
+            match exec_sql_grpc(&mut client, q).await {
+                Ok(_) => tries.push(serde_json::json!(t.elapsed().as_secs_f64())),
+                Err(e) => {
+                    tries.push(serde_json::Value::Null);
+                    err.get_or_insert(e);
+                }
+            }
+        }
+        report(idx, &tries, err, &mut failures, &mut hot_total);
+        results.push(serde_json::Value::Array(tries));
     }
+    summarize(
+        "live-server gRPC",
+        "bench/clickbench/results/local-grpc.json",
+        queries.len(),
+        load_secs,
+        rows,
+        results,
+        failures,
+        hot_total,
+    );
+}
+
+fn report(
+    idx: usize,
+    tries: &[serde_json::Value],
+    err: Option<String>,
+    failures: &mut Vec<(usize, String)>,
+    hot_total: &mut f64,
+) {
+    if let Some(e) = err {
+        let msg = e.lines().next().unwrap_or("").to_string();
+        eprintln!("Q{idx:<2} FAIL  {msg}");
+        failures.push((idx, msg));
+    } else {
+        let hot = hot_of(tries);
+        *hot_total += hot;
+        eprintln!("Q{idx:<2} ok    hot={hot:.4}s");
+    }
+}
+
+fn write_parquet(path: &Path, batch: &RecordBatch) {
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(batch).expect("write batch");
+    writer.close().expect("close parquet");
+}
+
+async fn connect_retry(endpoint: &str) -> SparkConnectServiceClient<Channel> {
+    for _ in 0..50 {
+        if let Ok(c) = SparkConnectServiceClient::connect(endpoint.to_string()).await {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("server did not become ready at {endpoint}");
+}
+
+/// Run one SQL statement over gRPC and drain the response stream; returns row count.
+async fn exec_sql_grpc(
+    client: &mut SparkConnectServiceClient<Channel>,
+    sql: &str,
+) -> Result<usize, String> {
+    let request = sc::ExecutePlanRequest {
+        session_id: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+        plan: Some(sc::Plan {
+            op_type: Some(sc::plan::OpType::Root(sc::Relation {
+                common: None,
+                rel_type: Some(sc::relation::RelType::Sql(sc::Sql {
+                    query: sql.to_string(),
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    };
+    let mut stream = client
+        .execute_plan(request)
+        .await
+        .map_err(|e| e.message().to_string())?
+        .into_inner();
+    let mut rows = 0usize;
+    while let Some(msg) = stream
+        .message()
+        .await
+        .map_err(|e| e.message().to_string())?
+    {
+        if let Some(sc::execute_plan_response::ResponseType::ArrowBatch(b)) = msg.response_type {
+            rows += b.row_count as usize;
+        }
+    }
+    Ok(rows)
 }
 
 #[tokio::main]
@@ -274,12 +423,13 @@ async fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("clickbench") | None => run_clickbench(rows).await,
+        Some("clickbench-grpc") => run_clickbench_grpc(rows).await,
         Some("tpch") => {
             eprintln!("tpch harness: TODO (issue #2)");
             std::process::exit(2);
         }
         Some(other) => {
-            eprintln!("unknown subcommand: {other}; try `clickbench`");
+            eprintln!("unknown subcommand: {other}; try `clickbench` or `clickbench-grpc`");
             std::process::exit(2);
         }
     }
