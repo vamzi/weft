@@ -94,7 +94,8 @@ pub fn uses_plan_id(e: &sc::Expression) -> bool {
     }
 }
 
-fn literal(l: &sc::expression::Literal) -> Result<Expr, Status> {
+/// Translate a Spark literal to a DataFusion literal expression (used by NA fill/replace).
+pub fn literal(l: &sc::expression::Literal) -> Result<Expr, Status> {
     use sc::expression::literal::LiteralType as L;
     let sv = match l
         .literal_type

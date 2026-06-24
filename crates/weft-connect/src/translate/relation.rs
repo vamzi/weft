@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
+use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion::prelude::SessionContext;
 use tonic::Status;
 use weft_proto::spark::connect as sc;
@@ -92,6 +92,9 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
             let input = child(ctx, &s.input).await?;
             build(LogicalPlanBuilder::from(input).alias(s.alias.clone()))
         }
+        RelType::FillNa(f) => na_fill(ctx, f).await,
+        RelType::DropNa(d) => na_drop(ctx, d).await,
+        RelType::Replace(r) => na_replace(ctx, r).await,
         RelType::WithColumns(w) => with_columns(ctx, w).await,
         RelType::WithColumnsRenamed(w) => with_columns_renamed(ctx, w).await,
         RelType::Drop(d) => drop_columns(ctx, d).await,
@@ -556,6 +559,132 @@ async fn to_df(ctx: &SessionContext, t: &sc::ToDf) -> Result<LogicalPlan, Status
         .zip(&t.column_names)
         .map(|(c, n)| Expr::Column(c).alias(n))
         .collect::<Vec<_>>();
+    build(LogicalPlanBuilder::from(input).project(proj))
+}
+
+/// `df.na.fill(...)`: `coalesce(col, value)` for each targeted column whose type matches the
+/// fill value's category (numeric value → numeric columns, etc.), per Spark semantics.
+async fn na_fill(ctx: &SessionContext, f: &sc::NaFill) -> Result<LogicalPlan, Status> {
+    use datafusion::execution::FunctionRegistry;
+    let input = child(ctx, &f.input).await?;
+    let targets = &f.cols;
+    let coalesce = ctx.state().udf("coalesce").map_err(plan_err)?;
+    let mut proj = Vec::new();
+    for (field, c) in input.schema().fields().iter().zip(input.schema().columns()) {
+        let name = field.name();
+        let want = targets.is_empty() || targets.iter().any(|t| t == name);
+        let lit = if f.values.len() == 1 {
+            f.values.first()
+        } else {
+            targets
+                .iter()
+                .position(|t| t == name)
+                .and_then(|i| f.values.get(i))
+        };
+        if let (true, Some(lit)) = (want, lit) {
+            if let Some(val) = na_fill_value(field.data_type(), lit)? {
+                proj.push(coalesce.call(vec![Expr::Column(c), val]).alias(name));
+                continue;
+            }
+        }
+        proj.push(Expr::Column(c));
+    }
+    build(LogicalPlanBuilder::from(input).project(proj))
+}
+
+/// The fill value cast to the column type, but only when the value's category matches the column
+/// (so `fill(0)` touches numeric columns and `fill("x")` touches string columns, like Spark).
+fn na_fill_value(
+    dt: &datafusion::arrow::datatypes::DataType,
+    l: &sc::expression::Literal,
+) -> Result<Option<Expr>, Status> {
+    use datafusion::arrow::datatypes::DataType;
+    use sc::expression::literal::LiteralType as L;
+    let lt = l
+        .literal_type
+        .as_ref()
+        .ok_or_else(|| inval("na fill: empty literal"))?;
+    let num = matches!(
+        lt,
+        L::Byte(_) | L::Short(_) | L::Integer(_) | L::Long(_) | L::Float(_) | L::Double(_)
+    );
+    let matches = (num && dt.is_numeric())
+        || (matches!(lt, L::String(_))
+            && matches!(
+                dt,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ))
+        || (matches!(lt, L::Boolean(_)) && matches!(dt, DataType::Boolean));
+    if !matches {
+        return Ok(None);
+    }
+    let val = super::expr::literal(l)?;
+    Ok(Some(Expr::Cast(datafusion::logical_expr::Cast::new(
+        Box::new(val),
+        dt.clone(),
+    ))))
+}
+
+/// `df.na.drop(...)`: keep rows whose count of non-null values among the subset is at least
+/// `min_non_nulls` (default = all of the subset, i.e. `how="any"`).
+async fn na_drop(ctx: &SessionContext, d: &sc::NaDrop) -> Result<LogicalPlan, Status> {
+    use datafusion::arrow::datatypes::DataType;
+    let input = child(ctx, &d.input).await?;
+    let cols: Vec<Expr> = if d.cols.is_empty() {
+        input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect()
+    } else {
+        d.cols.iter().map(col).collect()
+    };
+    let min = d.min_non_nulls.unwrap_or(cols.len() as i32) as i64;
+    let non_null_count = cols
+        .into_iter()
+        .map(|c| {
+            Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(c.is_not_null()),
+                DataType::Int64,
+            ))
+        })
+        .reduce(|a, b| a + b)
+        .ok_or_else(|| inval("na drop: no columns"))?;
+    build(LogicalPlanBuilder::from(input).filter(non_null_count.gt_eq(lit(min))))
+}
+
+/// `df.na.replace(...)`: `CASE col WHEN old THEN new … ELSE col END` for each targeted column.
+async fn na_replace(ctx: &SessionContext, r: &sc::NaReplace) -> Result<LogicalPlan, Status> {
+    let input = child(ctx, &r.input).await?;
+    let mut proj = Vec::new();
+    for (field, c) in input.schema().fields().iter().zip(input.schema().columns()) {
+        let name = field.name();
+        let want = r.cols.is_empty() || r.cols.iter().any(|t| t == name);
+        if want && !r.replacements.is_empty() {
+            let when_then = r
+                .replacements
+                .iter()
+                .map(|rep| {
+                    let old = super::expr::literal(
+                        rep.old_value.as_ref().ok_or_else(|| inval("replace.old"))?,
+                    )?;
+                    let new = super::expr::literal(
+                        rep.new_value.as_ref().ok_or_else(|| inval("replace.new"))?,
+                    )?;
+                    Ok((Box::new(old), Box::new(new)))
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            let case = Expr::Case(datafusion::logical_expr::Case::new(
+                Some(Box::new(Expr::Column(c.clone()))),
+                when_then,
+                Some(Box::new(Expr::Column(c))),
+            ));
+            proj.push(case.alias(name));
+        } else {
+            proj.push(Expr::Column(c));
+        }
+    }
     build(LogicalPlanBuilder::from(input).project(proj))
 }
 
