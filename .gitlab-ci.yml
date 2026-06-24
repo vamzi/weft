@@ -35,6 +35,11 @@ clickbench-grpc-coverage:
   stage: test
   script: ["cargo run -p weft-bench -- clickbench-grpc --rows 20000"]
 
+# TPC-H subset gate: Q1/Q3/Q5/Q6/Q10 (aggregation + multi-table joins) on synthetic tables.
+tpch-coverage:
+  stage: test
+  script: ["cargo run -p weft-bench -- tpch"]
+
 # Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
 # (Enabled once weft-loom executes queries — Phase 0.)
 correctness:

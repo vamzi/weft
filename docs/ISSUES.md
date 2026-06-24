@@ -16,8 +16,10 @@ parallel, #2 depends on #1.
   uses it over the deprecated `sql` field), `AnalyzePlan(Schema)` with Arrow→Spark type
   conversion, real `Config` get/set, and reattach buffering. Validated with a Rust gRPC client
   (not PySpark) to avoid the local Python 3.14 / pyarrow wheel risk.
-- **#2 — STARTED.** DataFusion is embedded in `weft-loom` (`Engine::sql`); TPC-H subset
-  correctness harness still to come.
+- **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
+  Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
+  counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI
+  (`tpch-coverage`). Oracle-diff correctness (vs DuckDB) still to add.
 - **#3 — local coverage DONE.** `weft-bench` runs all **43/43** ClickBench queries through
   Loom/DataFusion on a synthetic `hits` table (`cargo run -p weft-bench -- clickbench`),
   emitting a ClickBench-format `results.json`; gated in CI (`clickbench-coverage`). The
