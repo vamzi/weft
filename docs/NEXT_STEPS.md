@@ -102,9 +102,12 @@ streaming, and routing `weft spark server --cluster` GROUP BY through `run_distr
 ### Phase 1 exit loose ends
 - Compute **median per-query speedup vs Spark** (need a Spark baseline run or use Sail's published
   per-query Spark numbers) — exit criterion is > 8.4×.
-- **PySpark parity** for the *official* harness (today the live-server bench uses our Rust gRPC
-  client): handle `SqlCommand.input` (PySpark's `spark.sql` path) + `AnalyzePlan(Schema)` with
-  Arrow→Spark type conversion, then validate with stock `pyspark-client`.
+- **PySpark parity — protocol surface DONE** (`crates/weft-connect`): `SqlCommand.input`
+  (`spark.sql(...)`) — query → lazy `SqlCommandResult` relation handle; DDL/DML → eager exec +
+  `LocalRelation`; `LocalRelation` execution wired for `.show()`. `AnalyzePlan(Schema)` returns the
+  result schema via Arrow→Spark `DataType` conversion (`weft-connect::types`). 3 gRPC tests in
+  `tests/pyspark_parity.rs`. **Still open:** validate against *stock* `pyspark-client` (deferred for
+  the local Python 3.14 / pyarrow wheel risk), real `Config` get/set, reattach buffering.
 - Open the upstream PR: copy `results/<date>/c6a.4xlarge.json` + `template.json` under
   `ClickHouse/ClickBench/weft/`.
 
