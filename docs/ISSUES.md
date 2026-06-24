@@ -3,6 +3,21 @@
 The three issues that bootstrap Phase 0. Open these on GitLab in order; #1 and #3 can run in
 parallel, #2 depends on #1.
 
+## ✅ Phase 0 EXIT MET (2026-06-24)
+
+All 43 ClickBench queries run to completion on the **real 14.78 GB / 100 M-row dataset**, on a
+real `c6a.4xlarge` (us-west-2), driven through the live `weft-connect` Spark Connect server over
+gRPC — **43/43 passing, hot total 52.851 s** (Sail's published baseline: 56.3 s; same hardware,
+same dataset, 3 tries, hot = min(try2,try3)).
+
+Honest framing: this is *parity-class*, not a Weft-engineered win — it rides on DataFusion 54
+(newer than Sail's pinned build) + a warm reused server. Beating Sail with a real margin is
+**Phase 1's** job (native heavy operators). Getting here required: DataFusion 43→54 (fixed the
+high-card `GROUP BY` `group_column` panic), gRPC 128 MB + Arrow chunking (fixed the oversized-
+message failures), and a bounded spill pool (`WEFT_MEMORY_LIMIT_BYTES`) so the heavy queries
+spill instead of OOM-killing on 32 GB. Heaviest queries today: Q23 8.98 s (`SELECT *`+LIKE+sort),
+Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Phase 1 targets.
+
 ## Progress
 
 - **#1 — DONE (core slice).** A real tonic `SparkConnectService` is live: vendored protos
