@@ -239,6 +239,10 @@ async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPla
         .iter()
         .map(|e| to_expr(ctx, e, None))
         .collect::<Result<Vec<_>, _>>()?;
+    if a.group_type == sc::aggregate::GroupType::Pivot as i32 {
+        let pivot = a.pivot.as_ref().ok_or_else(|| inval("pivot: no spec"))?;
+        return pivot_aggregate(ctx, input, group, a, pivot);
+    }
     // Spark's aggregate_expressions may repeat the grouping columns; DataFusion's aggregate adds
     // the group columns itself, so drop plain group-column refs from the aggregate list.
     let group_cols: Vec<String> = group.iter().map(|e| e.schema_name().to_string()).collect();
@@ -251,6 +255,86 @@ async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPla
         aggs.push(ex);
     }
     build(LogicalPlanBuilder::from(input).aggregate(group, aggs))
+}
+
+/// `df.groupBy(...).pivot(col, [values]).agg(...)`: one output column per (pivot value, aggregate),
+/// each aggregate filtered to rows where the pivot column equals that value
+/// (`agg(x) FILTER (WHERE pivot = value)`). Requires explicit pivot values (no server-side distinct).
+fn pivot_aggregate(
+    ctx: &SessionContext,
+    input: LogicalPlan,
+    group: Vec<Expr>,
+    a: &sc::Aggregate,
+    pivot: &sc::aggregate::Pivot,
+) -> Result<LogicalPlan, Status> {
+    if pivot.values.is_empty() {
+        return Err(Status::unimplemented(
+            "pivot without an explicit value list is not supported yet",
+        ));
+    }
+    let pivot_col = to_expr(
+        ctx,
+        pivot.col.as_ref().ok_or_else(|| inval("pivot.col"))?,
+        None,
+    )?;
+    let aggs = a
+        .aggregate_expressions
+        .iter()
+        .map(|e| to_expr(ctx, e, None))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let single = aggs.len() == 1;
+    let labels: Vec<String> = aggs.iter().map(agg_label).collect();
+    let mut out = Vec::new();
+    for v in &pivot.values {
+        let name = pivot_value_name(v);
+        let filter = pivot_col.clone().eq(super::expr::literal(v)?);
+        for (agg, label) in aggs.iter().zip(&labels) {
+            // Strip any alias, set the per-value filter on the aggregate, then name the column.
+            let filtered = with_filter(agg.clone().unalias(), filter.clone());
+            let col_name = if single {
+                name.clone()
+            } else {
+                format!("{name}_{label}")
+            };
+            out.push(filtered.alias(col_name));
+        }
+    }
+    build(LogicalPlanBuilder::from(input).aggregate(group, out))
+}
+
+/// Set an aggregate's FILTER (so the pivot keeps only rows matching the value).
+fn with_filter(agg: Expr, filter: Expr) -> Expr {
+    if let Expr::AggregateFunction(mut af) = agg {
+        af.params.filter = Some(Box::new(filter));
+        Expr::AggregateFunction(af)
+    } else {
+        agg
+    }
+}
+
+/// The name Spark uses for an aggregate in a multi-aggregate pivot column (its alias or display).
+fn agg_label(e: &Expr) -> String {
+    match e {
+        Expr::Alias(a) => a.name.clone(),
+        other => other.schema_name().to_string(),
+    }
+}
+
+/// The output column name Spark gives a pivot value (its literal rendered as a string).
+fn pivot_value_name(l: &sc::expression::Literal) -> String {
+    use sc::expression::literal::LiteralType as L;
+    match l.literal_type.as_ref() {
+        Some(L::String(s)) => s.clone(),
+        Some(L::Boolean(b)) => b.to_string(),
+        Some(L::Byte(v)) => v.to_string(),
+        Some(L::Short(v)) => v.to_string(),
+        Some(L::Integer(v)) => v.to_string(),
+        Some(L::Long(v)) => v.to_string(),
+        Some(L::Float(v)) => v.to_string(),
+        Some(L::Double(v)) => v.to_string(),
+        _ => "null".to_string(),
+    }
 }
 
 fn sort_exprs(
