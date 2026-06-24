@@ -99,6 +99,7 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         RelType::WithColumnsRenamed(w) => with_columns_renamed(ctx, w).await,
         RelType::Drop(d) => drop_columns(ctx, d).await,
         RelType::ToDf(t) => to_df(ctx, t).await,
+        RelType::Unpivot(u) => unpivot(ctx, u).await,
         // Single-node: hints and repartitioning are no-ops over the child.
         RelType::Hint(h) => child(ctx, &h.input).await,
         RelType::Repartition(r) => child(ctx, &r.input).await,
@@ -560,6 +561,60 @@ async fn to_df(ctx: &SessionContext, t: &sc::ToDf) -> Result<LogicalPlan, Status
         .map(|(c, n)| Expr::Column(c).alias(n))
         .collect::<Vec<_>>();
     build(LogicalPlanBuilder::from(input).project(proj))
+}
+
+/// `df.unpivot(ids, values, var, val)` (melt): for each value column, project the ids plus a
+/// `(var = "<col name>", val = <col>)` pair, then union them. Value columns default to all
+/// non-id columns; they must share a common type (DataFusion's union coerces/errors like Spark).
+async fn unpivot(ctx: &SessionContext, u: &sc::Unpivot) -> Result<LogicalPlan, Status> {
+    let input = child(ctx, &u.input).await?;
+    let ids = u
+        .ids
+        .iter()
+        .map(|e| to_expr(ctx, e, None))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Value columns: explicit list, or every column not used as an id.
+    let value_exprs: Vec<Expr> = match u.values.as_ref() {
+        Some(v) if !v.values.is_empty() => v
+            .values
+            .iter()
+            .map(|e| to_expr(ctx, e, None))
+            .collect::<Result<_, _>>()?,
+        _ => {
+            let id_names: Vec<String> = ids.iter().map(|e| e.schema_name().to_string()).collect();
+            input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|c| !id_names.iter().any(|n| n == c.name()))
+                .map(Expr::Column)
+                .collect()
+        }
+    };
+    if value_exprs.is_empty() {
+        return Err(inval("unpivot: no value columns"));
+    }
+
+    let mut acc: Option<LogicalPlan> = None;
+    for ve in value_exprs {
+        let vname = ve.schema_name().to_string();
+        let mut proj = ids.clone();
+        proj.push(lit(vname).alias(&u.variable_column_name));
+        proj.push(ve.alias(&u.value_column_name));
+        let part = LogicalPlanBuilder::from(input.clone())
+            .project(proj)
+            .and_then(|b| b.build())
+            .map_err(plan_err)?;
+        acc = Some(match acc {
+            None => part,
+            Some(prev) => LogicalPlanBuilder::from(prev)
+                .union(part)
+                .and_then(|b| b.build())
+                .map_err(plan_err)?,
+        });
+    }
+    acc.ok_or_else(|| inval("unpivot: empty"))
 }
 
 /// `df.na.fill(...)`: `coalesce(col, value)` for each targeted column whose type matches the
