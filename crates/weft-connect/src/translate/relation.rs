@@ -53,7 +53,7 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         RelType::Project(p) => {
             let input = child(ctx, &p.input).await?;
             let exprs = project_exprs(ctx, &input, &p.expressions)?;
-            build(LogicalPlanBuilder::from(input).project(exprs))
+            project_with_windows(input, exprs)
         }
         RelType::Filter(f) => {
             let input = child(ctx, &f.input).await?;
@@ -449,7 +449,54 @@ async fn with_columns(ctx: &SessionContext, w: &sc::WithColumns) -> Result<Logic
         .map(Expr::Column)
         .collect();
     proj.extend(new.into_iter().map(|(_, e)| e));
-    build(LogicalPlanBuilder::from(input).project(proj))
+    project_with_windows(input, proj)
+}
+
+/// Project `exprs`, first lifting any window functions into a `Window` plan node (DataFusion's
+/// physical planner requires window functions there, not inside a bare projection), then rewriting
+/// each window sub-expression to reference its output column.
+fn project_with_windows(input: LogicalPlan, exprs: Vec<Expr>) -> Result<LogicalPlan, Status> {
+    use datafusion::logical_expr::utils::find_window_exprs;
+    let window_exprs = find_window_exprs(&exprs);
+    if window_exprs.is_empty() {
+        return LogicalPlanBuilder::from(input)
+            .project(exprs)
+            .and_then(|b| b.build())
+            .map_err(plan_err);
+    }
+    // The Window node appends one column per window expr after the input columns, in order — map
+    // each window expr to that column by position (its display name resolves qualifiers, so a
+    // name-based lookup would miss).
+    let input_len = input.schema().fields().len();
+    let plan = LogicalPlanBuilder::from(input)
+        .window(window_exprs.clone())
+        .and_then(|b| b.build())
+        .map_err(plan_err)?;
+    let out_cols = plan.schema().columns();
+    let win_map: std::collections::HashMap<Expr, Expr> = window_exprs
+        .into_iter()
+        .enumerate()
+        .map(|(i, we)| (we, Expr::Column(out_cols[input_len + i].clone())))
+        .collect();
+    let projected = exprs
+        .into_iter()
+        .map(|e| replace_windows(e, &win_map))
+        .collect::<Result<Vec<_>, _>>()?;
+    LogicalPlanBuilder::from(plan)
+        .project(projected)
+        .and_then(|b| b.build())
+        .map_err(plan_err)
+}
+
+/// Replace each window-function sub-expression with its `Window`-node output column.
+fn replace_windows(e: Expr, map: &std::collections::HashMap<Expr, Expr>) -> Result<Expr, Status> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    e.transform_up(|node| match map.get(&node) {
+        Some(col) => Ok(Transformed::yes(col.clone())),
+        None => Ok(Transformed::no(node)),
+    })
+    .map(|t| t.data)
+    .map_err(plan_err)
 }
 
 async fn with_columns_renamed(

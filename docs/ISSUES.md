@@ -93,8 +93,13 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   Stress-validated with stock `pyspark-connect 4.0`: createDataFrame, select/filter/withColumn/
   rename/drop, groupBy.agg, orderBy/limit, distinct, joins (incl. self-join), union, string fns,
   when/isin/like, `show`/`collect`/`toPandas`. Rust tests in `tests/dataframe_api.rs`.
-  **Still open:** window functions, pivot, UDFs (`CommonInlineUserDefinedFunction`), `Unpivot`,
-  `NA`/`Stat` ops, `Catalog`/`MlRelation`, streaming, reattach buffering.
+  **Window functions (DONE).** `Expression.Window` lowers to a DataFusion `Window` plan node:
+  ranking (`row_number`/`rank`/`dense_rank`/`ntile`), `lag`/`lead`, and aggregate-over
+  (`sum`/`avg`/… with PARTITION BY / ORDER BY and ROWS/RANGE frames incl. signed `rowsBetween`
+  offsets). Unsigned results (e.g. `row_number`'s UInt64) are cast to signed so Spark can read them.
+  Validated with stock PySpark (`Window.partitionBy().orderBy()`); Rust test in `dataframe_api.rs`.
+  **Still open:** pivot, UDFs (`CommonInlineUserDefinedFunction`), `Unpivot`, `NA`/`Stat` ops,
+  `Catalog`/`MlRelation`, streaming, reattach buffering.
 - **#2 — DONE (subset).** DataFusion embedded in `weft-loom`; `weft-bench tpch` runs the
   Q1/Q3/Q5/Q6/Q10 subset on synthetic tables — **5/5 pass** with structurally-correct row
   counts (Q1's 6 returnflag×linestatus groups, Q5's 6-table ASIA-region join). Gated in CI

@@ -315,13 +315,19 @@ impl WeftService {
             _ => {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
-                let mut batches = self
+                let batches = self
                     .engine
                     .execute_logical_plan(plan)
                     .await
                     .map_err(err_to_status)?;
+                // Spark has no unsigned types; cast unsigned columns (e.g. row_number's UInt64) to
+                // signed so the Arrow IPC the client reads is representable.
+                let mut batches = batches
+                    .into_iter()
+                    .map(signed_columns)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 if batches.is_empty() {
-                    batches.push(RecordBatch::new_empty(schema));
+                    batches.push(RecordBatch::new_empty(signed_schema(&schema)));
                 }
                 Ok(batches)
             }
@@ -787,6 +793,60 @@ fn show_string_batch(text: String) -> RecordBatch {
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![text]))])
         .expect("show_string batch")
+}
+
+/// The signed Arrow type a Spark-unrepresentable unsigned type maps to (widening to stay lossless).
+fn signed_target(
+    dt: &weft_loom::arrow::datatypes::DataType,
+) -> Option<weft_loom::arrow::datatypes::DataType> {
+    use weft_loom::arrow::datatypes::DataType::*;
+    Some(match dt {
+        UInt8 => Int16,
+        UInt16 => Int32,
+        UInt32 => Int64,
+        UInt64 => Int64,
+        _ => return None,
+    })
+}
+
+fn signed_schema(
+    schema: &weft_loom::arrow::datatypes::Schema,
+) -> weft_loom::arrow::datatypes::SchemaRef {
+    use weft_loom::arrow::datatypes::{Field, Schema};
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| match signed_target(f.data_type()) {
+            Some(t) => Arc::new(Field::new(f.name(), t, f.is_nullable())),
+            None => f.clone(),
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+/// Cast any unsigned-integer columns to signed so the result is Spark-representable.
+fn signed_columns(batch: RecordBatch) -> std::result::Result<RecordBatch, Status> {
+    use weft_loom::arrow::compute::cast;
+    if batch
+        .schema()
+        .fields()
+        .iter()
+        .all(|f| signed_target(f.data_type()).is_none())
+    {
+        return Ok(batch);
+    }
+    let schema = signed_schema(batch.schema().as_ref());
+    let cols = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(f, c)| match signed_target(f.data_type()) {
+            Some(t) => cast(c, &t).map_err(|e| Status::internal(format!("cast: {e}"))),
+            None => Ok(c.clone()),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(schema, cols).map_err(|e| Status::internal(format!("rebuild batch: {e}")))
 }
 
 fn err_to_status(e: Error) -> Status {
