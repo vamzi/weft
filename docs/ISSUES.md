@@ -16,7 +16,10 @@ parallel, #2 depends on #1.
   (not PySpark) to avoid the local Python 3.14 / pyarrow wheel risk.
 - **#2 — STARTED.** DataFusion is embedded in `weft-loom` (`Engine::sql`); TPC-H subset
   correctness harness still to come.
-- **#3 — scaffolded** (`bench/clickbench`), not yet wired to the live server.
+- **#3 — local coverage DONE.** `weft-bench` runs all **43/43** ClickBench queries through
+  Loom/DataFusion on a synthetic `hits` table (`cargo run -p weft-bench -- clickbench`),
+  emitting a ClickBench-format `results.json`; gated in CI (`clickbench-coverage`). The
+  official `c6a.4xlarge` run (real 14 GB via the Spark Connect client) is still to wire.
 
 ## #1 — `weft-connect`: Spark Connect gRPC skeleton + session + `ExecutePlan(SQL)→Arrow`
 

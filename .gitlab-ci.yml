@@ -25,6 +25,11 @@ test:
   stage: test
   script: ["cargo test --workspace"]
 
+# Local ClickBench coverage gate: all 43 queries must run through Loom on synthetic data.
+clickbench-coverage:
+  stage: test
+  script: ["cargo run -p weft-bench -- clickbench --rows 20000"]
+
 # Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
 # (Enabled once weft-loom executes queries — Phase 0.)
 correctness:

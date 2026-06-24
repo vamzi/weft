@@ -4,6 +4,19 @@ Weft's north-star benchmark. Mirrors the [ClickBench](https://github.com/ClickHo
 entry contract so results are independently reproducible, and so we can submit an entry
 under `ClickHouse/ClickBench/weft/`.
 
+## Two harnesses
+
+1. **Official entry (this directory's shell scripts)** — `install` + `benchmark.sh` + `query`
+   run the real 14 GB `hits.parquet` on a `c6a.4xlarge`, driving the **live Spark Connect
+   server** via a stock PySpark client (`sc://`), 3 tries/query. This is what we publish and
+   compare against Sail's 56.3 s. *Not yet wired to the live server.*
+2. **Local coverage harness (`weft-bench`)** — `cargo run -p weft-bench -- clickbench` runs the
+   same 43 (DataFusion-dialect) queries through `weft_loom` directly against a **synthetic
+   `hits` table** built from `hits_schema.tsv`. It proves all 43 queries run to completion and
+   emits `results/local-synthetic.json`. It is **for dev/CI coverage only** — synthetic data
+   and (by default) debug builds, so its timings are *not* comparable to Sail's absolute
+   numbers. Gated in CI as `clickbench-coverage`. Currently **43/43 pass**.
+
 ## Contract (from ClickBench)
 
 - Dataset: single `hits` table, 99,997,497 rows × 105 cols, `hits.parquet` ≈ 14.78 GB.
