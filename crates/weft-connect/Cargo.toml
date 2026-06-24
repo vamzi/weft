@@ -17,4 +17,12 @@ weft-optimizer = { workspace = true }
 weft-physical = { workspace = true }
 weft-execution = { workspace = true }
 weft-catalog = { workspace = true }
-# TODO(deps): tonic (gRPC), tokio, arrow-ipc (result batches), tower (auth/interceptors).
+weft-loom = { workspace = true }
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

@@ -1,18 +1,19 @@
-//! `weft-proto` — generated Spark Connect protobuf types.
+//! `weft-proto` — generated Spark Connect protobuf + gRPC types.
 //!
-//! When wired up, this crate vendors the `spark/connect/*.proto` files from a pinned
-//! `apache/spark` tag (target **Spark 4.x**) and runs `tonic-build` in `build.rs` to
-//! produce the `SparkConnectService` server stubs plus the `Relation` / `Expression` /
-//! `DataType` message trees.
-//!
-//! Surface the server must cover (see `docs/architecture.md` §2):
-//! - RPCs: `ExecutePlan`, `AnalyzePlan`, `Config`, `Interrupt`,
-//!   `ReattachExecute`/`ReleaseExecute`, `AddArtifacts`/`ArtifactStatus`,
-//!   `FetchErrorDetails`.
-//! - `Relation.rel_type` oneof (~60 types) and `Expression.expr_type` oneof (~22 types).
-//!
-//! Today it is an empty placeholder so the workspace builds without `protoc`.
+//! The `spark/connect/*.proto` files are vendored under `proto/` from a pinned
+//! `apache/spark` checkout (target **Spark 4.x**) and compiled at build time by
+//! `build.rs` using `protox` (pure-Rust) + `tonic-build`. The generated items live under
+//! [`spark::connect`] — e.g. `spark::connect::Plan`, `spark::connect::ExecutePlanRequest`,
+//! and `spark::connect::spark_connect_service_server::SparkConnectService`.
 
-/// The pinned Spark protocol version this crate targets. The Spark Connect wire
-/// protocol is version-coupled; we test against an exact `pyspark-client`.
+#[allow(clippy::all, missing_docs, rustdoc::all)]
+pub mod spark {
+    #[allow(clippy::all, missing_docs, rustdoc::all)]
+    pub mod connect {
+        tonic::include_proto!("spark.connect");
+    }
+}
+
+/// The Spark protocol version these vendored protos track. The wire protocol is
+/// version-coupled; we test against an exact `pyspark-client`.
 pub const TARGET_SPARK_VERSION: &str = "4.x";
