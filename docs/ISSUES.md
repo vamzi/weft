@@ -33,9 +33,21 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   (`delta_active_files` replays `_delta_log`; `iceberg_active_files` walks metadata.json →
   manifest-list → manifests via avro), then DataFusion 54's native reader. `Engine::register_
   delta`/`register_iceberg`, both tested. v1 limits: no DV / MoR deletes / partition pruning.
-- **1.4 — TODO:** push margin on high-card GROUP BY (Q32 8.08 s, ~100 M near-unique groups; Q28
-  regex 4.0 s) — config can't help; needs a native/strategy operator (uncertain ROI vs DF's own).
-- **1.5 — TODO:** distributed execution MVP (driver/worker + Arrow Flight shuffle) — largest piece.
+- **1.4 — IN PROGRESS:** margin-push DataFusion knobs are now env-tunable in `Engine::new`
+  (`WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`, `WEFT_REPARTITION_AGGREGATIONS`, alongside the
+  existing `WEFT_TARGET_PARTITIONS`) so a sweep needs no rebuild. The sweep itself (Q32/Q33/Q34/Q28
+  on real c6a) is the remaining paid step; honest expectation is config plateaus near the DF54
+  ceiling, in which case the durable margin is the Phase 2 HVM2 path, not a native CPU operator.
+- **1.5a — DONE:** single-stage driver/worker over Arrow Flight (`weft-execution::flight`).
+- **1.5b — DONE (local MVP):** multi-stage distributed shuffle. `partial-agg → hash shuffle by key
+  → final-agg` over Arrow Flight: a prost `StageTicket`/`ShuffleReadTicket` control envelope, FNV
+  hash partitioning of stage output into per-worker buckets (`shuffle::partition`), pull-based
+  shuffle via `do_get(ShuffleReadTicket)`, and `datafusion-proto` physical-fragment ser/de
+  (`shuffle::codec`, round-trips a GROUP BY over a Parquet leaf). `driver::run_distributed`
+  orchestrates the two stages; `weft worker` / `weft driver` CLI subcommands drive it. The headline
+  test `two_worker_groupby_matches_single_node` asserts the distributed result equals single-node
+  row-for-row. v1 limits: re-combinable aggregates only (COUNT/SUM/MIN/MAX; no AVG/COUNT(DISTINCT)
+  auto-decomposition), 2-stage only, static worker list, no shuffle spill, `do_exchange` stubbed.
 - Reusable benchmarking instance: `scratchpad/c6a.sh {up|run|stop|start|down}` (stopped between
   runs; data + build cache persist on EBS).
 

@@ -17,8 +17,8 @@ Sail's 56.3 s (~19% faster)**, same hardware/dataset/methodology.
 | 1.2 Reproducible ClickBench entry | ✅ `bench/clickbench/{install,benchmark.sh}` |
 | 1.3 Delta + Iceberg reads | ✅ version-safe resolvers, tested |
 | 1.5a Distributed MVP (single-stage Flight) | ✅ driver/worker over Arrow Flight, tested |
-| **1.4 Push the margin** | ⬜ NEXT (see below) |
-| **1.5b Distributed shuffle** | ⬜ NEXT |
+| **1.5b Distributed shuffle** | ✅ 2-stage hash shuffle, `two_worker_groupby` test passes |
+| **1.4 Push the margin** | 🟡 knobs wired & env-tunable; sweep needs one paid c6a run |
 | Phase 2 (streaming / Unity / K8s / HVM2 gate) | ⬜ later |
 
 All committed (~18 commits), all gates green: `cargo build/test`, `clippy -D warnings`, `fmt`.
@@ -57,26 +57,36 @@ scratchpad/c6a.sh down    # terminate + delete SG/keypair
 
 ## Next steps (in priority order)
 
-### 1.4 — Push the margin (needs paid c6a runs)
+### 1.4 — Push the margin (knobs wired; sweep needs one paid c6a run)
 Current bottlenecks at 45.51 s: **Q32 8.08 s** (`GROUP BY WatchID, ClientIP` — WatchID near-unique,
 ~100 M groups), **Q28 4.0 s** (REGEXP_REPLACE), **Q33/Q34 ~3.6 s** (high-card GROUP BY).
-1. **Cheap first (one c6a run):** try DataFusion knobs in `weft-loom::Engine::new` —
-   `WEFT_TARGET_PARTITIONS` sweep, larger `execution.batch_size`, `aggregate` settings, and check
-   whether `schema_force_view_types` already covers the string keys. Measure; commit what helps.
-2. **If config plateaus:** assess a native/strategy operator for the ~100 M-group aggregation
-   (adaptive cardinality, two-phase bypass). Honest expectation: DataFusion 54's hash-agg is
-   already strong, so ROI is uncertain — this may confirm we're near the DataFusion ceiling, in
-   which case the durable margin comes from the **HVM2 GPU path (Phase 2)**, not CPU operators.
-3. Re-benchmark with `c6a.sh run`; update `bench/clickbench/results` + `ISSUES.md`.
+1. **DONE — knobs are env-tunable in `weft-loom::Engine::new`** (no rebuild to sweep):
+   `WEFT_TARGET_PARTITIONS`, `WEFT_BATCH_SIZE`, `WEFT_COALESCE_BATCHES`,
+   `WEFT_REPARTITION_AGGREGATIONS`. (`schema_force_view_types` already on for the string keys.)
+2. **REMAINING (one c6a run):** sweep `WEFT_TARGET_PARTITIONS ∈ {8,16,32}` ×
+   `WEFT_BATCH_SIZE ∈ {8192,16384,32768}` + the two agg toggles; record per-query hot times for
+   Q32/Q33/Q34/Q28. Gate: do not regress the 45.51 s total. Commit only knobs that measurably help.
+3. **If config plateaus:** assess a native/strategy operator for the ~100 M-group aggregation —
+   honest expectation is DF54's hash-agg is already strong, so the durable margin comes from the
+   **HVM2 GPU path (Phase 2)**, not CPU operators. Document the "near the DF54 ceiling" finding.
+4. Re-benchmark with `c6a.sh run`; update `bench/clickbench/results` + `ISSUES.md`.
 
-### 1.5b — Distributed shuffle (no AWS cost; pure local Rust)
-Build on `crates/weft-execution/src/flight.rs` (single-stage driver/worker already works):
-1. Add `datafusion-proto = "54"` to ship **serialized physical-plan fragments** (not SQL strings)
-   in the Flight ticket — `PhysicalPlanNode::try_from_physical_plan` / `try_into_physical_plan`.
-2. Split a plan at shuffle boundaries (driver): stage graph; partition the data; workers exchange
-   partitions via Flight `do_get`/`do_exchange` (the shuffle data plane).
-3. Test: a 2-worker GROUP BY with a shuffle, asserting the same result as single-node.
-4. Wire `weft-execution::run(Mode::Distributed)` and a `weft spark server --cluster` path.
+### 1.5b — Distributed shuffle — DONE (local MVP, $0)
+Implemented in `crates/weft-execution`: 2-stage `partial-agg → hash shuffle → final-agg`.
+- `shuffle::protocol` — prost `StageTicket`/`ShuffleReadTicket` envelope (tag-byte prefixed so the
+  legacy raw-SQL `do_get` ticket still works).
+- `shuffle::partition` — FNV hash partitioning of stage output into per-worker buckets.
+- `flight.rs` — `Worker` caches stage output; consumer stages pull their bucket from every upstream
+  via `do_get(ShuffleReadTicket)`, register `shuffle_input`, and finalize.
+- `shuffle::codec` — `datafusion-proto` physical-fragment ser/de (round-trips a GROUP BY over a
+  Parquet leaf; `stage_sql` is the primary path and permanent fallback).
+- `driver::run_distributed` + `weft worker` / `weft driver` CLI subcommands; `run(Mode::Distributed)`
+  seam in `lib.rs`.
+- Test `two_worker_groupby_matches_single_node` asserts row-for-row equality with single-node.
+
+**Remaining 1.5b follow-ups (deferred):** auto-decompose SQL aggregates (AVG/COUNT(DISTINCT) via
+sum+count or sketches), >2-stage plans, shuffle spill, dynamic worker discovery, `do_exchange`
+streaming, and routing `weft spark server --cluster` GROUP BY through `run_distributed`.
 
 ### Phase 1 exit loose ends
 - Compute **median per-query speedup vs Spark** (need a Spark baseline run or use Sail's published
@@ -105,6 +115,11 @@ design — its moat is a *separate* benchmark.)
 - **tonic versions split on purpose:** `weft-connect`/`weft-proto` use **0.12** (Spark Connect);
   `weft-execution` uses **0.14** (matches `arrow-flight 58`). They don't exchange tonic types.
   `arrow_flight::error::FlightError::Tonic` wraps `Box<Status>`.
+- **Shuffle proto alignment is fine:** `datafusion-proto 54`, `arrow-flight 58`, and `prost 0.14`
+  all resolve to **prost 0.14.4** in `weft-execution` (verified) — the shuffle envelope and the
+  DataFusion physical-fragment bytes share one prost major. `datafusion-proto`'s
+  `try_into_physical_plan(&TaskContext, &dyn PhysicalExtensionCodec)` in DF54 takes a `TaskContext`
+  (build via `TaskContext::from(&session_state)`), not a registry+runtime pair.
 - **Lakehouse:** the `deltalake`/`iceberg` crates pin DataFusion 53 → can't compose with our 54.
   We instead resolve tables to their active Parquet file list (`weft_datasource::delta_active_files`
   / `iceberg_active_files`) and use DataFusion 54's native reader. v1 limits: no deletion vectors /
@@ -117,7 +132,8 @@ design — its moat is a *separate* benchmark.)
 ## Map of the code
 `crates/`: `weft-connect` (Spark Connect gRPC server) · `weft-proto` (generated protos via protox) ·
 `weft-loom` (DataFusion 54 engine + lakehouse register) · `weft-datasource` (Delta/Iceberg file
-resolvers) · `weft-execution` (Flight driver/worker) · `weft-bench` (ClickBench/TPC-H/correctness
+resolvers) · `weft-execution` (Flight driver/worker + `shuffle::{protocol,partition,codec}` +
+`driver::run_distributed`) · `weft-bench` (ClickBench/TPC-H/correctness
 harness) · `weft-{plan,analyzer,optimizer,physical,catalog,hvm,common,cli}` (mostly scaffold).
 `bench/clickbench/` (the entry) · `scratchpad/c6a.sh` (AWS runner) · full plan:
 `~/.claude/plans/you-are-a-principal-floofy-donut.md`.

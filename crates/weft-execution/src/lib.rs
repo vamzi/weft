@@ -1,15 +1,20 @@
 //! `weft-execution` — local and distributed execution of physical plans.
 //!
 //! Local mode runs the physical plan across a thread pool (morsel-driven). Distributed
-//! mode (Phase 1 MVP) splits the plan into stages/tasks at shuffle boundaries: a
-//! driver/worker actor control plane over Weft gRPC, and an Arrow Flight data plane for
-//! shuffle + result return. Out-of-core, partitioned shuffle with spill is a deliberate
-//! divergence lane — Sail's cluster mode is new (Feb 2026) and its ClickBench is
-//! single-process-per-query.
+//! mode splits the plan into stages at shuffle boundaries: a driver/worker control plane and
+//! an Arrow Flight data plane for shuffle + result return. The MVP shape is two-stage
+//! `partial-agg → hash shuffle → final-agg` ([`driver::run_distributed`]). Out-of-core,
+//! partitioned shuffle with spill is a deliberate divergence lane — Sail's cluster mode is new
+//! (Feb 2026) and its ClickBench is single-process-per-query.
 
+pub mod driver;
 pub mod flight;
+pub mod shuffle;
 
-use weft_common::Result;
+use std::sync::Arc;
+
+use weft_common::{Error, Result};
+use weft_loom::Engine;
 
 /// Execution mode for a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,10 +25,46 @@ pub enum Mode {
     Distributed,
 }
 
-/// Run a physical plan to completion. Implemented incrementally across Phase 0/1.
-///
-/// Today execution is delegated to a [`weft_loom::Engine`] held by the server; this
-/// function is the seam where the distributed driver/worker scheduler will live.
-pub fn run(_mode: Mode) -> Result<()> {
-    Ok(())
+/// The role this process plays when running distributed.
+#[derive(Debug, Clone)]
+pub enum Role {
+    /// Run as a worker, serving a Flight endpoint on `port`.
+    Worker { port: u16 },
+    /// Run as the driver, orchestrating `plan` across `workers`.
+    Driver {
+        workers: Vec<String>,
+        plan: driver::DistributedPlan,
+    },
+}
+
+/// How to run: the mode and (for distributed) the role.
+pub struct RunConfig {
+    /// The execution mode.
+    pub mode: Mode,
+    /// The role to play (only consulted for [`Mode::Distributed`]).
+    pub role: Option<Role>,
+    /// The engine this process uses (a worker's local engine, or the driver's local engine).
+    pub engine: Arc<Engine>,
+}
+
+/// Drive execution per [`RunConfig`]. For a worker this blocks serving Flight; for a driver it
+/// runs the distributed plan and returns its result. Local mode is a no-op seam today (the
+/// server executes directly on its [`Engine`]).
+pub async fn run(cfg: RunConfig) -> Result<Vec<weft_loom::arrow::record_batch::RecordBatch>> {
+    match cfg.mode {
+        Mode::Local => Ok(Vec::new()),
+        Mode::Distributed => match cfg.role {
+            Some(Role::Worker { port }) => {
+                flight::serve_worker(port, cfg.engine).await?;
+                Ok(Vec::new())
+            }
+            Some(Role::Driver { workers, plan }) => {
+                let cluster = driver::Cluster::new(workers);
+                driver::run_distributed(&cluster, &plan).await
+            }
+            None => Err(Error::Unsupported(
+                "distributed mode requires a Role (worker or driver)".into(),
+            )),
+        },
+    }
 }

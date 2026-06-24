@@ -13,6 +13,9 @@ weft-physical = { workspace = true }
 weft-loom = { workspace = true }
 arrow-flight = "58"
 tonic = "0.14"  # must match arrow-flight 58's tonic (its FlightService trait is over 0.14 types)
+prost = "0.14" # shuffle control envelope; pinned to arrow-flight 58's prost major
+datafusion = "54"        # SessionState/RuntimeEnv for deserializing physical-plan fragments
+datafusion-proto = "54"  # serialize physical-plan fragments shipped in the Flight ticket
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 futures = "0.3"
 
