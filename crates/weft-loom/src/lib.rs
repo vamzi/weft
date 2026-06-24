@@ -49,6 +49,17 @@ impl Engine {
         {
             config = config.with_target_partitions(p);
         }
+        // ClickBench-winning scan settings (mirrors DataFusion's published entry + what Sail
+        // tunes): push filters into the Parquet decoder, reorder them by selectivity, read
+        // binary columns as strings, and use Arrow StringView for big string columns (URL,
+        // Title, Referer) — decisive for the string/scan-heavy queries (Q20–Q28, Q34/Q35).
+        {
+            let opts = config.options_mut();
+            opts.execution.parquet.pushdown_filters = true;
+            opts.execution.parquet.reorder_filters = true;
+            opts.execution.parquet.binary_as_string = true;
+            opts.execution.parquet.schema_force_view_types = true;
+        }
 
         let ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
             .ok()
