@@ -19,6 +19,9 @@ pub enum Mode {
 }
 
 /// Run a physical plan to completion. Implemented incrementally across Phase 0/1.
+///
+/// Today execution is delegated to a [`weft_loom::Engine`] held by the server; this
+/// function is the seam where the distributed driver/worker scheduler will live.
 pub fn run(_mode: Mode) -> Result<()> {
-    weft_loom::execute()
+    Ok(())
 }

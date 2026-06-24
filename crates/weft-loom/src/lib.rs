@@ -14,10 +14,75 @@
 //! The strategy: tie Sail on the ~33 cheap queries (DataFusion parity), beat it 1.5–2× on
 //! the ~10 expensive ones. Winning those *is* winning the total.
 
+use datafusion::prelude::SessionContext;
+use weft_common::{Error, Result};
+
+/// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
+/// Arrow IPC against one version (no cross-crate `arrow` mismatch).
+pub use datafusion::arrow;
+
+use arrow::record_batch::RecordBatch;
+
 /// Backend identifier reported in `EXPLAIN`.
 pub const NAME: &str = "loom";
 
-/// Execute a physical plan on the CPU engine. Implemented in Phase 0.
-pub fn execute() -> weft_common::Result<()> {
-    weft_physical::plan_physical()
+/// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
+/// operators behind the same surface in Phase 1.
+pub struct Engine {
+    ctx: SessionContext,
+}
+
+impl Engine {
+    /// Create a fresh engine with default session state.
+    pub fn new() -> Self {
+        Self {
+            ctx: SessionContext::new(),
+        }
+    }
+
+    /// Run a SQL string and collect the result as Arrow record batches.
+    ///
+    /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
+    /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
+    pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        let df = self
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        df.collect()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Access the underlying DataFusion context (e.g. to register tables/Parquet).
+    pub fn ctx(&self) -> &SessionContext {
+        &self.ctx
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn select_one() {
+        let engine = Engine::new();
+        let batches = engine.sql("SELECT 1 AS x").await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn select_arithmetic() {
+        let engine = Engine::new();
+        let batches = engine.sql("SELECT 40 + 2 AS answer").await.unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+    }
 }

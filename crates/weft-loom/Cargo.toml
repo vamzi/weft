@@ -12,6 +12,10 @@ weft-common = { workspace = true }
 weft-plan = { workspace = true }
 weft-physical = { workspace = true }
 weft-datasource = { workspace = true }
-# TODO(deps): datafusion = "4x" (Phase 0 backend), arrow.
-# Phase 1 native operators replace DataFusion on the ~10 heavy ClickBench queries:
-#   adaptive high-cardinality hash-agg, late-materialized top-N, SIMD LIKE/regex, HLL.
+# Phase 0 backend. The whole workspace shares this one `arrow` (re-exported below) so
+# Arrow IPC bytes produced here line up with whatever encodes them downstream.
+# Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
+datafusion = "43"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
