@@ -115,9 +115,10 @@ streaming, and routing `weft spark server --cluster` GROUP BY through `run_distr
   (inner/outer/semi/anti/cross; using-column coalescing + `plan_id`-resolved conditions + self-join),
   SetOp (union/intersect/except), Deduplicate, Range, SubqueryAlias, WithColumns/Renamed, Drop, ToDf,
   Hint/Repartition; expressions incl. operators, scalar/aggregate functions (registry), Alias, Cast,
-  when/otherwise, isin, like, between, `*`. Stress-tested with `pyspark-connect 4.0`; Rust tests in
-  `tests/dataframe_api.rs`. **Still open:** window functions, pivot, Python UDFs, Unpivot, NA/Stat,
-  Catalog/ML relations, streaming, reattach buffering.
+  when/otherwise, isin, like, between, `*`, **window functions** (ranking/lag/lead/aggregate-over
+  with PARTITION/ORDER/frames, via a DataFusion `Window` node; unsigned results cast to signed).
+  Stress-tested with `pyspark-connect 4.0`; Rust tests in `tests/dataframe_api.rs`.
+  **Still open:** pivot, Python UDFs, Unpivot, NA/Stat, Catalog/ML relations, streaming, reattach.
 - Open the upstream PR: copy `results/<date>/c6a.4xlarge.json` + `template.json` under
   `ClickHouse/ClickBench/weft/`.
 

@@ -136,6 +136,32 @@ async fn filter_lowers_and_executes() {
 }
 
 #[tokio::test]
+async fn window_function_lowers_and_executes() {
+    let mut client = boot(50603).await;
+    // row_number() OVER (ORDER BY v) over 3 rows → 3 rows, and the result is signed (UInt64 from
+    // row_number would be unrepresentable in Spark and error at the client).
+    let src = local_relation(vec![1, 2, 3], vec![30, 10, 20]);
+    let order = sc::expression::SortOrder {
+        child: Some(Box::new(attr("v"))),
+        direction: sc::expression::sort_order::SortDirection::Ascending as i32,
+        null_ordering: 0,
+    };
+    let win = expr(sc::expression::ExprType::Window(Box::new(
+        sc::expression::Window {
+            window_function: Some(Box::new(func("row_number", vec![]))),
+            partition_spec: vec![],
+            order_spec: vec![order],
+            frame_spec: None,
+        },
+    )));
+    let plan = rel(sc::relation::RelType::Project(Box::new(sc::Project {
+        input: boxed(src),
+        expressions: vec![win],
+    })));
+    assert_eq!(count_rows(&mut client, plan).await, 3);
+}
+
+#[tokio::test]
 async fn project_and_aggregate_lower_and_execute() {
     let mut client = boot(50602).await;
     // df(id,v): rows (1,0),(2,0),(3,9) grouped by v → 2 groups.

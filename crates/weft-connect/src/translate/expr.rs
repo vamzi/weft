@@ -44,6 +44,8 @@ pub fn to_expr(
             Ok(inner.alias(name))
         }
         ExprType::Cast(c) => cast(ctx, c, ids),
+        ExprType::Window(w) => window(ctx, w, ids),
+        ExprType::SortOrder(o) => Ok(sort_order(ctx, o, ids)?.expr),
         ExprType::UnresolvedStar(_) => Ok(wildcard()),
         ExprType::ExpressionString(s) => ctx
             .parse_sql_expr(&s.expression, &datafusion::common::DFSchema::empty())
@@ -229,6 +231,166 @@ fn function(
         return Ok(udf.call(args));
     }
     Err(Status::unimplemented(format!("function `{name}`")))
+}
+
+/// Translate a `SortOrder` to a DataFusion [`SortExpr`] (used by both `Sort` and window OVER).
+pub fn sort_order(
+    ctx: &SessionContext,
+    o: &sc::expression::SortOrder,
+    ids: Option<&Ids>,
+) -> Result<datafusion::logical_expr::SortExpr, Status> {
+    use sc::expression::sort_order::{NullOrdering, SortDirection};
+    let e = to_expr(
+        ctx,
+        o.child.as_deref().ok_or_else(|| inval("sort.child"))?,
+        ids,
+    )?;
+    let asc = o.direction != SortDirection::Descending as i32;
+    let nulls_first = match NullOrdering::try_from(o.null_ordering) {
+        Ok(NullOrdering::SortNullsFirst) => true,
+        Ok(NullOrdering::SortNullsLast) => false,
+        _ => asc, // Spark default: nulls first for ASC, last for DESC
+    };
+    Ok(datafusion::logical_expr::SortExpr::new(e, asc, nulls_first))
+}
+
+/// Translate a window expression (`func() OVER (PARTITION BY … ORDER BY … frame)`).
+fn window(
+    ctx: &SessionContext,
+    w: &sc::expression::Window,
+    ids: Option<&Ids>,
+) -> Result<Expr, Status> {
+    use datafusion::execution::FunctionRegistry;
+    use datafusion::logical_expr::expr::{WindowFunction, WindowFunctionDefinition};
+    use datafusion::logical_expr::WindowFrame;
+
+    let wf = w
+        .window_function
+        .as_deref()
+        .ok_or_else(|| inval("window: no function"))?;
+    let Some(sc::expression::ExprType::UnresolvedFunction(f)) = wf.expr_type.as_ref() else {
+        return Err(Status::unimplemented(
+            "window function must be a function call",
+        ));
+    };
+    let args = f
+        .arguments
+        .iter()
+        .map(|a| {
+            if is_wildcard(a) {
+                Ok(lit(ScalarValue::Int64(Some(1))))
+            } else {
+                to_expr(ctx, a, ids)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let lname = f.function_name.to_ascii_lowercase();
+    let state = ctx.state();
+    let fun = if let Ok(udwf) = state.udwf(&lname) {
+        WindowFunctionDefinition::WindowUDF(udwf)
+    } else if let Ok(udaf) = state.udaf(&lname) {
+        WindowFunctionDefinition::AggregateUDF(udaf)
+    } else {
+        return Err(Status::unimplemented(format!(
+            "window function `{}`",
+            f.function_name
+        )));
+    };
+
+    let partition_by = w
+        .partition_spec
+        .iter()
+        .map(|e| to_expr(ctx, e, ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    let order_by = w
+        .order_spec
+        .iter()
+        .map(|o| sort_order(ctx, o, ids))
+        .collect::<Result<Vec<_>, _>>()?;
+    let window_frame = match w.frame_spec.as_ref() {
+        Some(fs) => frame(ctx, fs, ids)?,
+        None => WindowFrame::new(if order_by.is_empty() {
+            None
+        } else {
+            Some(true)
+        }),
+    };
+
+    let mut func = WindowFunction::new(fun, args);
+    func.params.partition_by = partition_by;
+    func.params.order_by = order_by;
+    func.params.window_frame = window_frame;
+    Ok(Expr::WindowFunction(Box::new(func)))
+}
+
+fn frame(
+    ctx: &SessionContext,
+    fs: &sc::expression::window::WindowFrame,
+    ids: Option<&Ids>,
+) -> Result<datafusion::logical_expr::WindowFrame, Status> {
+    use datafusion::logical_expr::{WindowFrame, WindowFrameUnits};
+    use sc::expression::window::window_frame::FrameType;
+    let units = match FrameType::try_from(fs.frame_type) {
+        Ok(FrameType::Row) => WindowFrameUnits::Rows,
+        Ok(FrameType::Range) => WindowFrameUnits::Range,
+        // Undefined frame → DataFusion's ordered default.
+        _ => return Ok(WindowFrame::new(Some(true))),
+    };
+    let start = frame_bound(ctx, fs.lower.as_deref(), true, ids)?;
+    let end = frame_bound(ctx, fs.upper.as_deref(), false, ids)?;
+    Ok(WindowFrame::new_bounds(units, start, end))
+}
+
+fn frame_bound(
+    ctx: &SessionContext,
+    b: Option<&sc::expression::window::window_frame::FrameBoundary>,
+    is_lower: bool,
+    ids: Option<&Ids>,
+) -> Result<datafusion::logical_expr::WindowFrameBound, Status> {
+    use datafusion::logical_expr::WindowFrameBound;
+    use sc::expression::window::window_frame::frame_boundary::Boundary;
+    let unbounded = if is_lower {
+        WindowFrameBound::Preceding(ScalarValue::UInt64(None))
+    } else {
+        WindowFrameBound::Following(ScalarValue::UInt64(None))
+    };
+    let Some(b) = b else {
+        return Ok(WindowFrameBound::CurrentRow);
+    };
+    Ok(match b.boundary.as_ref() {
+        Some(Boundary::CurrentRow(_)) => WindowFrameBound::CurrentRow,
+        Some(Boundary::Unbounded(_)) | None => unbounded,
+        Some(Boundary::Value(e)) => {
+            // Spark frame offsets are signed: negative = N preceding, positive = N following
+            // (regardless of which bound), and DataFusion wants the magnitude as UInt64.
+            let n = match to_expr(ctx, e, ids)? {
+                Expr::Literal(s, _) => scalar_to_i64(&s)
+                    .ok_or_else(|| inval("window frame offset must be an integer literal"))?,
+                _ => return Err(inval("window frame bound must be a literal")),
+            };
+            match n.cmp(&0) {
+                std::cmp::Ordering::Equal => WindowFrameBound::CurrentRow,
+                std::cmp::Ordering::Less => {
+                    WindowFrameBound::Preceding(ScalarValue::UInt64(Some(n.unsigned_abs())))
+                }
+                std::cmp::Ordering::Greater => {
+                    WindowFrameBound::Following(ScalarValue::UInt64(Some(n as u64)))
+                }
+            }
+        }
+    })
+}
+
+/// Extract an integer from a scalar literal (frame offsets arrive as int8/16/32/64).
+fn scalar_to_i64(s: &ScalarValue) -> Option<i64> {
+    match s {
+        ScalarValue::Int8(Some(v)) => Some(*v as i64),
+        ScalarValue::Int16(Some(v)) => Some(*v as i64),
+        ScalarValue::Int32(Some(v)) => Some(*v as i64),
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        _ => None,
+    }
 }
 
 fn cast(ctx: &SessionContext, c: &sc::expression::Cast, ids: Option<&Ids>) -> Result<Expr, Status> {
