@@ -11,6 +11,10 @@ rust-version.workspace = true
 weft-common = { workspace = true }
 weft-physical = { workspace = true }
 weft-loom = { workspace = true }
-# TODO(deps): tokio, arrow-flight (data-plane shuffle), plus an actor model for the
-#             driver/worker control plane. Out-of-core/partitioned shuffle + spill live
-#             here — a CPU-engine concern, independent of HVM2.
+arrow-flight = "58"
+tonic = "0.14"  # must match arrow-flight 58's tonic (its FlightService trait is over 0.14 types)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
