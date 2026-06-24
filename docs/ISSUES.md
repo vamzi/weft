@@ -25,9 +25,17 @@ Q32 8.07 s and Q33/Q34 ~3.5 s (high-card GROUP BY), Q28 4.0 s (regex) — the Ph
   **52.85 s → 45.51 s (−14%), now ~19% under Sail's 56.3 s.** Standout: Q23 `SELECT *`+LIKE+sort
   **8.98 s → 0.64 s (14×)** as late materialization finally kicks in. Caveat: margin still rides
   partly on DataFusion 54 + warm server; durable separation needs native operators.
-- **Next targets** (config can't help these): Q32 8.08 s (`GROUP BY WatchID, ClientIP`, ~100 M
-  near-unique groups), Q28 4.0 s (regex), Q33/Q34 ~3.6 s. Plus distributed MVP + Delta/Iceberg
-  reads per plan §4.
+- **1.2 — publishable ClickBench entry (DONE).** `bench/clickbench/{install,benchmark.sh}` is a
+  self-contained on-box runner (build → fetch 14.78 GB → run 43 via the live server → ClickBench
+  results.json); README documents the 45.51 s vs 56.3 s headline + upstream-submission steps.
+- **1.3 — lakehouse reads (DONE).** Delta + Iceberg, version-safe (the `deltalake`/`iceberg`
+  crates pin DataFusion 53, we're on 54): resolve the table to its active Parquet files
+  (`delta_active_files` replays `_delta_log`; `iceberg_active_files` walks metadata.json →
+  manifest-list → manifests via avro), then DataFusion 54's native reader. `Engine::register_
+  delta`/`register_iceberg`, both tested. v1 limits: no DV / MoR deletes / partition pruning.
+- **1.4 — TODO:** push margin on high-card GROUP BY (Q32 8.08 s, ~100 M near-unique groups; Q28
+  regex 4.0 s) — config can't help; needs a native/strategy operator (uncertain ROI vs DF's own).
+- **1.5 — TODO:** distributed execution MVP (driver/worker + Arrow Flight shuffle) — largest piece.
 - Reusable benchmarking instance: `scratchpad/c6a.sh {up|run|stop|start|down}` (stopped between
   runs; data + build cache persist on EBS).
 
