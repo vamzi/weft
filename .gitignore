@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock IS committed: the workspace ships a binary (weft-cli), so we pin deps.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+myenv/
+dist/
+*.egg-info/
+
+# Benchmark artifacts
+bench/**/hits.parquet
+bench/**/hits_*.parquet
+bench/**/*.tbl
+bench/**/result.csv
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

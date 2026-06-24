@@ -1,0 +1,17 @@
+[package]
+name = "weft-cli"
+description = "The `weft` binary: launches the Spark Connect server and dev utilities."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "weft"
+path = "src/main.rs"
+
+[dependencies]
+weft-common = { workspace = true }
+weft-connect = { workspace = true }
+# TODO(deps): clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,48 @@
+# Weft CI (GitLab). See docs/architecture.md §5.
+stages: [check, test, bench]
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+default:
+  image: rust:1-bookworm
+  before_script:
+    - rustup component add rustfmt clippy
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [.cargo/, target/]
+
+fmt:
+  stage: check
+  script: ["cargo fmt --all -- --check"]
+
+clippy:
+  stage: check
+  script: ["cargo clippy --workspace --all-targets -- -D warnings"]
+
+test:
+  stage: test
+  script: ["cargo test --workspace"]
+
+# Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
+# (Enabled once weft-loom executes queries — Phase 0.)
+correctness:
+  stage: test
+  when: manual
+  script:
+    - ./bench/clickbench/run-correctness.sh
+    - ./bench/tpch/run-correctness.sh
+
+# Nightly performance gate on a self-hosted c6a.4xlarge runner; fails if total hot > Sail's.
+clickbench-nightly:
+  stage: bench
+  tags: [c6a-4xlarge]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  script:
+    - ./bench/clickbench/benchmark.sh
+    - ./bench/clickbench/assert-beats-sail.sh 56.3
+  artifacts:
+    paths: ["bench/clickbench/results/"]
+    expire_in: 90 days

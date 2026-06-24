@@ -1,0 +1,17 @@
+[package]
+name = "weft-loom"
+description = "The CPU engine: vectorized Arrow execution. Embeds DataFusion in Phase 0, carves out native heavy operators in Phase 1."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-plan = { workspace = true }
+weft-physical = { workspace = true }
+weft-datasource = { workspace = true }
+# TODO(deps): datafusion = "4x" (Phase 0 backend), arrow.
+# Phase 1 native operators replace DataFusion on the ~10 heavy ClickBench queries:
+#   adaptive high-cardinality hash-agg, late-materialized top-N, SIMD LIKE/regex, HLL.

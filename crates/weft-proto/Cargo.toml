@@ -1,0 +1,15 @@
+[package]
+name = "weft-proto"
+description = "Generated Spark Connect protobuf types (tonic/prost). Pinned to one Spark version."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# TODO(build, needs protoc + Rust >= 1.80):
+#   [build-dependencies] tonic-build = "0.12"
+#   build.rs compiles sql/connect/common/src/main/protobuf/spark/connect/*.proto
+#   vendored from a pinned apache/spark tag (target Spark 4.x).
+[dependencies]
+# TODO(deps): tonic = "0.12", prost = "0.13"

@@ -1,0 +1,20 @@
+[package]
+name = "weft-connect"
+description = "Spark Connect gRPC server: session lifecycle, Config/AnalyzePlan/ExecutePlan, reattachable execution, Arrow IPC results."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-proto = { workspace = true }
+weft-plan = { workspace = true }
+weft-sql = { workspace = true }
+weft-analyzer = { workspace = true }
+weft-optimizer = { workspace = true }
+weft-physical = { workspace = true }
+weft-execution = { workspace = true }
+weft-catalog = { workspace = true }
+# TODO(deps): tonic (gRPC), tokio, arrow-ipc (result batches), tower (auth/interceptors).

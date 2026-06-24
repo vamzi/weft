@@ -1,0 +1,14 @@
+[package]
+name = "weft-datasource"
+description = "Scan sources into Arrow: Parquet/CSV/JSON + Delta (delta-kernel-rs) and Iceberg (iceberg-rust) reads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+# TODO(deps): parquet, arrow, object_store,
+#             delta_kernel = "0.x" (deletion vectors + column mapping),
+#             iceberg = "0.9" (position + equality deletes).

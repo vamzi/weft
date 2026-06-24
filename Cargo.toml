@@ -1,0 +1,41 @@
+# Weft — drop-in Apache Spark replacement on a vectorized CPU core (Loom) with an
+# opt-in HVM2/Bend parallel backend. See plan: docs/architecture.md.
+#
+# This is the workspace skeleton. Crates are intentionally dependency-free today so
+# the tree builds green offline on Rust 1.72+. Real dependencies (DataFusion, Arrow,
+# tonic/prost, delta-kernel-rs, iceberg-rust, hvm) are listed as TODOs inside each
+# crate's Cargo.toml and require Rust >= 1.80 + protoc when added.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://gitlab.com/weftlabs/weft"
+authors = ["Weft Labs <hello@weftlabs.dev>"]
+rust-version = "1.72"
+
+# Internal crates are wired as path dependencies here so the dependency DAG is
+# expressed once and inherited via `{ workspace = true }` in each crate.
+[workspace.dependencies]
+weft-common     = { path = "crates/weft-common" }
+weft-proto      = { path = "crates/weft-proto" }
+weft-plan       = { path = "crates/weft-plan" }
+weft-sql        = { path = "crates/weft-sql" }
+weft-analyzer   = { path = "crates/weft-analyzer" }
+weft-catalog    = { path = "crates/weft-catalog" }
+weft-optimizer  = { path = "crates/weft-optimizer" }
+weft-physical   = { path = "crates/weft-physical" }
+weft-datasource = { path = "crates/weft-datasource" }
+weft-loom       = { path = "crates/weft-loom" }
+weft-hvm        = { path = "crates/weft-hvm" }
+weft-execution  = { path = "crates/weft-execution" }
+weft-connect    = { path = "crates/weft-connect" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

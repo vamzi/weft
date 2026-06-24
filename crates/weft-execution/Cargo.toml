@@ -1,0 +1,16 @@
+[package]
+name = "weft-execution"
+description = "Runtime: local multi-threaded execution, and distributed driver/worker scheduling with Arrow Flight shuffle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-physical = { workspace = true }
+weft-loom = { workspace = true }
+# TODO(deps): tokio, arrow-flight (data-plane shuffle), plus an actor model for the
+#             driver/worker control plane. Out-of-core/partitioned shuffle + spill live
+#             here — a CPU-engine concern, independent of HVM2.
