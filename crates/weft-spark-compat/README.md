@@ -35,43 +35,55 @@ cargo test -p weft-spark-compat -- --ignored   # full corpus, ~7s
 
 | metric | first baseline | now | Δ |
 |---|---|---|---|
-| strict parity | 2.2% (274) | **3.9% (496)** | +222 |
-| semantic parity | 25.5% (3,223) | **38.9% (4,923)** | +1,700 |
+| strict parity | 2.2% (274) | **4.2% (536)** | +262 |
+| semantic parity | 25.5% (3,223) | **39.4% (4,984)** | +1,761 |
 
-The jump came from the first parity fix: **`CREATE [OR REPLACE] [GLOBAL] TEMPORARY VIEW` support**
-in Weft's engine (`weft_loom::normalize_spark_sql`). DataFusion's `create_view` rejects *only* the
-`temporary` flag, so the rewrite drops the keyword (Spark temp views and DataFusion
-session-catalog views are both session-scoped — semantically equivalent). That cleared 2,438
-cascade failures; ~1,500 of those queries now run and return the right values.
+The jump came from the first parity fixes: **`CREATE [OR REPLACE] [GLOBAL] {TEMPORARY|TEMP} VIEW`
+support** in Weft's engine (`weft_loom::normalize_spark_sql`). DataFusion's `create_view` rejects
+*only* the `temporary` flag, so the rewrite drops the keyword (Spark temp views and DataFusion
+session-catalog views are both session-scoped — semantically equivalent), and also accepts Spark's
+`TEMP` abbreviation. That cleared ~2,650 cascade failures; ~1,500 of those queries now run and
+return the right values.
+
+These rewrites are deliberately **semantically faithful** (drop a keyword that doesn't change
+results). The next-biggest parser cluster — `CREATE TABLE … USING <format>` — is intentionally
+*not* shimmed in the core engine: stripping `USING parquet` would silently turn a persistent table
+into an in-memory one, which is lossy in the production path. Adaptations like that belong in the
+planned `weft-sql` Spark-dialect front end, not in `Engine::sql`.
 
 ### Triage backlog — failures by bucket (current)
 
 | bucket | count | what it means |
 |---|---:|---|
-| `missing-relation` | 3,131 | remaining setup cascades (`CREATE TABLE` variants, `INSERT`, …) |
+| `missing-relation` | 2,916 | remaining setup cascades (`CREATE TABLE … USING`, `INSERT`, …) |
 | `error-parity` | 2,464 | ✓ both engines reject (counts as semantic pass) |
-| `schema-only` | 1,963 | ✓ right values, divergent column name (semantic pass; blocks *strict*) |
-| `function-missing` | 1,639 | functions Weft/DataFusion lacks or names differently |
-| `parser-unsupported` | 1,304 | Spark SQL syntax DataFusion's parser rejects |
-| `exec-error` | 840 | miscellaneous execution failures |
-| `feature-unsupported` | 346 | `PIVOT`, `USE db`, `SHOW CREATE TABLE`, … |
-| `correctness` | 179 | **genuine wrong answers — top priority** |
-| `decimal-precision` | 129 | precision/scale/rounding diverged |
+| `schema-only` | 1,984 | ✓ right values, divergent column name (semantic pass; blocks *strict*) |
+| `function-missing` | 1,653 | functions Weft/DataFusion lacks or names differently |
+| `parser-unsupported` | 1,304 | Spark SQL syntax DataFusion's parser rejects (mostly `CREATE TABLE … USING`) |
+| `exec-error` | 938 | miscellaneous execution failures |
+| `feature-unsupported` | 378 | `PIVOT`, `USE db`, `SHOW CREATE TABLE`, … |
+| `correctness` | 180 | **genuine wrong answers — top priority** |
+| `decimal-precision` | 132 | precision/scale/rounding diverged |
 | `missing-error` | 110 | Weft accepted a query Spark rejects (too lenient) |
-| `null-semantics` | 21 | three-valued-logic divergence |
-| `ordering` | 17 | right multiset, wrong row order |
+| `null-semantics` | 23 | three-valued-logic divergence |
+| `ordering` | 21 | right multiset, wrong row order |
 | `datetime` | 1 | calendar/timezone/format |
 | `engine-panic` | 1 | DataFusion `panic!` (multi-arg `COUNT(DISTINCT a,b)`) — isolated, not fatal |
 
-### Next levers
+### Next levers — and which layer each belongs in
 
-- **`schema-only` (1,963)** — the biggest lever for *strict* parity: these queries already return
-  the right rows, but the `struct<...>` column names differ from Spark's analyzer (`count(a)` vs
-  `count(t.a)`). Aligning generated column names converts ~1,900 semantic passes into strict ones.
-- **`missing-relation` (3,131)** — the remaining setup cascades; chase the next failing
-  `CREATE`/`INSERT` forms the way temp views were chased.
-- **`function-missing` (1,639)** + **`parser-unsupported` (1,304)** — the long tails.
-- **`correctness` (179)** — fewest, but highest-trust: genuine wrong answers.
+The remaining gains split by *where* the work has to live:
+
+- **`weft-sql` Spark-dialect front end (not core `Engine`)** — `CREATE TABLE … USING <format>`
+  (the largest parser + missing-relation driver, ~120 direct + cascades), `PIVOT`, `USE db`,
+  `LIKE ANY`. These need real parsing/planning, and several are *lossy* as naive string shims, so
+  they don't belong in `Engine::sql`.
+- **DataFusion column-naming (`schema_name`)** — `schema-only` (1,984) is the biggest *strict*
+  lever: right rows, but DataFusion names columns `Utf8("hello")` / `count(testdata.a)` where Spark
+  uses `hello` / `count(a)`. Aligning generated names converts ~1,900 semantic passes into strict
+  ones — but it means overriding DataFusion's expr display and is correctness-sensitive.
+- **Real feature/function work** — `function-missing` (1,653), `decimal-precision`, multi-arg
+  `COUNT(DISTINCT)` (the `engine-panic`), `correctness` (180 — fewest but highest-trust).
 
 ## How it works
 
