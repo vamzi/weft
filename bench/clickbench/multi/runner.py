@@ -37,8 +37,11 @@ def load_statements(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--remote", required=True, help="sc://host:port")
-    ap.add_argument("--queries", required=True, help="queries.spark.sql")
-    ap.add_argument("--register-file", required=True, help="engine-specific DDL to create `hits`")
+    ap.add_argument("--queries", required=True, help="queries.spark.sql (or queries.weft.sql)")
+    ap.add_argument("--register-mode", default="sql", choices=["sql", "dataframe"],
+                    help="sql: run --register-file DDL; dataframe: read.parquet + typed casts")
+    ap.add_argument("--register-file", default=None, help="engine-specific DDL (register-mode=sql)")
+    ap.add_argument("--data", default=None, help="parquet path (register-mode=dataframe)")
     ap.add_argument("--out", required=True, help="output results JSON path")
     ap.add_argument("--engine", required=True, help="engine label, e.g. weft / sail / spark / gluten")
     ap.add_argument("--data-size", type=int, default=14779976446)
@@ -52,11 +55,27 @@ def main():
     print(f"[runner:{args.engine}] connecting to {args.remote} …", flush=True)
     spark = SparkSession.builder.remote(args.remote).getOrCreate()
 
-    # ---- registration (engine-specific DDL; not timed) ----------------------------------
+    # ---- registration (engine-specific; not timed) --------------------------------------
+    # The `hits` table must expose EventTime as a TIMESTAMP and EventDate as a DATE: in the raw
+    # parquet they are int64 epoch-seconds and int days-since-epoch, so bare date functions
+    # (extract/date_trunc, Q18/Q42) and date-string filters (Q37-43) fail without the cast. The
+    # same treatment is applied to every engine, so the comparison stays apples-to-apples.
     load_start = time.monotonic()
-    for stmt in load_statements(args.register_file):
-        print(f"[runner:{args.engine}] register: {stmt[:90]}…", flush=True)
-        spark.sql(stmt).collect()
+    if args.register_mode == "dataframe":
+        from pyspark.sql import functions as F
+        df = spark.read.parquet(args.data)
+        cols = set(df.columns)
+        if "EventTime" in cols:
+            df = df.withColumn("EventTime", F.timestamp_seconds(F.col("EventTime").cast("long")))
+        if "EventDate" in cols:
+            df = df.withColumn(
+                "EventDate", F.expr("date_add(date'1970-01-01', cast(EventDate as int))"))
+        df.createOrReplaceTempView("hits")
+        print(f"[runner:{args.engine}] registered `hits` via DataFrame API", flush=True)
+    else:
+        for stmt in load_statements(args.register_file):
+            print(f"[runner:{args.engine}] register: {stmt[:90]}…", flush=True)
+            spark.sql(stmt).collect()
     load_time = time.monotonic() - load_start
     print(f"[runner:{args.engine}] registered `hits` in {load_time:.2f}s", flush=True)
 

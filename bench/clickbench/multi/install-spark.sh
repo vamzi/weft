@@ -22,7 +22,12 @@ VENV="$HERE/.venv-spark"
 if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --quiet --upgrade pip
+  # setuptools<81 restores the `distutils` shim PySpark 3.5 imports (removed from Python 3.12,
+  # the default on Ubuntu 24.04); pandas<2.2 keeps the Arrow conversion path compatible. pyarrow
+  # is left at the Spark-3.5-era (<16) on purpose — Weft's server now materializes StringView, so
+  # an older-Arrow client (what real Spark ships) must work too.
   "$VENV/bin/pip" install --quiet \
-    "pyspark[connect]==${SPARK_VERSION}" pandas pyarrow grpcio grpcio-status protobuf
+    "pyspark[connect]==${SPARK_VERSION}" "setuptools<81" "pandas<2.2" "pyarrow<16" \
+    grpcio grpcio-status protobuf
 fi
 echo "[spark] ready: server=$SPARK_HOME  client=$VENV"
