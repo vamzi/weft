@@ -6,11 +6,15 @@
 //! Spark type-coercion rules. This (plus behavioral parity) is the bulk of the real
 //! engineering effort — not the gRPC transport.
 
-use weft_catalog::Catalog;
+use weft_catalog::CatalogProvider;
 use weft_common::Result;
 use weft_plan::LogicalPlan;
 
-/// Resolve a plan against a catalog. Implemented in Phase 0.
-pub fn resolve(plan: LogicalPlan, _catalog: &dyn Catalog) -> Result<LogicalPlan> {
+/// Resolve a plan against a catalog.
+///
+/// Phase 0 is a no-op: table-name resolution happens lazily in the DataFusion catalog bridge
+/// (`weft-loom::catalog_bridge`), not here. This seam stays for when analysis moves out of
+/// DataFusion (typed coercion, function binding) and needs the catalog directly.
+pub fn resolve(plan: LogicalPlan, _catalog: &dyn CatalogProvider) -> Result<LogicalPlan> {
     Ok(plan)
 }

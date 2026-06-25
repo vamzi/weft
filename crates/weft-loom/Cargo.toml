@@ -12,10 +12,14 @@ weft-common = { workspace = true }
 weft-plan = { workspace = true }
 weft-physical = { workspace = true }
 weft-datasource = { workspace = true }
+weft-catalog = { workspace = true }
+async-trait = "0.1"
 # Phase 0 backend. The whole workspace shares this one `arrow` (re-exported below) so
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.
 # Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
 datafusion = "54"
+# Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
+rayon = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
