@@ -45,3 +45,51 @@
     @apply text-xs font-semibold uppercase tracking-wider text-accent;
   }
 }
+
+/* ── Weaving motifs ─────────────────────────────────────────────────────────────────────
+ * Weft owns the loom: warp (vertical) + weft (horizontal) threads. All built from theme
+ * tokens only — orange accent + hairline border — so they theme automatically in dark mode. */
+@layer components {
+  /* A near-invisible woven texture for hero / closing bands. */
+  .woven-field {
+    background-image:
+      repeating-linear-gradient(90deg, var(--weft-border) 0 1px, transparent 1px 28px),
+      repeating-linear-gradient(0deg, var(--weft-border) 0 1px, transparent 1px 28px);
+    background-size: 28px 28px;
+    -webkit-mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
+    mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
+    opacity: 0.6;
+  }
+  /* A single off-center accent warp thread (the only colored line). */
+  .woven-field::after {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 38%;
+    width: 1px;
+    background: linear-gradient(var(--weft-accent), transparent 70%);
+    opacity: 0.22;
+  }
+  /* Denser variant for the closing band — the cloth "finishes". */
+  .woven-field--dense {
+    background-size: 18px 18px;
+    opacity: 0.75;
+  }
+}
+
+/* SVG warp-weave hatch fill for benchmark bars (referenced by id from React). */
+
+@keyframes weft-shuttle-glide {
+  0% { transform: translateX(-6%); opacity: 0; }
+  15% { opacity: 1; }
+  100% { transform: translateX(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .weft-anim-shuttle {
+    animation: weft-shuttle-glide 0.9s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  /* Threads/bars that grow on scroll-in: width is set inline; transition handles the motion. */
+  .weft-grow {
+    transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}

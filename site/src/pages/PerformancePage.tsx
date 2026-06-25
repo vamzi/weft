@@ -1,8 +1,11 @@
 import BenchmarkChart from "../components/BenchmarkChart";
 import PerQueryChart from "../components/PerQueryChart";
-import SpeedupCallout from "../components/SpeedupCallout";
+import StatChips from "../components/StatChips";
 import CodeBlock from "../components/CodeBlock";
+import ThreadDivider from "../components/ThreadDivider";
 import { benchmarks } from "../lib/benchmarks";
+
+const weft = benchmarks.engines.find((e) => e.key === "weft");
 
 const REPO = "https://github.com/vamzi/weft";
 
@@ -50,8 +53,15 @@ export default function PerformancePage() {
 
       {/* Speedups */}
       <section className="mt-12">
-        <h2 className="mb-4 text-lg font-semibold">Headline</h2>
-        <SpeedupCallout />
+        <h2 className="mb-1 text-lg font-semibold">Headline</h2>
+        <p className="mb-4 max-w-2xl text-sm text-muted">
+          Against Sail — the lean Rust peer and our honest north-star — Weft is the faster engine;
+          Spark and Spark+Gluten are the broader context. And Weft runs the{" "}
+          <strong className="text-body">full 43/43</strong>
+          {weft?.totalAll ? ` (${weft.totalAll.toFixed(1)}s, zero failures)` : ""} — it wins{" "}
+          <em>and</em> finishes everything.
+        </p>
+        <StatChips />
       </section>
 
       {/* Total runtime */}
@@ -81,8 +91,8 @@ export default function PerformancePage() {
       {/* Engine provenance table */}
       <section className="mt-12">
         <h2 className="mb-4 text-lg font-semibold">Engines & provenance</h2>
-        <div className="overflow-hidden rounded-weft border border-hairline">
-          <table className="w-full text-sm">
+        <div className="overflow-x-auto rounded-weft border border-hairline">
+          <table className="w-full min-w-[460px] text-sm">
             <thead className="bg-bg-subtle text-left text-xs uppercase tracking-wide text-muted">
               <tr>
                 <th className="px-4 py-2.5 font-medium">Engine</th>
@@ -133,8 +143,12 @@ export default function PerformancePage() {
         </p>
       </section>
 
+      <div className="my-12">
+        <ThreadDivider node={0.5} />
+      </div>
+
       {/* Methodology */}
-      <section className="mt-12 grid gap-8 lg:grid-cols-2">
+      <section className="mt-2 grid gap-8 lg:grid-cols-2">
         <div>
           <h2 className="mb-3 text-lg font-semibold">Methodology</h2>
           <ul className="space-y-2.5 text-sm text-muted">

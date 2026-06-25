@@ -1,4 +1,6 @@
-import { engineColor, type Engine } from "../lib/benchmarks";
+import { benchmarks, engineColor, type Engine } from "../lib/benchmarks";
+
+const weftTotal = benchmarks.engines.find((e) => e.key === "weft")?.total ?? null;
 
 /**
  * Total-runtime horizontal bar chart (lower = faster). Measured engines draw a solid bar scaled
@@ -14,6 +16,8 @@ export default function BenchmarkChart({
 }) {
   const measured = engines.filter((e) => e.total != null) as (Engine & { total: number })[];
   const max = measured.length ? Math.max(...measured.map((e) => e.total)) : 1;
+  // Fastest first; pending (null) last — matches the ShuttlePass order.
+  const ordered = [...engines].sort((a, b) => (a.total ?? Infinity) - (b.total ?? Infinity));
 
   return (
     <div className="weft-card p-5 sm:p-6">
@@ -22,7 +26,7 @@ export default function BenchmarkChart({
         <span className="text-xs text-muted">seconds · lower is better</span>
       </div>
       <div className="space-y-3.5">
-        {engines.map((e) => {
+        {ordered.map((e) => {
           const pending = e.total == null;
           const pct = pending ? 100 : Math.max(4, (e.total! / max) * 100);
           return (
@@ -35,7 +39,7 @@ export default function BenchmarkChart({
                   </span>
                 )}
               </div>
-              <div className="h-7 overflow-hidden rounded-weft-sm bg-bg-subtle">
+              <div className="relative flex h-7 items-center overflow-hidden rounded-weft-sm bg-bg-subtle">
                 <div
                   className={
                     pending
@@ -48,6 +52,12 @@ export default function BenchmarkChart({
                       : { width: `${pct}%`, backgroundColor: engineColor(e.key) }
                   }
                 />
+                {/* "×N slower than Weft" tick at the bar's end */}
+                {!pending && !e.highlight && weftTotal && (
+                  <span className="ml-2 whitespace-nowrap text-[11px] font-medium tabular-nums text-muted">
+                    {(e.total! / weftTotal).toFixed(2)}× Weft
+                  </span>
+                )}
               </div>
               <div className="text-right text-sm tabular-nums">
                 {pending ? (

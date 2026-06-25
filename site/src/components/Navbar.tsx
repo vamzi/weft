@@ -29,16 +29,19 @@ export default function Navbar() {
           <img src="weft.svg" alt="Weft" className="h-7 w-7" />
           <span className="text-base font-semibold tracking-tight">Weft</span>
         </Link>
-        <nav className="flex items-center gap-6">
+        <nav className="flex items-center gap-5 sm:gap-6">
           <NavLink to="/" end className={link}>
             Overview
           </NavLink>
           <NavLink to="/performance" className={link}>
-            Performance
+            Benchmarks
+          </NavLink>
+          <NavLink to="/architecture" className={link}>
+            Architecture
           </NavLink>
           <a
             href={`${REPO}#readme`}
-            className="text-sm font-medium text-muted transition-colors hover:text-body"
+            className="hidden text-sm font-medium text-muted transition-colors hover:text-body sm:inline"
           >
             Docs
           </a>

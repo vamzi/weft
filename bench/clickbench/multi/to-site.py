@@ -22,7 +22,7 @@ ENGINES = [
     {"key": "weft", "name": "Weft", "highlight": True},
     {"key": "sail", "name": "Sail", "highlight": False},
     {"key": "spark", "name": "Spark", "highlight": False},
-    {"key": "gluten", "name": "Spark + Gluten/Velox", "highlight": False},
+    {"key": "gluten", "name": "Spark + Gluten", "highlight": False},
 ]
 
 
