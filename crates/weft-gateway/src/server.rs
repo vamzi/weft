@@ -711,7 +711,7 @@ async fn run_aws(aws_bin: &str, args: &[String]) -> Result<String, String> {
 /// Minimal base64 (standard alphabet) for the EC2 user-data payload.
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
         let b = [
             chunk[0],
