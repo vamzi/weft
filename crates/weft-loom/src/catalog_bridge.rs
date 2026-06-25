@@ -213,7 +213,10 @@ async fn metadata_to_provider(
 /// EC2 instance role (IMDS) via object_store's default provider; no static keys. Registering on the
 /// shared runtime is idempotent and persists for the session, so query-time resolution finds it.
 /// `file://` and bare paths need nothing and are skipped.
-fn ensure_remote_store(state: &SessionState, url: &datafusion::datasource::listing::ListingTableUrl) {
+fn ensure_remote_store(
+    state: &SessionState,
+    url: &datafusion::datasource::listing::ListingTableUrl,
+) {
     if url.scheme() != "s3" {
         return;
     }

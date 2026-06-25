@@ -54,6 +54,79 @@ fn env_bool(key: &str) -> Option<bool> {
     }
 }
 
+/// Adapt Spark-dialect SQL that DataFusion's planner rejects verbatim but supports once a
+/// dialect-only keyword is dropped. The rewrite only touches the leading DDL keywords and leaves
+/// the statement body byte-for-byte intact.
+///
+/// Today it handles `CREATE [OR REPLACE] [GLOBAL] TEMPORARY VIEW … ` → `CREATE [OR REPLACE]
+/// VIEW … `. Spark temporary views are *session*-scoped; a DataFusion session-catalog view is
+/// too, so dropping `TEMPORARY`/`GLOBAL` preserves the semantics within a session while letting
+/// DataFusion register the view (its `create_view` rejects `temporary` and nothing else). This is
+/// the single biggest Spark-parity unlock — almost every Spark SQL test opens with
+/// `CREATE OR REPLACE TEMPORARY VIEW testData AS …`.
+///
+/// This is a stopgap living in the engine; it will migrate into the `weft-sql` Spark-dialect
+/// front end when that lands.
+pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
+    match strip_temporary_view(query) {
+        Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+        None => std::borrow::Cow::Borrowed(query),
+    }
+}
+
+/// Read the next whitespace-delimited token from `s` starting at `*cur`, returning its byte span
+/// and advancing `*cur` past it. `None` at end of input.
+fn next_token(s: &str, cur: &mut usize) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    while *cur < b.len() && b[*cur].is_ascii_whitespace() {
+        *cur += 1;
+    }
+    let start = *cur;
+    while *cur < b.len() && !b[*cur].is_ascii_whitespace() {
+        *cur += 1;
+    }
+    (start < *cur).then_some((start, *cur))
+}
+
+/// If `query` begins with `CREATE [OR REPLACE] [GLOBAL] TEMPORARY VIEW`, return the same
+/// statement with `GLOBAL TEMPORARY` removed; otherwise `None` (leave the query untouched).
+fn strip_temporary_view(query: &str) -> Option<String> {
+    let lead = query.len() - query.trim_start().len();
+    let (ws, rest) = query.split_at(lead);
+    let eq = |span: (usize, usize), kw: &str| rest[span.0..span.1].eq_ignore_ascii_case(kw);
+
+    let mut cur = 0;
+    if !eq(next_token(rest, &mut cur)?, "create") {
+        return None;
+    }
+    let mut or_replace = false;
+    let mut tok = next_token(rest, &mut cur)?;
+    if eq(tok, "or") {
+        if !eq(next_token(rest, &mut cur)?, "replace") {
+            return None;
+        }
+        or_replace = true;
+        tok = next_token(rest, &mut cur)?;
+    }
+    if eq(tok, "global") {
+        tok = next_token(rest, &mut cur)?;
+    }
+    // Only rewrite when `TEMPORARY` is actually present (otherwise DataFusion already copes).
+    if !eq(tok, "temporary") {
+        return None;
+    }
+    if !eq(next_token(rest, &mut cur)?, "view") {
+        return None;
+    }
+    // The statement body (view name onward) is preserved verbatim from just after `VIEW`.
+    let head = if or_replace {
+        "CREATE OR REPLACE VIEW"
+    } else {
+        "CREATE VIEW"
+    };
+    Some(format!("{ws}{head}{}", &rest[cur..]))
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -127,9 +200,10 @@ impl Engine {
     /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
     /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        let query = normalize_spark_sql(query);
         let df = self
             .ctx
-            .sql(query)
+            .sql(query.as_ref())
             .await
             .map_err(|e| Error::Plan(e.to_string()))?;
         df.collect()
@@ -140,9 +214,10 @@ impl Engine {
     /// Resolve the result schema of `query` without executing it — the logical-plan schema.
     /// Used by Spark Connect `AnalyzePlan(Schema)` (PySpark `df.schema` / `printSchema`).
     pub async fn schema(&self, query: &str) -> Result<arrow::datatypes::SchemaRef> {
+        let query = normalize_spark_sql(query);
         let df = self
             .ctx
-            .sql(query)
+            .sql(query.as_ref())
             .await
             .map_err(|e| Error::Plan(e.to_string()))?;
         Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
@@ -423,6 +498,56 @@ mod tests {
         let engine = Engine::new();
         let batches = engine.sql("SELECT 40 + 2 AS answer").await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn normalize_strips_temporary_view() {
+        // The four Spark spellings collapse to plain CREATE [OR REPLACE] VIEW, body untouched.
+        assert_eq!(
+            normalize_spark_sql("CREATE TEMPORARY VIEW t AS SELECT 1 a"),
+            "CREATE VIEW t AS SELECT 1 a"
+        );
+        assert_eq!(
+            normalize_spark_sql("CREATE OR REPLACE TEMPORARY VIEW t AS SELECT 1 a"),
+            "CREATE OR REPLACE VIEW t AS SELECT 1 a"
+        );
+        assert_eq!(
+            normalize_spark_sql("create global temporary view t as select 1"),
+            "CREATE VIEW t as select 1"
+        );
+        // Case-insensitive keywords, leading whitespace preserved.
+        assert_eq!(
+            normalize_spark_sql("  Create Temporary View v As Select 2"),
+            "  CREATE VIEW v As Select 2"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_other_statements_untouched() {
+        for q in [
+            "SELECT * FROM t",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TABLE t(a INT)",
+            "CREATE TEMPORARY FUNCTION f AS 'x'",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_view_then_query_roundtrips() {
+        // The whole point: a Spark-style temp view registers and is queryable afterwards.
+        let engine = Engine::new();
+        engine
+            .sql("CREATE OR REPLACE TEMPORARY VIEW testData AS SELECT * FROM VALUES (1,2),(3,4) AS t(a,b)")
+            .await
+            .expect("temp view should register");
+        let batches = engine
+            .sql("SELECT COUNT(*) AS n FROM testData")
+            .await
+            .expect("query against temp view");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     }
 
     #[tokio::test]

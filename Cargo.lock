@@ -4604,6 +4604,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tonic 0.12.3",
  "tower 0.5.3",
  "tower-http 0.5.2",
  "weft-catalog",
@@ -4614,6 +4615,7 @@ dependencies = [
  "weft-govern",
  "weft-loom",
  "weft-meta",
+ "weft-proto",
  "weft-sql",
 ]
 
@@ -4707,6 +4709,17 @@ version = "0.0.0"
 dependencies = [
  "weft-common",
  "weft-meta",
+]
+
+[[package]]
+name = "weft-spark-compat"
+version = "0.0.0"
+dependencies = [
+ "datafusion",
+ "serde",
+ "serde_json",
+ "tokio",
+ "weft-loom",
 ]
 
 [[package]]
