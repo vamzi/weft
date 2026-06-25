@@ -94,4 +94,62 @@ mod tests {
         assert_eq!(direct_rows, round_rows);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Why the distributed path ships *SQL* per stage rather than serialized consumer plans:
+    // a MemTable (in-memory `shuffle_input`) leaf *does* serialize, but datafusion-proto BAKES THE
+    // DATA into the bytes — it does not late-bind the table by name on deserialize. So a consumer
+    // fragment cannot be shipped from the driver and rebound to a worker's freshly-pulled shuffle
+    // bucket; the worker must re-plan its stage SQL against its own locally-registered input. This
+    // test pins that behavior so the “named-table placeholder + worker rebind” idea isn't retried.
+    #[tokio::test]
+    async fn memtable_leaf_bakes_in_data_not_late_bound() {
+        use weft_loom::arrow::array::Int64Array;
+        use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+
+        fn b(ks: Vec<i64>, vs: Vec<i64>) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("s", DataType::Int64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ks)),
+                    Arc::new(Int64Array::from(vs)),
+                ],
+            )
+            .unwrap()
+        }
+
+        let driver = Engine::new();
+        driver
+            .register_batches("shuffle_input", vec![b(vec![1, 2, 1], vec![10, 20, 30])])
+            .unwrap();
+        let bytes = serialize_plan(
+            &driver
+                .physical_plan("SELECT SUM(s) AS s FROM shuffle_input")
+                .await
+                .unwrap(),
+        )
+        .expect("a MemTable-leaf plan still serializes");
+
+        // A *different* worker engine with different data under the same name.
+        let worker = Engine::new();
+        worker
+            .register_batches("shuffle_input", vec![b(vec![1, 1, 1], vec![100, 100, 100])])
+            .unwrap();
+        let restored = deserialize_plan(&bytes, &worker.session_state()).unwrap();
+        let out = worker.execute_plan(restored).await.unwrap();
+        let sum = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        // 60 == the driver's baked-in data; 300 would be late-binding to the worker's data.
+        assert_eq!(
+            sum, 60,
+            "data is baked into the fragment, not late-bound by name"
+        );
+    }
 }

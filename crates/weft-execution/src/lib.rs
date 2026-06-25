@@ -9,6 +9,7 @@
 
 pub mod driver;
 pub mod flight;
+pub mod plan;
 pub mod shuffle;
 
 use std::sync::Arc;

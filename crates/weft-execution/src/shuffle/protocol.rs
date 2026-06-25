@@ -37,6 +37,19 @@ pub struct StageTicket {
     /// Output column indices to hash-partition this stage's result on (the shuffle key).
     #[prost(uint32, repeated, tag = "7")]
     pub hash_key_cols: Vec<u32>,
+    /// Upstream stage ids this stage consumes (empty == a leaf producer). One entry per shuffle
+    /// input: the consumer pulls bucket `partition_id` of each upstream stage from every worker in
+    /// `upstream_endpoints` and registers it as `shuffle_input` (single upstream) or
+    /// `shuffle_input_{i}` (the i-th of several — e.g. the two sides of a shuffle join). Replaces
+    /// the former implicit `stage_id - 1` chaining so an arbitrary stage DAG can be expressed.
+    #[prost(uint32, repeated, tag = "8")]
+    pub upstream_stage_ids: Vec<u32>,
+    /// Whether this stage *produces* for downstreams: hash-partition its output by `hash_key_cols`
+    /// and cache the buckets (returning empty), vs. an *output* stage that returns its result. A
+    /// stage may both consume upstreams and produce (an intermediate stage of a multi-shuffle DAG,
+    /// e.g. a join whose result is re-shuffled before a final aggregate).
+    #[prost(bool, tag = "9")]
+    pub produce: bool,
 }
 
 /// A pull request for one hash bucket of an already-produced stage output.
@@ -116,6 +129,8 @@ mod tests {
             stage_sql: "SELECT k, SUM(c) FROM shuffle_input GROUP BY k".into(),
             plan_fragment: vec![],
             hash_key_cols: vec![0],
+            upstream_stage_ids: vec![0],
+            produce: false,
         };
         let bytes = t.to_ticket_bytes();
         match decode_ticket(&bytes).unwrap() {

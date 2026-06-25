@@ -28,15 +28,20 @@ use arrow_flight::{
 use futures::{StreamExt, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use weft_common::{Error, Result};
-use weft_loom::arrow::datatypes::Schema;
+use weft_loom::arrow::datatypes::{Schema, SchemaRef};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
 use crate::shuffle::protocol::{self, ShuffleReadTicket, StageTicket};
 use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 
+/// One stage's cached output: the output schema (so an *empty* bucket can still be served as a
+/// schema-carrying batch — a downstream consumer must always be able to register the input table)
+/// plus the per-downstream buckets.
+type CachedStage = (SchemaRef, Vec<Vec<RecordBatch>>);
+
 /// Per-stage cached output, partitioned into buckets (one per downstream worker).
-type StageCache = Arc<Mutex<HashMap<u32, Vec<Vec<RecordBatch>>>>>;
+type StageCache = Arc<Mutex<HashMap<u32, CachedStage>>>;
 
 /// A Flight worker that runs stages on its local engine and serves shuffle buckets.
 pub struct Worker {
@@ -78,11 +83,41 @@ fn batches_to_stream(batches: Vec<RecordBatch>) -> FlightStream<FlightData> {
 }
 
 impl Worker {
-    /// Run a [`StageTicket`]: leaf stages partition + cache + return empty; consumer stages
-    /// pull their input bucket from upstreams, register it, run, and return the result.
+    /// Run a [`StageTicket`]. First, if it has upstreams, pull this worker's bucket of each upstream
+    /// stage from every worker and register them as `shuffle_input` (one upstream) or
+    /// `shuffle_input_{i}` (the i-th of several — e.g. a shuffle join's two sides). Then run the
+    /// stage SQL. If `produce` is set, hash-partition the result by `hash_key_cols` and cache it for
+    /// downstreams (returning empty); otherwise return the result (the output stage). A stage can
+    /// both consume *and* produce — an intermediate stage of a multi-shuffle DAG.
     async fn run_stage(&self, t: StageTicket) -> std::result::Result<Vec<RecordBatch>, Status> {
-        if t.upstream_endpoints.is_empty() {
-            // Leaf (producer) stage: run on local data, hash-partition, cache for downstreams.
+        // Pull + register each upstream's bucket (no-op for a leaf).
+        let single = t.upstream_stage_ids.len() == 1;
+        for (i, &up_stage) in t.upstream_stage_ids.iter().enumerate() {
+            let mut input = Vec::new();
+            for ep in &t.upstream_endpoints {
+                let part = pull_bucket(ep.clone(), up_stage, t.partition_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                input.extend(part);
+            }
+            let name = if single {
+                SHUFFLE_INPUT_TABLE.to_string()
+            } else {
+                format!("{SHUFFLE_INPUT_TABLE}_{i}")
+            };
+            self.engine
+                .register_batches(&name, input)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        if t.produce {
+            // Producer: capture the output schema up front so an empty bucket can still be served
+            // typed, then run, hash-partition, and cache for downstreams.
+            let schema = self
+                .engine
+                .schema(&t.stage_sql)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
             let batches = self
                 .engine
                 .sql(&t.stage_sql)
@@ -94,21 +129,10 @@ impl Worker {
             self.stage_outputs
                 .lock()
                 .expect("stage cache poisoned")
-                .insert(t.stage_id, buckets);
+                .insert(t.stage_id, (schema, buckets));
             Ok(Vec::new())
         } else {
-            // Consumer stage: pull this worker's bucket from every upstream's prior stage.
-            let upstream_stage = t.stage_id.saturating_sub(1);
-            let mut input = Vec::new();
-            for ep in &t.upstream_endpoints {
-                let part = pull_bucket(ep.clone(), upstream_stage, t.partition_id)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                input.extend(part);
-            }
-            self.engine
-                .register_batches(SHUFFLE_INPUT_TABLE, input)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            // Output stage: run and return the result.
             self.engine
                 .sql(&t.stage_sql)
                 .await
@@ -116,14 +140,18 @@ impl Worker {
         }
     }
 
-    /// Serve one cached shuffle bucket (or an empty result if absent).
+    /// Serve one cached shuffle bucket. An empty bucket is served as a single schema-carrying
+    /// empty batch (never a truly empty stream) so the consumer can always register the input
+    /// table — important for shuffle joins where some key buckets legitimately have no rows.
     fn read_shuffle(&self, r: ShuffleReadTicket) -> Vec<RecordBatch> {
-        self.stage_outputs
-            .lock()
-            .expect("stage cache poisoned")
-            .get(&r.stage_id)
-            .and_then(|buckets| buckets.get(r.target_partition as usize).cloned())
-            .unwrap_or_default()
+        let guard = self.stage_outputs.lock().expect("stage cache poisoned");
+        let Some((schema, buckets)) = guard.get(&r.stage_id) else {
+            return Vec::new();
+        };
+        match buckets.get(r.target_partition as usize) {
+            Some(b) if !b.is_empty() => b.clone(),
+            _ => vec![RecordBatch::new_empty(schema.clone())],
+        }
     }
 }
 
@@ -336,6 +364,8 @@ mod tests {
             stage_sql: "SELECT 1 AS k, 2 AS v".into(),
             plan_fragment: vec![],
             hash_key_cols: vec![0],
+            upstream_stage_ids: vec![],
+            produce: true,
         };
         let mut out = None;
         for _ in 0..50 {
