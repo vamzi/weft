@@ -111,8 +111,9 @@ fn strip_temporary_view(query: &str) -> Option<String> {
     if eq(tok, "global") {
         tok = next_token(rest, &mut cur)?;
     }
-    // Only rewrite when `TEMPORARY` is actually present (otherwise DataFusion already copes).
-    if !eq(tok, "temporary") {
+    // Only rewrite when the temp keyword is present (otherwise DataFusion already copes). Spark
+    // accepts both `TEMPORARY` and the `TEMP` abbreviation.
+    if !eq(tok, "temporary") && !eq(tok, "temp") {
         return None;
     }
     if !eq(next_token(rest, &mut cur)?, "view") {
@@ -514,6 +515,15 @@ mod tests {
         assert_eq!(
             normalize_spark_sql("create global temporary view t as select 1"),
             "CREATE VIEW t as select 1"
+        );
+        // `TEMP` is Spark's accepted abbreviation for `TEMPORARY`.
+        assert_eq!(
+            normalize_spark_sql("CREATE TEMP VIEW df AS SELECT 1"),
+            "CREATE VIEW df AS SELECT 1"
+        );
+        assert_eq!(
+            normalize_spark_sql("CREATE GLOBAL TEMP VIEW v(a,b) AS VALUES (1,2)"),
+            "CREATE VIEW v(a,b) AS VALUES (1,2)"
         );
         // Case-insensitive keywords, leading whitespace preserved.
         assert_eq!(

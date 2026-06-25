@@ -83,7 +83,13 @@ impl FileReport {
             }
             if v.bucket.is_semantic_pass() {
                 semantic_pass += 1;
-            } else if failures.len() < FAILURE_CAP {
+            }
+            // Backlog = every strict-blocker, so it drives *both* scores. We exclude clean
+            // `error-parity` (both engines reject — nothing to fix) but keep `schema-only` /
+            // `ordering` (semantic passes that still block strict parity).
+            let actionable = !v.bucket.is_strict_pass()
+                && !matches!(v.bucket, crate::classify::Bucket::ErrorParity);
+            if actionable && failures.len() < FAILURE_CAP {
                 failures.push(Failure {
                     bucket: bucket_key(v.bucket).to_string(),
                     sql: sql.chars().take(160).collect(),
