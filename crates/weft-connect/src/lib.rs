@@ -204,6 +204,28 @@ impl WeftService {
         ])
     }
 
+    /// Resolve a request `Plan` (a `spark.sql(...)` command or a DataFrame relation tree) to a
+    /// DataFusion logical plan — the seam `AnalyzePlan(Explain)` uses. A `SqlCommand` plans the
+    /// query text; any relation lowers through the DataFrame translator (which handles `Sql`,
+    /// `LocalRelation`, and the full relation surface).
+    async fn resolve_plan(
+        &self,
+        plan: &Option<sc::Plan>,
+    ) -> std::result::Result<datafusion::logical_expr::LogicalPlan, Status> {
+        match plan.as_ref().and_then(|p| p.op_type.as_ref()) {
+            Some(sc::plan::OpType::Command(cmd)) => match cmd.command_type.as_ref() {
+                Some(sc::command::CommandType::SqlCommand(c)) => {
+                    let sql = sql_command_text(c)
+                        .ok_or_else(|| Status::invalid_argument("empty SqlCommand"))?;
+                    self.engine.logical_plan(&sql).await.map_err(err_to_status)
+                }
+                _ => Err(Status::unimplemented("AnalyzePlan: unsupported command")),
+            },
+            Some(sc::plan::OpType::Root(rel)) => translate::to_plan(self.engine.ctx(), rel).await,
+            _ => Err(Status::unimplemented("AnalyzePlan: empty plan")),
+        }
+    }
+
     /// Resolve the result schema of a plan for `AnalyzePlan(Schema)`.
     async fn plan_schema(
         &self,
@@ -416,6 +438,40 @@ impl SparkConnectService for WeftService {
                     schema: Some(types::schema_to_spark(&schema)),
                 }))
             }
+            // PySpark `df.explain()` — render the optimized + physical plan. EXTENDED/COST/FORMATTED
+            // also include the logical plans; SIMPLE (and the unspecified default) show physical only.
+            Some(Analyze::Explain(e)) => {
+                use sc::analyze_plan_request::explain::ExplainMode;
+                let plan = self.resolve_plan(&e.plan).await?;
+                let extended = matches!(
+                    ExplainMode::try_from(e.explain_mode),
+                    Ok(ExplainMode::Extended | ExplainMode::Cost | ExplainMode::Formatted)
+                );
+                let text = self
+                    .engine
+                    .explain(&plan, extended)
+                    .await
+                    .map_err(err_to_status)?;
+                Some(out::Result::Explain(out::Explain {
+                    explain_string: text,
+                }))
+            }
+            // PySpark `df.printSchema()` — the resolved schema as Spark's indented tree.
+            Some(Analyze::TreeString(t)) => {
+                let schema = self.plan_schema(&t.plan).await?;
+                Some(out::Result::TreeString(out::TreeString {
+                    tree_string: types::schema_tree_string(&schema),
+                }))
+            }
+            // `df.isLocal()` / `df.isStreaming()` — Weft executes every plan server-side as a batch
+            // job, so both are constant `false`. Implemented (rather than `unimplemented`) so client
+            // action-dispatch paths that probe these don't abort.
+            Some(Analyze::IsLocal(_)) => {
+                Some(out::Result::IsLocal(out::IsLocal { is_local: false }))
+            }
+            Some(Analyze::IsStreaming(_)) => Some(out::Result::IsStreaming(out::IsStreaming {
+                is_streaming: false,
+            })),
             other => {
                 return Err(Status::unimplemented(format!(
                     "AnalyzePlan variant not implemented: {other:?}"

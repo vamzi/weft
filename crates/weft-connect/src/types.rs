@@ -90,6 +90,86 @@ pub fn schema_to_spark(schema: &Schema) -> sc::DataType {
     wrap(Kind::Struct(struct_of(schema.fields())))
 }
 
+/// The Spark type name printed by `df.printSchema()` for an Arrow [`DataType`] (mirrors the
+/// `arrow_to_spark` mapping: unsigned ints widen to Spark's signed names, unmapped → `string`).
+fn spark_type_name(t: &DataType) -> String {
+    match t {
+        DataType::Null => "void".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 | DataType::UInt8 => "byte".to_string(),
+        DataType::Int16 | DataType::UInt16 => "short".to_string(),
+        DataType::Int32 | DataType::UInt32 => "integer".to_string(),
+        DataType::Int64 | DataType::UInt64 => "long".to_string(),
+        DataType::Float16 | DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "binary".to_string(),
+        DataType::Date32 | DataType::Date64 => "date".to_string(),
+        DataType::Timestamp(_, Some(_)) => "timestamp".to_string(),
+        DataType::Timestamp(_, None) => "timestamp_ntz".to_string(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(_, _) => "array".to_string(),
+        DataType::Struct(_) => "struct".to_string(),
+        DataType::Map(_, _) => "map".to_string(),
+        _ => "string".to_string(),
+    }
+}
+
+/// Format an Arrow [`Schema`] as Spark's `printSchema()` tree (the `TreeString` analyze response):
+///
+/// ```text
+/// root
+///  |-- a: long (nullable = false)
+///  |-- b: string (nullable = true)
+/// ```
+///
+/// Struct/array element children are recursed into with Spark's `|    |--` indentation so nested
+/// schemas render the way `df.printSchema()` does.
+pub fn schema_tree_string(schema: &Schema) -> String {
+    let mut out = String::from("root\n");
+    for f in schema.fields() {
+        tree_field(&mut out, " |", f.name(), f.data_type(), f.is_nullable());
+    }
+    out
+}
+
+/// Append one field line (and any nested children) to a printSchema tree under `prefix`.
+fn tree_field(out: &mut String, prefix: &str, name: &str, dt: &DataType, nullable: bool) {
+    out.push_str(&format!(
+        "{prefix}-- {name}: {} (nullable = {nullable})\n",
+        spark_type_name(dt)
+    ));
+    let child_prefix = format!("{prefix}    |");
+    match dt {
+        DataType::Struct(fields) => {
+            for f in fields {
+                tree_field(out, &child_prefix, f.name(), f.data_type(), f.is_nullable());
+            }
+        }
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _) => {
+            tree_field(
+                out,
+                &child_prefix,
+                "element",
+                f.data_type(),
+                f.is_nullable(),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Convert a Spark Connect [`sc::DataType`] to an Arrow [`DataType`] (the reverse of
 /// [`arrow_to_spark`]) — used to lower `cast` targets. Unmapped kinds error.
 pub fn spark_to_arrow(t: &sc::DataType) -> Result<DataType, tonic::Status> {
