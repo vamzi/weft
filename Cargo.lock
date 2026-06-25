@@ -4216,6 +4216,7 @@ dependencies = [
 name = "weft-gateway"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "bcrypt",
  "datafusion",
@@ -4226,6 +4227,8 @@ dependencies = [
  "tokio",
  "tower 0.5.3",
  "tower-http",
+ "weft-catalog",
+ "weft-catalog-hive",
  "weft-clustermgr",
  "weft-common",
  "weft-govern",

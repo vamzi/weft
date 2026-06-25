@@ -18,7 +18,10 @@ weft-govern = { workspace = true }
 weft-clustermgr = { workspace = true }
 weft-loom = { workspace = true }
 weft-sql = { workspace = true }
+weft-catalog = { workspace = true }
+weft-catalog-hive = { workspace = true }
 datafusion = "54"
+async-trait = "0.1"
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

@@ -26,6 +26,8 @@ use weft_govern::{Effect, Grant, Principal, Privilege, Securable, SecurableType}
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
+use crate::glue::{glue_options, GlueCatalog};
+
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
 
 /// Session JWT claims.
@@ -143,6 +145,7 @@ pub struct AppState {
     users: Arc<Mutex<HashMap<String, UserRecord>>>,
     groups: Arc<Mutex<HashMap<String, Vec<String>>>>,
     grants: Arc<Mutex<Vec<Grant>>>,
+    connections: Arc<Mutex<Vec<ConnectionInfo>>>,
     engine: Arc<Engine>,
     jwt_secret: Arc<Vec<u8>>,
     web_dir: Arc<PathBuf>,
@@ -196,6 +199,7 @@ impl AppState {
             users: Arc::new(Mutex::new(users)),
             groups: Arc::new(Mutex::new(groups)),
             grants: Arc::new(Mutex::new(Vec::new())),
+            connections: Arc::new(Mutex::new(Vec::new())),
             engine,
             jwt_secret: Arc::new(jwt_secret),
             web_dir: Arc::new(web_dir),
@@ -285,6 +289,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/clusters/:id/events", get(list_cluster_events))
         .route("/api/sql", post(run_sql))
         .route("/api/catalog", get(get_catalog))
+        .route(
+            "/api/connections",
+            get(list_connections).post(create_connection),
+        )
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
@@ -863,6 +871,72 @@ fn privilege_from_str(p: &str) -> Option<Privilege> {
         "MANAGE" => Privilege::Manage,
         _ => return None,
     })
+}
+
+// ───────────────────────────────── Connections (external catalogs) ──────────────────────────────
+
+/// An attached catalog connection, as the UI lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionInfo {
+    /// The registered catalog name (use it as the first part of `name.db.table`).
+    pub name: String,
+    /// Connection kind: `glue` | `hive`.
+    pub kind: String,
+    /// Region (for Glue).
+    pub region: Option<String>,
+}
+
+/// `POST /api/connections` body — attach an external catalog.
+#[derive(Debug, Deserialize)]
+pub struct CreateConnection {
+    /// Catalog name to register it under.
+    pub name: String,
+    /// `glue` (AWS Glue Data Catalog) or `hive` (Hive Metastore over Thrift).
+    pub kind: String,
+    /// Kind-specific options: Glue → `region`; Hive → `uri` (`thrift://host:port`).
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+}
+
+async fn list_connections(State(st): State<AppState>) -> Json<Vec<ConnectionInfo>> {
+    Json(st.connections.lock().unwrap().clone())
+}
+
+/// Attach an external catalog: construct its [`weft_catalog::CatalogProvider`] and register it on
+/// the engine, so its databases/tables show up in the catalog browser and become queryable as
+/// `name.database.table`.
+async fn create_connection(
+    State(st): State<AppState>,
+    Json(b): Json<CreateConnection>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    match b.kind.as_str() {
+        "glue" => {
+            let (region, aws_bin) = glue_options(&b.options);
+            let provider = Arc::new(GlueCatalog::new(b.name.clone(), region.clone(), aws_bin));
+            st.engine.register_catalog(&b.name, provider);
+            st.connections.lock().unwrap().push(ConnectionInfo {
+                name: b.name,
+                kind: b.kind,
+                region: Some(region),
+            });
+            Ok(StatusCode::CREATED)
+        }
+        "hive" => {
+            let provider = weft_catalog_hive::HiveCatalog::from_config(&b.name, &b.options)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+            st.engine.register_catalog(&b.name, Arc::new(provider));
+            st.connections.lock().unwrap().push(ConnectionInfo {
+                name: b.name,
+                kind: b.kind,
+                region: None,
+            });
+            Ok(StatusCode::CREATED)
+        }
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported connection kind: {other}"),
+        )),
+    }
 }
 
 // ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
