@@ -1,0 +1,30 @@
+[package]
+name = "weft-gateway"
+description = "Weft control-plane REST/WebSocket API gateway: the single public entry point. Holds identity/SSO, the Spark Connect client pool, governance enforcement at the edge, and result streaming. The browser speaks to this; never gRPC."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "weft-gateway"
+path = "src/main.rs"
+
+[dependencies]
+weft-common = { workspace = true }
+weft-meta = { workspace = true }
+weft-govern = { workspace = true }
+weft-clustermgr = { workspace = true }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# TODO(deps): tonic (Spark Connect client to clusters), jsonwebtoken + openidconnect (OIDC/JWT) +
+# a SAML SP lib, sqlx (via weft-meta) for persistence, tower-http (CORS/trace), utoipa (OpenAPI).
+# The router below serves the frozen ROUTES surface with an in-memory store; persistence + auth +
+# the Spark Connect client pool layer on top.
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -1,0 +1,19 @@
+[package]
+name = "weft-ai"
+description = "Weft AI assist: NL → SQL and NL → notebook generation via the Anthropic Messages API (claude-opus-4-8) with strict tool use / structured output. Provider-swappable; governance-aware (generated SQL still goes through the authorizer)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+serde_json = "1"
+# TODO(deps, Rust >= 1.80): anthropic SDK (or reqwest for transport), tokio. The request builder
+# below constructs the Messages API body (model + schema-constrained output) as JSON; only the
+# HTTP transport + API-key wiring remain to make a live `AiProvider`.
+# Default model: claude-opus-4-8 via the Messages API with `output_config.format` (JSON schema) or
+# strict tool use so the model returns the structured shapes below — never free text to parse.
+# The API key lives in Secrets Manager, never in the browser. The output contract (cell/result
+# types + their JSON Schemas) is frozen here so the gateway and web AI panel build against it.

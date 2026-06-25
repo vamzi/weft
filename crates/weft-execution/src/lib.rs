@@ -9,6 +9,7 @@
 
 pub mod driver;
 pub mod flight;
+pub mod membership;
 pub mod plan;
 pub mod shuffle;
 

@@ -1,0 +1,14 @@
+[package]
+name = "weft-pyworker"
+description = "Weft Python UDF bridge: the Rust side of the per-pod Python sidecar that executes PySpark/Arrow UDFs. The engine ships vectorized Arrow batches to the sidecar over Arrow Flight/IPC and splices results back (Spark PythonRunner-style, Arrow-native)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+# TODO(deps, Rust >= 1.80): arrow + arrow-flight (batch transport to the sidecar), tokio, prost
+# (UDF invocation envelope). The artifact/UDF descriptor contract below is frozen; the Flight
+# transport + the Python runtime image (`runtime/`) land on top.

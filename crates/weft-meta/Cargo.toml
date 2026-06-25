@@ -1,0 +1,15 @@
+[package]
+name = "weft-meta"
+description = "Weft control-plane metadata store: the canonical Postgres schema (identity, clusters, catalog/governance, notebooks, queries, jobs, dashboards) and the sqlx repositories over it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+# TODO(deps, Rust >= 1.80): sqlx (Postgres, migrate), serde/serde_json (JSONB columns), uuid.
+# The schema is authored as SQL migrations under `migrations/`; the ordered migration list and
+# the table/enum name constants below are dependency-free so the contract is frozen first and the
+# repository layer (one module per domain) lands against it without churn.

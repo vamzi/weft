@@ -1,0 +1,19 @@
+[package]
+name = "weft-govern"
+description = "Unity-Catalog-parity governance: securable tree, privilege model, and the authorization evaluator (inheritance, USE-traversal gating, DENY override, transitive groups, ownership)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+weft-common = { workspace = true }
+weft-catalog = { workspace = true }
+async-trait = "0.1"
+# TODO(deps, Rust >= 1.80): serde (grant (de)serialization for the REST/SQL surface), sqlx
+# (persist the securable/grant tables in weft-meta). The model + evaluator are dependency-free and
+# fully unit-tested; `governed` wraps the real `weft_catalog::CatalogProvider` to enforce them.
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
