@@ -1,0 +1,56 @@
+/* Theme tokens first, then Tailwind layers read them through tailwind.config.js. */
+@import "./theme.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--weft-bg);
+    color: var(--weft-text);
+    font-family: var(--weft-font-ui);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  * {
+    border-color: var(--weft-border);
+  }
+}
+
+@layer components {
+  /* Shared, shadcn-flavored primitives kept minimal and token-driven. */
+  .weft-card {
+    @apply rounded-weft border border-hairline bg-surface;
+  }
+
+  .weft-btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-weft-sm px-3 py-1.5 text-sm
+      font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .weft-btn-primary {
+    @apply weft-btn bg-accent text-accent-contrast hover:bg-accent-hover;
+  }
+
+  .weft-btn-ghost {
+    @apply weft-btn border border-hairline bg-surface text-body hover:bg-bg-subtle;
+  }
+
+  .weft-input {
+    @apply w-full rounded-weft-sm border border-hairline bg-bg px-3 py-1.5 text-sm
+      text-body outline-none placeholder:text-muted focus:border-accent;
+  }
+
+  .weft-label {
+    @apply mb-1 block text-xs font-medium text-muted;
+  }
+}
