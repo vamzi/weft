@@ -85,6 +85,24 @@ pub struct Cluster {
     pub worker_max: u32,
     /// Pod size class.
     pub worker_size: String,
+    /// The cluster's real Spark Connect endpoint once `RUNNING` (e.g. `sc://host:51001`).
+    #[serde(default)]
+    pub connect_endpoint: Option<String>,
+}
+
+/// One lifecycle event for a cluster (the reconcile trace the UI shows).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterEvent {
+    /// Unix seconds.
+    pub at: u64,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// The OS process actually backing a `RUNNING` cluster on this node (the single-box analog of the
+/// driver+worker pods the EKS operator would create).
+struct ClusterRuntime {
+    child: tokio::process::Child,
 }
 
 /// Body for `POST /api/clusters`.
@@ -118,19 +136,44 @@ fn small() -> String {
 #[derive(Clone)]
 pub struct AppState {
     clusters: Arc<Mutex<HashMap<String, Cluster>>>,
+    runtimes: Arc<tokio::sync::Mutex<HashMap<String, ClusterRuntime>>>,
+    events: Arc<Mutex<HashMap<String, Vec<ClusterEvent>>>>,
     next_id: Arc<Mutex<u64>>,
+    next_port: Arc<Mutex<u16>>,
     users: Arc<Mutex<HashMap<String, UserRecord>>>,
     groups: Arc<Mutex<HashMap<String, Vec<String>>>>,
     grants: Arc<Mutex<Vec<Grant>>>,
     engine: Arc<Engine>,
     jwt_secret: Arc<Vec<u8>>,
     web_dir: Arc<PathBuf>,
+    weft_bin: Arc<String>,
+    public_host: Arc<String>,
 }
 
 impl AppState {
     /// Build state seeding a single local admin (`username`/`password`) and serving the SPA from
     /// `web_dir`. The JWT secret is provided by the caller (env in production).
     pub fn new(username: &str, password: &str, jwt_secret: Vec<u8>, web_dir: PathBuf) -> Self {
+        Self::with_runtime(
+            username,
+            password,
+            jwt_secret,
+            web_dir,
+            String::new(),
+            "127.0.0.1".into(),
+        )
+    }
+
+    /// Build state with cluster-runtime config: `weft_bin` (the `weft` binary spawned per cluster)
+    /// and `public_host` (the address advertised in a cluster's Spark Connect endpoint).
+    pub fn with_runtime(
+        username: &str,
+        password: &str,
+        jwt_secret: Vec<u8>,
+        web_dir: PathBuf,
+        weft_bin: String,
+        public_host: String,
+    ) -> Self {
         let mut users = HashMap::new();
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hash");
         users.insert(
@@ -144,14 +187,48 @@ impl AppState {
         groups.insert("admins".to_string(), vec![username.to_string()]);
         Self {
             clusters: Arc::new(Mutex::new(HashMap::new())),
+            runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            events: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(0)),
+            next_port: Arc::new(Mutex::new(51000)),
             users: Arc::new(Mutex::new(users)),
             groups: Arc::new(Mutex::new(groups)),
             grants: Arc::new(Mutex::new(Vec::new())),
             engine: Arc::new(Engine::new()),
             jwt_secret: Arc::new(jwt_secret),
             web_dir: Arc::new(web_dir),
+            weft_bin: Arc::new(weft_bin),
+            public_host: Arc::new(public_host),
         }
+    }
+
+    fn add_event(&self, id: &str, message: impl Into<String>) {
+        let at = now_secs() as u64;
+        self.events
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .push(ClusterEvent {
+                at,
+                message: message.into(),
+            });
+    }
+
+    fn set_state(&self, id: &str, state: Phase, endpoint: Option<String>) {
+        if let Some(c) = self.clusters.lock().unwrap().get_mut(id) {
+            c.state = state.as_str().to_string();
+            if endpoint.is_some() {
+                c.connect_endpoint = endpoint;
+            }
+        }
+    }
+
+    fn alloc_port(&self) -> u16 {
+        let mut p = self.next_port.lock().unwrap();
+        let port = *p;
+        *p += 1;
+        port
     }
 
     fn new_id(&self) -> String {
@@ -203,6 +280,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/clusters/:id", get(get_cluster).delete(delete_cluster))
         .route("/api/clusters/:id/start", post(start_cluster))
         .route("/api/clusters/:id/stop", post(stop_cluster))
+        .route("/api/clusters/:id/events", get(list_cluster_events))
         .route("/api/sql", post(run_sql))
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
@@ -307,19 +385,98 @@ async fn create_cluster(
     State(st): State<AppState>,
     Json(body): Json<CreateCluster>,
 ) -> (StatusCode, Json<Cluster>) {
+    let id = st.new_id();
     let cluster = Cluster {
-        id: st.new_id(),
+        id: id.clone(),
         name: body.name,
         state: Phase::Pending.as_str().to_string(),
         worker_min: body.worker_min,
         worker_max: body.worker_max,
         worker_size: body.worker_size,
+        connect_endpoint: None,
     };
     st.clusters
         .lock()
         .unwrap()
-        .insert(cluster.id.clone(), cluster.clone());
+        .insert(id.clone(), cluster.clone());
+    st.add_event(
+        &id,
+        format!(
+            "Cluster created (requested {} worker(s))",
+            cluster.worker_min
+        ),
+    );
+    // Provision a real compute backend (Databricks-style: create implies start). Async so the API
+    // returns immediately while the cluster comes up — poll the list / events to watch it advance.
+    tokio::spawn(provision(st.clone(), id));
     (StatusCode::CREATED, Json(cluster))
+}
+
+/// Materialize a cluster into a real Spark Connect server process and advance its state. On EKS the
+/// operator would create driver + worker pods here; on this single node it spawns a `weft spark
+/// server` on an allocated port — a genuine, connectable endpoint.
+async fn provision(st: AppState, id: String) {
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, Duration};
+
+    st.set_state(&id, Phase::Provisioning, None);
+    let port = st.alloc_port();
+    st.add_event(
+        &id,
+        format!("Provisioning compute (allocating Spark Connect port {port})"),
+    );
+
+    if st.weft_bin.is_empty() {
+        st.set_state(&id, Phase::Error, None);
+        st.add_event(
+            &id,
+            "No weft binary configured (WEFT_BIN) — cannot start compute",
+        );
+        return;
+    }
+
+    let child = tokio::process::Command::new(st.weft_bin.as_str())
+        .args(["spark", "server", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            st.set_state(&id, Phase::Error, None);
+            st.add_event(&id, format!("Failed to launch compute: {e}"));
+            return;
+        }
+    };
+    st.runtimes
+        .lock()
+        .await
+        .insert(id.clone(), ClusterRuntime { child });
+    st.add_event(
+        &id,
+        "Compute process launched; waiting for the Spark Connect endpoint to accept",
+    );
+
+    // Wait for the endpoint to listen (up to ~20s).
+    let mut up = false;
+    for _ in 0..40 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            up = true;
+            break;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    if up {
+        let endpoint = format!("sc://{}:{port}", st.public_host);
+        st.set_state(&id, Phase::Running, Some(endpoint.clone()));
+        st.add_event(
+            &id,
+            format!("Cluster RUNNING — Spark Connect endpoint {endpoint}"),
+        );
+    } else {
+        st.set_state(&id, Phase::Error, None);
+        st.add_event(&id, "Compute did not become ready in time");
+    }
 }
 
 async fn get_cluster(
@@ -335,33 +492,78 @@ async fn get_cluster(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// The lifecycle events for a cluster (the reconcile trace shown in the UI).
+async fn list_cluster_events(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Vec<ClusterEvent>> {
+    Json(
+        st.events
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
 async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
-    if st.clusters.lock().unwrap().remove(&id).is_some() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    let existed = st.clusters.lock().unwrap().remove(&id).is_some();
+    if !existed {
+        return StatusCode::NOT_FOUND;
     }
+    kill_runtime(&st, &id).await;
+    st.events.lock().unwrap().remove(&id);
+    StatusCode::NO_CONTENT
 }
 
 async fn start_cluster(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
-    transition(&st, &id, Phase::Running)
+    let exists = st.clusters.lock().unwrap().contains_key(&id);
+    if !exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let already_up = st.runtimes.lock().await.contains_key(&id);
+    if !already_up {
+        st.add_event(&id, "Start requested");
+        tokio::spawn(provision(st.clone(), id.clone()));
+    }
+    st.clusters
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn stop_cluster(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
-    transition(&st, &id, Phase::Terminated)
+    let exists = st.clusters.lock().unwrap().contains_key(&id);
+    if !exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    kill_runtime(&st, &id).await;
+    st.set_state(&id, Phase::Terminated, None);
+    st.add_event(&id, "Cluster stopped (compute terminated)");
+    st.clusters
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
-fn transition(st: &AppState, id: &str, to: Phase) -> Result<Json<Cluster>, StatusCode> {
-    let mut map = st.clusters.lock().unwrap();
-    let c = map.get_mut(id).ok_or(StatusCode::NOT_FOUND)?;
-    c.state = to.as_str().to_string();
-    Ok(Json(c.clone()))
+/// Kill the OS process backing a cluster, if any.
+async fn kill_runtime(st: &AppState, id: &str) {
+    if let Some(mut rt) = st.runtimes.lock().await.remove(id) {
+        let _ = rt.child.kill().await;
+    }
 }
 
 // ───────────────────────────────────────── Run SQL ──────────────────────────────────────────────
@@ -670,7 +872,18 @@ pub async fn serve(addr: &str) -> std::io::Result<()> {
         std::env::var("WEFT_JWT_SECRET").unwrap_or_else(|_| "weft-dev-secret-change-me".into());
     let web_dir =
         PathBuf::from(std::env::var("WEFT_WEB_DIR").unwrap_or_else(|_| "web/dist".into()));
-    let state = AppState::new(&user, &password, secret.into_bytes(), web_dir);
+    // Cluster runtime: the `weft` binary to spawn per cluster, and the host advertised in the
+    // cluster's connect endpoint.
+    let weft_bin = std::env::var("WEFT_BIN").unwrap_or_default();
+    let public_host = std::env::var("WEFT_PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let state = AppState::with_runtime(
+        &user,
+        &password,
+        secret.into_bytes(),
+        web_dir,
+        weft_bin,
+        public_host,
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await
 }
@@ -839,17 +1052,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-
+        let created = body_json(resp).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        // Create kicks off async provisioning; with no `weft` binary configured in tests it can't
+        // come up, so we don't assert RUNNING here. A create event is recorded, and stop terminates.
         let resp = app(st.clone())
             .oneshot(
-                Request::post(format!("/api/clusters/{id}/start"))
+                Request::get(format!("/api/clusters/{id}/events"))
                     .header("authorization", &auth)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(body_json(resp).await["state"], "RUNNING");
+        let events = body_json(resp).await;
+        assert!(events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"].as_str().unwrap().contains("created")));
+
+        // Stop transitions to TERMINATED (no process needed).
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post(format!("/api/clusters/{id}/stop"))
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["state"], "TERMINATED");
     }
 }
