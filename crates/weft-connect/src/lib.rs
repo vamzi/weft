@@ -767,16 +767,62 @@ fn is_query(sql: &str) -> bool {
     )
 }
 
+/// Materialize Arrow "view" layouts (`Utf8View`/`BinaryView`) to their canonical equivalents
+/// (`Utf8`/`Binary`) before handing data to the client. DataFusion 54 uses `StringView` internally
+/// for a real speedup on string-heavy work, but Spark Connect clients bundle older Arrow (Spark
+/// 3.5's Arrow-Java, pyarrow < 16) that cannot decode view arrays — they fail with an opaque
+/// `KeyError: 39` (39 = the `Utf8View` type id). A *drop-in* Spark replacement must return columns
+/// any Spark client can read, so we cast at the output boundary only. Result sets here are tiny
+/// (the ClickBench queries are `LIMIT 10/25`), so this costs nothing measurable and keeps the
+/// internal StringView fast path intact. Top-level columns only — the 43 queries return scalars.
+fn materialize_view_types(
+    batch: &RecordBatch,
+) -> std::result::Result<RecordBatch, weft_loom::arrow::error::ArrowError> {
+    use weft_loom::arrow::array::ArrayRef;
+    use weft_loom::arrow::compute::cast;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = batch.schema();
+    let has_view = schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Utf8View | DataType::BinaryView));
+    if !has_view {
+        return Ok(batch.clone());
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (f, col) in schema.fields().iter().zip(batch.columns()) {
+        let target = match f.data_type() {
+            DataType::Utf8View => Some(DataType::Utf8),
+            DataType::BinaryView => Some(DataType::Binary),
+            _ => None,
+        };
+        match target {
+            Some(t) => {
+                cols.push(cast(col, &t)?);
+                fields.push(Arc::new(Field::new(f.name(), t, f.is_nullable())));
+            }
+            None => {
+                cols.push(col.clone());
+                fields.push(f.clone());
+            }
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)
+}
+
 /// Encode one record batch as a self-contained Arrow IPC stream (schema + batch), which is
 /// exactly what `ExecutePlanResponse.arrow_batch.data` carries.
 fn encode_ipc_stream(
     batch: &RecordBatch,
 ) -> std::result::Result<Vec<u8>, weft_loom::arrow::error::ArrowError> {
+    let batch = materialize_view_types(batch)?;
     let mut buf = Vec::new();
     let schema = batch.schema();
     {
         let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())?;
-        writer.write(batch)?;
+        writer.write(&batch)?;
         writer.finish()?;
     }
     Ok(buf)
@@ -788,14 +834,18 @@ fn encode_ipc_multi(
     batches: &[RecordBatch],
 ) -> std::result::Result<Vec<u8>, weft_loom::arrow::error::ArrowError> {
     use weft_loom::arrow::datatypes::Schema;
+    let materialized: Vec<RecordBatch> = batches
+        .iter()
+        .map(materialize_view_types)
+        .collect::<std::result::Result<_, _>>()?;
     let mut buf = Vec::new();
-    let schema = batches
+    let schema = materialized
         .first()
         .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(Schema::empty()));
     {
         let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())?;
-        for b in batches {
+        for b in &materialized {
             writer.write(b)?;
         }
         writer.finish()?;
@@ -990,4 +1040,52 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .await
         .map_err(|e| Error::Io(format!("server error: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod view_materialize_tests {
+    use super::*;
+    use weft_loom::arrow::array::{Array, Int64Array, StringViewArray};
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn utf8view_is_materialized_to_utf8_preserving_values() {
+        // A batch as DataFusion 54 hands it back: a StringView column (the layout Spark Connect
+        // clients with older Arrow cannot decode) next to a passthrough Int64.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let s = StringViewArray::from(vec![Some("google"), None, Some("yandex")]);
+        let n = Int64Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(s), Arc::new(n)]).unwrap();
+
+        let out = materialize_view_types(&batch).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::Int64);
+
+        // The encoder must also round-trip without a view type leaking into the IPC bytes.
+        let bytes = encode_ipc_stream(&batch).unwrap();
+        let mut rdr = StreamReader::try_new(bytes.as_slice(), None).unwrap();
+        let decoded = rdr.next().unwrap().unwrap();
+        assert_eq!(decoded.schema().field(0).data_type(), &DataType::Utf8);
+        let col = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<weft_loom::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "google");
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), "yandex");
+    }
+
+    #[test]
+    fn batch_without_view_types_is_untouched() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let out = materialize_view_types(&batch).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(out.num_rows(), 2);
+    }
 }
