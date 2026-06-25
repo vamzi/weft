@@ -234,8 +234,14 @@ async fn parquet_files_provider(
 }
 
 /// Convert a storage URI to a local filesystem path, or error for a scheme v1 can't read locally.
+///
+/// Handles both `file:///abs` (RFC form) and Hive's `file:/abs` (single-slash, as the Metastore
+/// returns it), as well as bare paths. Non-`file` schemes (`s3://`, `hdfs://`, …) are not local.
 fn local_path(location: &str) -> DfResult<String> {
     if let Some(rest) = location.strip_prefix("file://") {
+        return Ok(rest.to_string());
+    }
+    if let Some(rest) = location.strip_prefix("file:") {
         return Ok(rest.to_string());
     }
     if location.contains("://") {

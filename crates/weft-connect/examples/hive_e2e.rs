@@ -20,19 +20,30 @@ use weft_loom::Engine;
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("gen") {
-        let dir = args.get(2).expect("usage: hive_e2e gen <dir>");
-        gen_orders(dir);
-        return;
+    match args.get(1).map(|s| s.as_str()) {
+        Some("gen") => {
+            gen_orders(args.get(2).expect("usage: hive_e2e gen <dir>"), false);
+            return;
+        }
+        // Hand-write a minimal Delta table (parquet + _delta_log) the bridge can read.
+        Some("gen-delta") => {
+            gen_orders(args.get(2).expect("usage: hive_e2e gen-delta <dir>"), true);
+            return;
+        }
+        _ => {}
     }
-    if let Err(e) = query().await {
-        eprintln!("E2E FAILED: {e}");
+    // `query [table]` (default `orders`).
+    let table = args.get(2).cloned().unwrap_or_else(|| "orders".to_string());
+    if let Err(e) = query(&table).await {
+        eprintln!("E2E FAILED ({table}): {e}");
         std::process::exit(1);
     }
 }
 
 /// Write `orders(id BIGINT, amount DOUBLE)` = (1,10),(2,20),(3,30) as a parquet file into `dir`.
-fn gen_orders(dir: &str) {
+/// With `delta=true`, also write a minimal `_delta_log` so the table reads as Delta Lake.
+fn gen_orders(dir: &str, delta: bool) {
+    let dir = dir.trim_end_matches('/');
     std::fs::create_dir_all(dir).expect("mkdir");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -46,17 +57,32 @@ fn gen_orders(dir: &str) {
         ],
     )
     .expect("batch");
-    let path = format!("{}/part-0.parquet", dir.trim_end_matches('/'));
+    let path = format!("{dir}/part-0.parquet");
     let f = std::fs::File::create(&path).expect("create parquet");
     let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(f, schema, None).expect("writer");
     w.write(&batch).expect("write");
     w.close().expect("close");
     println!("wrote {path} (3 rows)");
+
+    if delta {
+        let log = format!("{dir}/_delta_log");
+        std::fs::create_dir_all(&log).expect("mkdir _delta_log");
+        let commit = concat!(
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            "\n",
+            r#"{"metaData":{"id":"orders","format":{"provider":"parquet"},"schemaString":"{}","partitionColumns":[]}}"#,
+            "\n",
+            r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":1,"modificationTime":0,"dataChange":true}}"#,
+            "\n",
+        );
+        std::fs::write(format!("{log}/00000000000000000000.json"), commit).expect("write commit");
+        println!("wrote {log}/00000000000000000000.json (Delta v0 commit)");
+    }
 }
 
-async fn query() -> Result<(), Box<dyn std::error::Error>> {
+async fn query(table: &str) -> Result<(), Box<dyn std::error::Error>> {
     let uri = std::env::var("WEFT_HMS_URI").unwrap_or_else(|_| "thrift://localhost:9083".to_string());
-    println!("== connecting to Hive Metastore at {uri} ==");
+    println!("== connecting to Hive Metastore at {uri} (table=sales.{table}) ==");
     let catalog = HiveCatalog::from_uri("hive", &uri)?;
 
     let namespaces = catalog.list_namespaces(&[]).await?;
@@ -65,21 +91,23 @@ async fn query() -> Result<(), Box<dyn std::error::Error>> {
     let tables = catalog.list_tables(&["sales".to_string()]).await?;
     println!("tables in `sales`: {tables:?}");
 
-    let md = catalog.load_table(&["sales".to_string()], "orders").await?;
+    let md = catalog.load_table(&["sales".to_string()], table).await?;
     println!(
-        "loaded sales.orders -> location={} format={:?} partitions={:?}",
+        "loaded sales.{table} -> location={} format={:?} partitions={:?}",
         md.location, md.format, md.partition_columns
     );
 
-    let exists = catalog.table_exists(&["sales".to_string()], "orders").await?;
+    let exists = catalog.table_exists(&["sales".to_string()], table).await?;
     let ghost = catalog.table_exists(&["sales".to_string()], "ghost").await?;
-    println!("tableExists orders={exists} ghost={ghost}");
+    println!("tableExists {table}={exists} ghost={ghost}");
 
     // Register the catalog and run a query that was NEVER pre-registered — it resolves lazily.
     let engine = Engine::new();
     engine.register_catalog("hive", Arc::new(catalog));
     let batches = engine
-        .sql("SELECT COUNT(*) AS c, SUM(amount) AS s FROM hive.sales.orders")
+        .sql(&format!(
+            "SELECT COUNT(*) AS c, SUM(amount) AS s FROM hive.sales.{table}"
+        ))
         .await?;
     let c = batches[0]
         .column(0)
@@ -97,7 +125,9 @@ async fn query() -> Result<(), Box<dyn std::error::Error>> {
 
     // A filtered + projected query — exercises predicate/projection through the bridge.
     let filtered = engine
-        .sql("SELECT id, amount FROM hive.sales.orders WHERE amount >= 20 ORDER BY id")
+        .sql(&format!(
+            "SELECT id, amount FROM hive.sales.{table} WHERE amount >= 20 ORDER BY id"
+        ))
         .await?;
     let ids: Vec<i64> = filtered
         .iter()
@@ -116,6 +146,9 @@ async fn query() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(s, 60.0, "expected sum(amount)=60");
     assert_eq!(ids, vec![2, 3], "expected ids [2,3] for amount>=20");
     assert!(exists && !ghost, "tableExists wrong");
-    println!("\n✅ E2E PASSED: live HMS → weft-catalog-hive → bridge → lazy query");
+    println!(
+        "\n✅ E2E PASSED ({:?}): live HMS → weft-catalog-hive → bridge → lazy query",
+        md.format
+    );
     Ok(())
 }
