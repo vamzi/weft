@@ -149,7 +149,7 @@ export default function PerformancePage() {
 
       {/* Methodology */}
       <section className="mt-2 grid gap-8 lg:grid-cols-2">
-        <div>
+        <div className="min-w-0">
           <h2 className="mb-3 text-lg font-semibold">Methodology</h2>
           <ul className="space-y-2.5 text-sm text-muted">
             <li>
@@ -175,7 +175,7 @@ export default function PerformancePage() {
             </li>
           </ul>
         </div>
-        <div>
+        <div className="min-w-0">
           <h2 className="mb-3 text-lg font-semibold">Reproduce it</h2>
           <CodeBlock
             lines={[
