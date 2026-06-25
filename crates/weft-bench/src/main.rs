@@ -33,6 +33,7 @@ use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
 mod tpch;
+mod tpch_data;
 
 const HITS_SCHEMA_TSV: &str = include_str!("../../../bench/clickbench/hits_schema.tsv");
 const CLICKBENCH_QUERIES: &str = include_str!("../../../bench/clickbench/queries.sql");
@@ -650,7 +651,18 @@ async fn main() {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
-        Some("tpch") => tpch::run().await,
+        Some("tpch") => {
+            let sf = args
+                .iter()
+                .position(|a| a == "--sf")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.05);
+            let dir = data
+                .clone()
+                .unwrap_or_else(|| format!("{}/weft-tpch-sf{sf}", std::env::temp_dir().display()));
+            tpch::run(sf, Path::new(&dir)).await;
+        }
         Some(other) => {
             eprintln!("unknown subcommand: {other}; try `clickbench` or `clickbench-grpc`");
             std::process::exit(2);
