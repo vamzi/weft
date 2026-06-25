@@ -1,0 +1,45 @@
+{
+  "dataset": "hits.parquet \u2014 99,997,497 rows, 14.78 GB (ClickBench)",
+  "machine": "c6a.4xlarge",
+  "runDate": null,
+  "queryCount": 43,
+  "method": "Spark Connect, stock PySpark client, 3 tries/query, hot = min(try2, try3)",
+  "engines": [
+    {
+      "key": "weft",
+      "name": "Weft",
+      "highlight": true,
+      "total": null,
+      "source": "pending",
+      "perQuery": [],
+      "failures": null
+    },
+    {
+      "key": "sail",
+      "name": "Sail",
+      "highlight": false,
+      "total": null,
+      "source": "pending",
+      "perQuery": [],
+      "failures": null
+    },
+    {
+      "key": "spark",
+      "name": "Spark",
+      "highlight": false,
+      "total": null,
+      "source": "pending",
+      "perQuery": [],
+      "failures": null
+    },
+    {
+      "key": "gluten",
+      "name": "Spark + Gluten/Velox",
+      "highlight": false,
+      "total": null,
+      "source": "pending",
+      "perQuery": [],
+      "failures": null
+    }
+  ]
+}
