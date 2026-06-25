@@ -176,7 +176,7 @@
     },
     {
       "key": "gluten",
-      "name": "Spark + Gluten/Velox",
+      "name": "Spark + Gluten",
       "highlight": false,
       "total": 107.401,
       "totalAll": 117.807,

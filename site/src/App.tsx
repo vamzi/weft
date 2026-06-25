@@ -3,6 +3,7 @@ import Navbar from "./components/Navbar";
 import Footer from "./components/Footer";
 import HomePage from "./pages/HomePage";
 import PerformancePage from "./pages/PerformancePage";
+import ArchitecturePage from "./pages/ArchitecturePage";
 
 // HashRouter keeps deep links (#/performance) working on GitHub Pages with zero server config.
 export default function App() {
@@ -14,6 +15,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/performance" element={<PerformancePage />} />
+            <Route path="/architecture" element={<ArchitecturePage />} />
             <Route path="*" element={<HomePage />} />
           </Routes>
         </main>
