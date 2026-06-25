@@ -15,7 +15,7 @@ async fn select_one_over_grpc_returns_1() {
 
     // Start the server in the background.
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port }).await;
+        let _ = serve(ServerConfig { port, ..Default::default() }).await;
     });
 
     // Wait for readiness (retry connect).

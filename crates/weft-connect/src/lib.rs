@@ -34,6 +34,7 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+mod catalog;
 mod translate;
 mod types;
 
@@ -47,11 +48,18 @@ const CHUNK_ROWS: usize = 8192;
 pub struct ServerConfig {
     /// TCP port. Sail uses 50051; Spark's own server defaults to 15002.
     pub port: u16,
+    /// Catalogs to declare at startup, as flat `spark.sql.catalog.<name>.*` entries (e.g.
+    /// `spark.sql.catalog.prod.type=hive`). Seeds the session config so external catalogs are
+    /// live before the first client connects; clients can still add more via the `Config` RPC.
+    pub catalogs: std::collections::HashMap<String, String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { port: 50051 }
+        Self {
+            port: 50051,
+            catalogs: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -62,6 +70,9 @@ pub struct WeftService {
     server_session_id: String,
     /// Session SQL config (`spark.sql.*`), set/queried via the `Config` RPC.
     config: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Named catalogs + current catalog/db pointers. External catalogs declared via
+    /// `spark.sql.catalog.<name>.*` are bridged into the engine and tracked here.
+    registry: Arc<weft_catalog::CatalogRegistry>,
 }
 
 impl Default for WeftService {
@@ -87,6 +98,45 @@ impl WeftService {
             engine: Arc::new(Engine::new()),
             server_session_id: Uuid::new_v4().to_string(),
             config: std::sync::Mutex::new(config),
+            registry: Arc::new(weft_catalog::CatalogRegistry::new()),
+        }
+    }
+
+    /// Reconcile declared `spark.sql.catalog.<name>.*` config into live, bridged catalogs.
+    ///
+    /// Idempotent and best-effort: each not-yet-registered catalog whose config is complete is
+    /// built (a cheap, non-networked step — connections open lazily on first table load) and
+    /// registered into both the engine (so `cat.ns.tbl` resolves) and the registry (so the
+    /// `spark.catalog.*` RPC sees it). Catalogs with incomplete config are retried on the next
+    /// `Config` set. Honors `spark.sql.defaultCatalog`.
+    /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
+    /// entries). The catalogs are bridged into the engine before any client connects.
+    pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
+        let service = Self::new();
+        if !catalogs.is_empty() {
+            service
+                .config
+                .lock()
+                .expect("config poisoned")
+                .extend(catalogs);
+            service.sync_catalogs();
+        }
+        service
+    }
+
+    fn sync_catalogs(&self) {
+        let snapshot = self.config.lock().expect("config poisoned").clone();
+        for (name, opts) in catalog::group_catalog_options(&snapshot) {
+            if self.registry.contains(&name) {
+                continue;
+            }
+            if let Ok(provider) = catalog::build_provider(&name, &opts) {
+                self.engine.register_catalog(&name, provider.clone());
+                self.registry.register(&name, provider);
+            }
+        }
+        if let Some(def) = snapshot.get("spark.sql.defaultCatalog") {
+            let _ = self.registry.set_current_catalog(def);
         }
     }
 
@@ -271,6 +321,10 @@ impl WeftService {
                     false,
                 )])))
             }
+            // Resolve a catalog op's result schema statically — no side effects (so a client that
+            // probes `df.schema` on `spark.catalog.listTables()` doesn't run the op).
+            Some(sc::relation::RelType::Catalog(cat)) => catalog::result_schema(cat)
+                .ok_or_else(|| Status::unimplemented("AnalyzePlan(Schema): catalog op")),
             _ => {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 Ok(Arc::new(plan.schema().as_arrow().clone()))
@@ -293,6 +347,10 @@ impl WeftService {
             let batches = self.base_relation_batches(child).await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
             return Ok(vec![show_string_batch(text)]);
+        }
+        // `spark.catalog.*` operations (listTables, currentCatalog, setCurrentDatabase, …).
+        if let Some(sc::relation::RelType::Catalog(cat)) = rel.rel_type.as_ref() {
+            return catalog::handle_catalog(&self.engine, &self.registry, cat).await;
         }
         self.base_relation_batches(rel).await
     }
@@ -493,17 +551,21 @@ impl SparkConnectService for WeftService {
         let req = request.into_inner();
         let pairs = match req.operation.and_then(|o| o.op_type) {
             Some(OpType::Set(set)) => {
-                let mut store = self.config.lock().expect("config poisoned");
-                for kv in set.pairs {
-                    match kv.value {
-                        Some(v) => {
-                            store.insert(kv.key, v);
-                        }
-                        None => {
-                            store.remove(&kv.key);
+                {
+                    let mut store = self.config.lock().expect("config poisoned");
+                    for kv in set.pairs {
+                        match kv.value {
+                            Some(v) => {
+                                store.insert(kv.key, v);
+                            }
+                            None => {
+                                store.remove(&kv.key);
+                            }
                         }
                     }
                 }
+                // A `spark.sql.catalog.*` change may have declared a new catalog — reconcile.
+                self.sync_catalogs();
                 Vec::new()
             }
             Some(OpType::Get(get)) => get.keys.iter().map(|k| self.config_get(k)).collect(),
@@ -919,7 +981,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.port)
         .parse()
         .map_err(|e| Error::Io(format!("bad listen addr: {e}")))?;
-    let service = SparkConnectServiceServer::new(WeftService::new())
+    let service = SparkConnectServiceServer::new(WeftService::with_catalogs(config.catalogs))
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
     tonic::transport::Server::builder()
