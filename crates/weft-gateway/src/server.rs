@@ -26,7 +26,7 @@ use weft_govern::{Effect, Grant, Principal, Privilege, Securable, SecurableType}
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
-use crate::glue::{glue_options, GlueCatalog};
+use weft_catalog_glue::GlueCatalog;
 
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
 
@@ -128,6 +128,11 @@ struct Ec2ClusterConfig {
     region: String,
     /// Path to the AWS CLI.
     aws_bin: String,
+    /// Launch clusters in a private subnet with no public IP (reach them by private IP from the
+    /// in-VPC gateway). Requires a route to S3 (gateway endpoint) + Glue for catalogs.
+    private: bool,
+    /// IAM instance profile to attach to cluster instances (e.g. so they can read Glue/S3).
+    instance_profile: Option<String>,
 }
 
 impl Ec2ClusterConfig {
@@ -145,6 +150,10 @@ impl Ec2ClusterConfig {
             weft_url,
             region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string()),
             aws_bin: std::env::var("WEFT_AWS_BIN").unwrap_or_else(|_| "aws".to_string()),
+            private: std::env::var("WEFT_CLUSTER_PRIVATE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            instance_profile: std::env::var("WEFT_CLUSTER_INSTANCE_PROFILE").ok(),
         })
     }
 }
@@ -199,6 +208,8 @@ pub struct AppState {
     groups: Arc<Mutex<HashMap<String, Vec<String>>>>,
     grants: Arc<Mutex<Vec<Grant>>>,
     connections: Arc<Mutex<Vec<ConnectionInfo>>>,
+    /// Where attached connections are persisted (JSON) so they survive restarts and seed clusters.
+    conn_file: Arc<PathBuf>,
     engine: Arc<Engine>,
     jwt_secret: Arc<Vec<u8>>,
     web_dir: Arc<PathBuf>,
@@ -248,7 +259,10 @@ impl AppState {
         groups.insert("admins".to_string(), vec![username.to_string()]);
         let engine = Arc::new(Engine::new());
         seed_sample_data(&engine);
-        Self {
+        let conn_file = PathBuf::from(
+            std::env::var("WEFT_CONNECTIONS_FILE").unwrap_or_else(|_| "connections.json".into()),
+        );
+        let st = Self {
             clusters: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(HashMap::new())),
@@ -258,6 +272,7 @@ impl AppState {
             groups: Arc::new(Mutex::new(groups)),
             grants: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Mutex::new(Vec::new())),
+            conn_file: Arc::new(conn_file),
             engine,
             jwt_secret: Arc::new(jwt_secret),
             web_dir: Arc::new(web_dir),
@@ -269,6 +284,46 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
+        };
+        st.load_connections();
+        st
+    }
+
+    /// Re-register connections persisted to [`Self::conn_file`] (best-effort): populate the list and
+    /// bridge each provider back into the engine so attached catalogs survive a restart.
+    fn load_connections(&self) {
+        let data = match std::fs::read_to_string(self.conn_file.as_ref()) {
+            Ok(d) => d,
+            Err(_) => return, // no file yet — nothing to restore
+        };
+        let saved: Vec<ConnectionInfo> = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warn: ignoring corrupt {}: {e}", self.conn_file.display());
+                return;
+            }
+        };
+        for c in saved {
+            match build_connection_provider(&c.kind, &c.name, &c.options) {
+                Ok(p) => {
+                    self.engine.register_catalog(&c.name, p);
+                    self.connections.lock().unwrap().push(c);
+                }
+                Err(e) => eprintln!("warn: skipping connection `{}`: {e}", c.name),
+            }
+        }
+    }
+
+    /// Persist the current connection set to [`Self::conn_file`] (best-effort).
+    fn save_connections(&self) {
+        let conns = self.connections.lock().unwrap();
+        match serde_json::to_string_pretty(&*conns) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(self.conn_file.as_ref(), json) {
+                    eprintln!("warn: could not persist connections: {e}");
+                }
+            }
+            Err(e) => eprintln!("warn: could not serialize connections: {e}"),
         }
     }
 
@@ -365,6 +420,7 @@ pub fn app(state: AppState) -> Router {
             "/api/connections",
             get(list_connections).post(create_connection),
         )
+        .route("/api/connections/:name", axum::routing::delete(delete_connection))
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
@@ -496,6 +552,35 @@ async fn create_cluster(
     (StatusCode::CREATED, Json(cluster))
 }
 
+/// Build the `WEFT_CATALOG_CONF` value (`;`-separated `spark.sql.catalog.<name>.*` entries) from the
+/// attached connections, so a freshly provisioned cluster registers the same catalogs as the
+/// control plane. Glue → `type=glue;region=…`; Hive → `type=hive;uri=…`.
+fn cluster_catalog_conf(st: &AppState, default_region: &str) -> String {
+    let conns = st.connections.lock().unwrap();
+    let mut parts: Vec<String> = Vec::new();
+    for c in conns.iter() {
+        let p = format!("spark.sql.catalog.{}", c.name);
+        parts.push(format!("{p}.type={}", c.kind));
+        match c.kind.as_str() {
+            "glue" => {
+                let region = c
+                    .options
+                    .get("region")
+                    .map(String::as_str)
+                    .unwrap_or(default_region);
+                parts.push(format!("{p}.region={region}"));
+            }
+            "hive" => {
+                if let Some(uri) = c.options.get("uri") {
+                    parts.push(format!("{p}.uri={uri}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join(";")
+}
+
 /// Materialize a cluster into a real Spark Connect server process and advance its state. On EKS the
 /// operator would create driver + worker pods here; on this single node it spawns a `weft spark
 /// server` on an allocated port — a genuine, connectable endpoint.
@@ -527,10 +612,24 @@ async fn provision_ec2(st: AppState, id: String) {
         format!("Launching EC2 instance ({itype}) for cluster compute"),
     );
 
-    // user-data: download the weft binary and run the Spark Connect server on boot.
+    // Propagate every attached catalog connection so the cluster's engine registers them too —
+    // a cluster automatically "sees" the same catalogs as the control plane.
+    let catalog_conf = cluster_catalog_conf(&st, &cfg.region);
+    if !catalog_conf.is_empty() {
+        st.add_event(
+            &id,
+            format!(
+                "Seeding cluster with {} attached catalog(s)",
+                st.connections.lock().unwrap().len()
+            ),
+        );
+    }
+
+    // user-data: download the weft binary and run the Spark Connect server on boot, with AWS region
+    // + catalog config in the environment so external catalogs (Glue/Hive) resolve on the cluster.
     let user_data = format!(
-        "#!/bin/bash\nset -e\ncurl -fsSL '{}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\n/usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n",
-        cfg.weft_url
+        "#!/bin/bash\nset -e\ncurl -fsSL '{}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\nexport AWS_REGION='{}'\nexport WEFT_CATALOG_CONF='{}'\n/usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n",
+        cfg.weft_url, cfg.region, catalog_conf
     );
     let user_data_b64 = base64_encode(user_data.as_bytes());
 
@@ -554,6 +653,17 @@ async fn provision_ec2(st: AppState, id: String) {
         args.push("--key-name".into());
         args.push(key.clone());
     }
+    if let Some(profile) = &cfg.instance_profile {
+        // Lets the cluster read Glue/S3 via the instance role (no static keys).
+        args.push("--iam-instance-profile".into());
+        args.push(format!("Name={profile}"));
+    }
+    // Private clusters get no public IP — the in-VPC gateway reaches them by private IP.
+    args.push("--associate-public-ip-address".into());
+    if cfg.private {
+        args.last_mut()
+            .map(|s| *s = "--no-associate-public-ip-address".into());
+    }
 
     let instance_id = match run_aws(&cfg.aws_bin, &args).await {
         Ok(out) => out.trim().to_string(),
@@ -574,7 +684,12 @@ async fn provision_ec2(st: AppState, id: String) {
         format!("EC2 instance {instance_id} launching; waiting for it to boot"),
     );
 
-    // Wait for a public IP (instance running) — up to ~120s.
+    // Wait for the instance's IP (private when running in a private subnet, else public) — ~120s.
+    let ip_field = if cfg.private {
+        "Reservations[0].Instances[0].PrivateIpAddress"
+    } else {
+        "Reservations[0].Instances[0].PublicIpAddress"
+    };
     let mut ip = None;
     for _ in 0..60 {
         if let Ok(out) = run_aws(
@@ -587,7 +702,7 @@ async fn provision_ec2(st: AppState, id: String) {
                 "--region".into(),
                 cfg.region.clone(),
                 "--query".into(),
-                "Reservations[0].Instances[0].PublicIpAddress".into(),
+                ip_field.into(),
                 "--output".into(),
                 "text".into(),
             ],
@@ -604,7 +719,7 @@ async fn provision_ec2(st: AppState, id: String) {
     }
     let Some(ip) = ip else {
         st.set_state(&id, Phase::Error, None);
-        st.add_event(&id, "EC2 instance did not report a public IP in time");
+        st.add_event(&id, "EC2 instance did not report an IP in time");
         return;
     };
     st.add_event(&id, format!("Instance running at {ip}; waiting for Spark Connect to accept (booting + installing weft)"));
@@ -1147,15 +1262,21 @@ fn privilege_from_str(p: &str) -> Option<Privilege> {
 
 // ───────────────────────────────── Connections (external catalogs) ──────────────────────────────
 
-/// An attached catalog connection, as the UI lists it.
-#[derive(Debug, Clone, Serialize)]
+/// An attached catalog connection, as the UI lists it. Also the persisted record (round-tripped
+/// to `WEFT_CONNECTIONS_FILE`) and the source for a cluster's startup catalog config, so `options`
+/// carries everything needed to re-register the provider (Glue `region`, Hive `uri`, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     /// The registered catalog name (use it as the first part of `name.db.table`).
     pub name: String,
     /// Connection kind: `glue` | `hive`.
     pub kind: String,
-    /// Region (for Glue).
+    /// Region (for Glue) — surfaced to the UI for convenience; also present in `options`.
     pub region: Option<String>,
+    /// Full kind-specific options (Glue → `region`/`aws_bin`; Hive → `uri`). Used to rebuild the
+    /// provider on restart and to seed a cluster's `spark.sql.catalog.<name>.*` config.
+    #[serde(default)]
+    pub options: HashMap<String, String>,
 }
 
 /// `POST /api/connections` body — attach an external catalog.
@@ -1174,41 +1295,66 @@ async fn list_connections(State(st): State<AppState>) -> Json<Vec<ConnectionInfo
     Json(st.connections.lock().unwrap().clone())
 }
 
+/// Build a [`weft_catalog::CatalogProvider`] for a connection `kind` + `options`, used both by the
+/// live attach path and when re-registering persisted connections on startup.
+fn build_connection_provider(
+    kind: &str,
+    name: &str,
+    options: &HashMap<String, String>,
+) -> Result<Arc<dyn weft_catalog::CatalogProvider>, String> {
+    match kind {
+        "glue" => Ok(Arc::new(GlueCatalog::from_config(name, options))),
+        "hive" => Ok(Arc::new(
+            weft_catalog_hive::HiveCatalog::from_config(name, options)
+                .map_err(|e| format!("{e:?}"))?,
+        )),
+        other => Err(format!("unsupported connection kind: {other}")),
+    }
+}
+
 /// Attach an external catalog: construct its [`weft_catalog::CatalogProvider`] and register it on
 /// the engine, so its databases/tables show up in the catalog browser and become queryable as
-/// `name.database.table`.
+/// `name.database.table`. The connection is persisted so it survives a restart and is propagated
+/// to every cluster the gateway provisions.
 async fn create_connection(
     State(st): State<AppState>,
     Json(b): Json<CreateConnection>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    match b.kind.as_str() {
-        "glue" => {
-            let (region, aws_bin) = glue_options(&b.options);
-            let provider = Arc::new(GlueCatalog::new(b.name.clone(), region.clone(), aws_bin));
-            st.engine.register_catalog(&b.name, provider);
-            st.connections.lock().unwrap().push(ConnectionInfo {
-                name: b.name,
-                kind: b.kind,
-                region: Some(region),
-            });
-            Ok(StatusCode::CREATED)
-        }
-        "hive" => {
-            let provider = weft_catalog_hive::HiveCatalog::from_config(&b.name, &b.options)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:?}")))?;
-            st.engine.register_catalog(&b.name, Arc::new(provider));
-            st.connections.lock().unwrap().push(ConnectionInfo {
-                name: b.name,
-                kind: b.kind,
-                region: None,
-            });
-            Ok(StatusCode::CREATED)
-        }
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            format!("unsupported connection kind: {other}"),
-        )),
+    let provider = build_connection_provider(&b.kind, &b.name, &b.options)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    st.engine.register_catalog(&b.name, provider);
+    {
+        let mut conns = st.connections.lock().unwrap();
+        conns.retain(|c| c.name != b.name); // replace any prior connection with the same name
+        conns.push(ConnectionInfo {
+            name: b.name.clone(),
+            kind: b.kind,
+            region: b.options.get("region").cloned(),
+            options: b.options,
+        });
     }
+    st.save_connections();
+    Ok(StatusCode::CREATED)
+}
+
+/// Detach an external catalog by name. Removes it from the persisted set so it no longer appears in
+/// the catalog browser or seeds new clusters. (DataFusion can't deregister a live catalog, so the
+/// provider lingers in memory until the next restart; the catalog browser filters it out by name.)
+async fn delete_connection(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let removed = {
+        let mut conns = st.connections.lock().unwrap();
+        let before = conns.len();
+        conns.retain(|c| c.name != name);
+        before != conns.len()
+    };
+    if !removed {
+        return Err((StatusCode::NOT_FOUND, format!("no connection `{name}`")));
+    }
+    st.save_connections();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
@@ -1469,8 +1615,21 @@ pub struct CatalogNamespace {
 /// Introspect the engine's real catalogs/schemas/tables/columns — what the SQL editor can query.
 async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> {
     let ctx = st.engine.ctx();
+    // Only surface the built-in `main` catalog plus catalogs that are currently attached as
+    // connections. DataFusion can't deregister a catalog, so a deleted connection's provider may
+    // still be registered — filtering by the live connection set hides it immediately.
+    let attached: std::collections::HashSet<String> = st
+        .connections
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     let mut out = Vec::new();
     for cat_name in ctx.catalog_names() {
+        if cat_name != "main" && !attached.contains(&cat_name) {
+            continue;
+        }
         let Some(cat) = ctx.catalog(&cat_name) else {
             continue;
         };

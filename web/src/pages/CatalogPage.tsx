@@ -269,6 +269,18 @@ function ConnectModal({
     void loadConnections();
   }, [loadConnections]);
 
+  async function removeConnection(connName: string) {
+    setError(null);
+    try {
+      await api.deleteConnection(connName);
+      await loadConnections();
+      // The detached catalog disappears from the tree.
+      await onAttached();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to detach connection");
+    }
+  }
+
   const valid =
     name.trim().length > 0 &&
     (kind === "glue" ? region.trim().length > 0 : uri.trim().length > 0);
@@ -333,6 +345,15 @@ function ConnectModal({
                     {c.kind}
                     {c.region ? ` · ${c.region}` : ""}
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => void removeConnection(c.name)}
+                    className="shrink-0 rounded-weft-sm px-1.5 py-0.5 text-[11px] text-muted hover:bg-red-50 hover:text-red-600"
+                    title={`Detach ${c.name}`}
+                    aria-label={`Detach ${c.name}`}
+                  >
+                    ✕
+                  </button>
                 </li>
               ))}
             </ul>

@@ -20,6 +20,7 @@ weft-loom = { workspace = true }
 weft-sql = { workspace = true }
 weft-catalog = { workspace = true }
 weft-catalog-hive = { workspace = true }
+weft-catalog-glue = { workspace = true }
 datafusion = "54"
 async-trait = "0.1"
 axum = "0.7"

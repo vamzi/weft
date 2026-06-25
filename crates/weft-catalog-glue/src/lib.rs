@@ -1,10 +1,14 @@
-//! An AWS Glue Data Catalog [`CatalogProvider`] for the gateway.
+//! An AWS Glue Data Catalog [`CatalogProvider`].
 //!
 //! Implements the catalog SPI by shelling out to the `aws glue` CLI (so we avoid pulling the large
-//! AWS Rust SDK; the EC2 instance role provides credentials via IMDS). `list_namespaces` →
+//! AWS Rust SDK; an EC2 instance role provides credentials via IMDS). `list_namespaces` →
 //! `get-databases`, `list_tables` → `get-tables`, `load_table` → `get-table` resolved to the
 //! table's storage location + format. Once registered via `Engine::register_catalog`, Glue tables
 //! resolve and query lazily through the DataFusion bridge — a genuine external catalog.
+//!
+//! Shared by the control-plane gateway (`POST /api/connections` with `kind=glue`) and the
+//! cluster-side Spark Connect server (`spark.sql.catalog.<name>.type=glue`), so an attached Glue
+//! catalog resolves identically whether a query runs on the gateway engine or on a cluster.
 
 use std::collections::HashMap;
 
@@ -30,6 +34,18 @@ impl GlueCatalog {
             region: region.into(),
             aws_bin: aws_bin.unwrap_or_else(|| "aws".to_string()),
         }
+    }
+
+    /// Build from a flat options map (`region`, optional `aws_bin`) — the shape used by both the
+    /// gateway connection request and the `spark.sql.catalog.<name>.*` startup config. `region`
+    /// defaults to `us-west-2`.
+    pub fn from_config(name: &str, options: &HashMap<String, String>) -> Self {
+        let region = options
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "us-west-2".to_string());
+        let aws_bin = options.get("aws_bin").cloned();
+        Self::new(name, region, aws_bin)
     }
 
     /// Run `aws glue <args> --region <region> --output json` and return stdout.
@@ -121,14 +137,4 @@ fn single_db(namespace: &[String]) -> Result<&str> {
             namespace.join(".")
         ))),
     }
-}
-
-/// Parse `options` from a connection request into `(region, aws_bin)`.
-pub fn glue_options(options: &HashMap<String, String>) -> (String, Option<String>) {
-    let region = options
-        .get("region")
-        .cloned()
-        .unwrap_or_else(|| "us-west-2".to_string());
-    let aws_bin = options.get("aws_bin").cloned();
-    (region, aws_bin)
 }

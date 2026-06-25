@@ -980,6 +980,11 @@ export const api = {
     await request<void>("POST", "/api/connections", { name, kind, options });
   },
 
+  /** DELETE /api/connections/:name — detach an external catalog. */
+  async deleteConnection(name: string): Promise<void> {
+    await request<void>("DELETE", `/api/connections/${encodeURIComponent(name)}`);
+  },
+
   // SQL / queries ---------------------------------------------------------
   /** GET /api/queries */
   async listQueries(): Promise<Query[]> {
