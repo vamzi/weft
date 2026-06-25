@@ -17,6 +17,14 @@ bench/**/hits_*.parquet
 bench/**/*.tbl
 bench/**/result.csv
 bench/**/results/*.json
+# Multi-engine harness runtime artifacts (created on the bench box)
+bench/clickbench/multi/.venv-*
+bench/clickbench/multi/logs/
+bench/clickbench/multi/jars/
+bench/clickbench/multi/.register-*.sql
+
+# Node / web
+node_modules/
 
 # Editor / OS
 .idea/
