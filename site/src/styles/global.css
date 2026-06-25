@@ -44,6 +44,13 @@
   .weft-eyebrow {
     @apply text-xs font-semibold uppercase tracking-wider text-accent;
   }
+  /* Code text on the dark surface — solid, theme-independent (Tailwind opacity-on-var drops). */
+  .weft-code-line {
+    color: var(--weft-code-text);
+  }
+  .weft-code-dim {
+    color: var(--weft-code-text-dim);
+  }
 }
 
 /* ── Weaving motifs ─────────────────────────────────────────────────────────────────────
