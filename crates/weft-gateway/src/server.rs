@@ -2007,24 +2007,10 @@ pub struct CatalogNamespace {
 /// Introspect the engine's real catalogs/schemas/tables/columns — what the SQL editor can query.
 async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> {
     let ctx = st.engine.ctx();
-    // Only surface the built-in `main` catalog plus catalogs that are currently attached as
-    // connections. DataFusion can't deregister a catalog, so a deleted connection's provider may
-    // still be registered — filtering by the live connection set hides it immediately.
-    let attached: std::collections::HashSet<String> = st
-        .connections
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
     let mut out = Vec::new();
-    for cat_name in ctx.catalog_names() {
-        if cat_name != "main" && !attached.contains(&cat_name) {
-            continue;
-        }
-        let Some(cat) = ctx.catalog(&cat_name) else {
-            continue;
-        };
+
+    // 1) Built-in `main` catalog — DataFusion enumerates it eagerly (seeded tables resolved).
+    if let Some(cat) = ctx.catalog("main") {
         let mut schemas = Vec::new();
         for sch_name in cat.schema_names() {
             if sch_name == "information_schema" {
@@ -2036,18 +2022,9 @@ async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> 
             let mut tables = Vec::new();
             for tbl_name in sch.table_names() {
                 if let Ok(Some(tbl)) = sch.table(&tbl_name).await {
-                    let columns = tbl
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| CatalogColumn {
-                            name: f.name().clone(),
-                            data_type: format!("{}", f.data_type()),
-                        })
-                        .collect();
                     tables.push(CatalogTable {
                         name: tbl_name,
-                        columns,
+                        columns: fields_to_columns(tbl.schema().fields()),
                     });
                 }
             }
@@ -2056,15 +2033,79 @@ async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> 
                 tables,
             });
         }
-        // Only surface catalogs that actually hold schemas with tables (skip empty internals).
         if schemas.iter().any(|s| !s.tables.is_empty()) {
             out.push(CatalogNamespace {
-                name: cat_name,
+                name: "main".into(),
+                schemas,
+            });
+        }
+    }
+
+    // 2) Attached external catalogs (Glue / Hive). The DataFusion bridge lists these *lazily*
+    // (table_names() is empty until a query resolves a table), so we enumerate through the catalog
+    // provider's own async API — list databases → list tables — and resolve each table's columns
+    // through the engine bridge (best-effort; a Glue/Hive hiccup just yields fewer entries).
+    let conns: Vec<ConnectionInfo> = st.connections.lock().unwrap().clone();
+    for conn in conns {
+        let Ok(provider) = build_connection_provider(&conn.kind, &conn.name, &conn.options) else {
+            continue;
+        };
+        let Ok(namespaces) = provider.list_namespaces(&[]).await else {
+            continue;
+        };
+        let mut schemas = Vec::new();
+        for ns in namespaces {
+            let db = ns.join(".");
+            let tables = provider.list_tables(&ns).await.unwrap_or_default();
+            let mut tbls = Vec::new();
+            for tname in tables {
+                let columns = resolve_columns(ctx, &conn.name, &db, &tname).await;
+                tbls.push(CatalogTable {
+                    name: tname,
+                    columns,
+                });
+            }
+            schemas.push(CatalogSchema { name: db, tables: tbls });
+        }
+        if !schemas.is_empty() {
+            out.push(CatalogNamespace {
+                name: conn.name,
                 schemas,
             });
         }
     }
     Json(out)
+}
+
+/// Map Arrow fields to the catalog-browser column shape.
+fn fields_to_columns(fields: &weft_loom::arrow::datatypes::Fields) -> Vec<CatalogColumn> {
+    fields
+        .iter()
+        .map(|f| CatalogColumn {
+            name: f.name().clone(),
+            data_type: format!("{}", f.data_type()),
+        })
+        .collect()
+}
+
+/// Resolve a `catalog.db.table`'s columns through the engine bridge (reads the table's schema,
+/// e.g. a Parquet footer for a Glue table). Best-effort: returns `[]` if it can't be resolved.
+async fn resolve_columns(
+    ctx: &datafusion::prelude::SessionContext,
+    catalog: &str,
+    db: &str,
+    table: &str,
+) -> Vec<CatalogColumn> {
+    let Some(cat) = ctx.catalog(catalog) else {
+        return vec![];
+    };
+    let Some(sch) = cat.schema(db) else {
+        return vec![];
+    };
+    match sch.table(table).await {
+        Ok(Some(tbl)) => fields_to_columns(tbl.schema().fields()),
+        _ => vec![],
+    }
 }
 
 /// Bind and serve the gateway on `addr`. Admin credentials come from `WEFT_ADMIN_USER` /
