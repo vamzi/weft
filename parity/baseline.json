@@ -1,0 +1,25 @@
+{
+  "spark_version": "v4.0.0",
+  "files_total": 303,
+  "files_skipped": 63,
+  "blocks_total": 12641,
+  "strict_pass": 496,
+  "semantic_pass": 4923,
+  "buckets": {
+    "correctness": 179,
+    "datetime": 1,
+    "decimal-precision": 129,
+    "engine-panic": 1,
+    "error-parity": 2464,
+    "exec-error": 840,
+    "feature-unsupported": 346,
+    "function-missing": 1639,
+    "missing-error": 110,
+    "missing-relation": 3131,
+    "null-semantics": 21,
+    "ordering": 17,
+    "parser-unsupported": 1304,
+    "pass": 496,
+    "schema-only": 1963
+  }
+}
