@@ -18,6 +18,7 @@ if [ ! -d "$VENV" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --quiet --upgrade pip
   "$VENV/bin/pip" install --quiet \
-    "pyspark[connect]==${PYSPARK_FOR_WEFT}" pandas pyarrow grpcio grpcio-status protobuf
+    "pyspark[connect]==${PYSPARK_FOR_WEFT}" "setuptools<81" "pandas<2.2" "pyarrow<16" \
+    grpcio grpcio-status protobuf
 fi
 echo "[weft] ready: bin=$REPO/target/release/weft  client=$VENV"

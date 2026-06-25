@@ -16,8 +16,9 @@ if [ ! -d "$VENV" ]; then
   else
     "$VENV/bin/pip" install --quiet pysail
   fi
-  # Stock PySpark client to drive Sail's Connect endpoint.
+  # Stock PySpark client to drive Sail's Connect endpoint (see install-spark.sh for the pins).
   "$VENV/bin/pip" install --quiet \
-    "pyspark[connect]==${PYSPARK_FOR_SAIL}" pandas pyarrow grpcio grpcio-status protobuf
+    "pyspark[connect]==${PYSPARK_FOR_SAIL}" "setuptools<81" "pandas<2.2" "pyarrow<16" \
+    grpcio grpcio-status protobuf
 fi
 echo "[sail] ready: $("$VENV/bin/python" -c 'import pysail,sys; print("pysail", pysail.__version__)' 2>/dev/null || echo 'pysail installed')  client=$VENV"

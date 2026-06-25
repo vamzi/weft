@@ -24,10 +24,15 @@ Each engine runs **alone** (others' servers stopped) so every run gets the full 
   byte-for-byte identical across all four engines.
 - **Timing**: 3 tries/query; **hot = min(try2, try3)**; total = sum of per-query hot. Matches the
   ClickBench contract and `../assert-beats-sail.sh`.
-- **Registration** is the one engine-specific bit (DDL, not timed): Spark-family registers the
-  parquet with `CREATE OR REPLACE TEMPORARY VIEW hits USING parquet`; Weft uses its DataFusion
-  DDL (`CREATE EXTERNAL TABLE … STORED AS PARQUET`) plus the `EventDate` int→date view that
-  `weft-bench` already uses. Both expose the same logical `hits` table.
+- **Registration** is the one engine-specific bit (not timed), and it exposes an identically-typed
+  `hits` to every engine: **EventTime** is cast from int64 epoch-seconds to `TIMESTAMP` and
+  **EventDate** from int days to `DATE`. Without this, bare date functions (`extract`/`date_trunc`
+  in Q18/Q42) and date-string filters (Q37-43) fail on the raw integer columns — on *every* engine,
+  Spark included. Spark-family registers via the DataFrame API (`spark.read.parquet` +
+  `timestamp_seconds`/`date_add` casts); Weft uses its DataFusion DDL (`CREATE EXTERNAL TABLE` +
+  a `to_timestamp_seconds`/date view). Weft also case-folds bare identifiers, so it runs
+  `queries.weft.sql` (the same 43 queries with column names double-quoted); the analytical SQL is
+  otherwise identical.
 - **Honesty**: a query that errors on an engine is recorded as `null` (a visible gap on the
   site), never silently dropped. Engines that fail to install/boot stay `pending` rather than
   being faked. Per-engine tuning is limited to documented, defensible defaults (shuffle
@@ -60,8 +65,9 @@ bash bench/clickbench/multi/run-engine.sh weft
 | `install-weft.sh` | `cargo build --release -p weft-cli` + PySpark client venv |
 | `run-engine.sh` | boot one engine, register `hits`, run 43×3, write `results/<engine>.json` |
 | `run-all.sh` | download data, run all four sequentially |
-| `runner.py` | engine-agnostic Spark Connect benchmark client |
-| `queries.spark.sql` | the 43 ClickBench queries, Spark SQL dialect |
+| `runner.py` | engine-agnostic Spark Connect benchmark client (sql / dataframe registration) |
+| `queries.spark.sql` | the 43 ClickBench queries, Spark SQL dialect (Spark/Sail/Gluten) |
+| `queries.weft.sql` | same 43 queries, column identifiers double-quoted for Weft |
 | `to-site.py` | merge `results/*.json` → `site/src/data/benchmarks.json` |
 
 `results/*.json` are git-ignored (intermediate); the committed, published artifact is the site's
