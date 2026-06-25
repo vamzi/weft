@@ -271,8 +271,9 @@ impl AppState {
         );
         let mut groups = HashMap::new();
         groups.insert("admins".to_string(), vec![username.to_string()]);
+        // The embedded engine holds no local/in-memory data. All tables come from attached
+        // external catalogs (Glue), re-registered from DynamoDB in `load_from_cloud`.
         let engine = Arc::new(Engine::new());
-        seed_sample_data(&engine);
         let ddb_table =
             std::env::var("WEFT_DDB_TABLE").unwrap_or_else(|_| "weft-control-plane".into());
         // Workspace S3 prefix (e.g. s3://bucket/control-plane); notebooks/queries are blobs under it.
@@ -1625,7 +1626,7 @@ async fn create_notebook(
         cells: vec![NotebookCell {
             id: st.new_oid("cell"),
             kind: "sql".into(),
-            source: "SELECT * FROM main.sales.lineitem LIMIT 10".into(),
+            source: "SELECT * FROM glue.clickbench.hits LIMIT 10".into(),
         }],
         updated_at: now_iso(),
     };
@@ -1749,224 +1750,6 @@ async fn delete_query(State(st): State<AppState>, Path(id): Path<String>) -> Sta
     }
 }
 
-// ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
-
-/// Register a small set of sample tables under `main.sales` so the SQL editor + catalog browser
-/// have real, queryable data out of the box (e.g. `SELECT * FROM main.sales.monthly_revenue`). In
-/// production these come from the user's registered catalogs (local + external HMS/Glue/UC).
-fn seed_sample_data(engine: &Engine) {
-    use weft_loom::arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
-    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
-    use weft_loom::arrow::record_batch::RecordBatch;
-
-    // 2026-01-01 as days since the Unix epoch (Date32). Orders/lineitems spread over ~4 months.
-    const BASE: i32 = 20454;
-    const N_CUST: i64 = 10;
-    const N_ORD: i64 = 30;
-    let segments = [
-        "BUILDING",
-        "AUTOMOBILE",
-        "MACHINERY",
-        "HOUSEHOLD",
-        "FURNITURE",
-    ];
-    let statuses = ["O", "F", "P"];
-    let prio = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
-    let flags = ["A", "N", "R"];
-
-    // monthly_revenue — a simple roll-up table for quick demos.
-    let revenue = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("month", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("revenue", DataType::Float64, false),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec![
-                "2026-01", "2026-01", "2026-02", "2026-02", "2026-03", "2026-03",
-            ])),
-            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US", "EU"])),
-            Arc::new(Float64Array::from(vec![
-                120000.0, 88000.0, 135000.0, 91000.0, 142000.0, 99000.0,
-            ])),
-        ],
-    );
-
-    // customer — TPC-H-shaped.
-    let customer = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("c_custkey", DataType::Int64, false),
-            Field::new("c_name", DataType::Utf8, false),
-            Field::new("c_mktsegment", DataType::Utf8, false),
-            Field::new("c_acctbal", DataType::Float64, false),
-            Field::new("c_nationkey", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from((1..=N_CUST).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(
-                (1..=N_CUST)
-                    .map(|i| format!("Customer#{i:03}"))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_CUST)
-                    .map(|i| segments[(i as usize - 1) % segments.len()].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                (1..=N_CUST)
-                    .map(|i| 1000.0 + i as f64 * 137.5)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                (1..=N_CUST).map(|i| i % 5).collect::<Vec<_>>(),
-            )),
-        ],
-    );
-
-    // orders — TPC-H-shaped, with a real Date32 o_orderdate.
-    let orders = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("o_orderkey", DataType::Int64, false),
-            Field::new("o_custkey", DataType::Int64, false),
-            Field::new("o_orderstatus", DataType::Utf8, false),
-            Field::new("o_totalprice", DataType::Float64, false),
-            Field::new("o_orderdate", DataType::Date32, false),
-            Field::new("o_orderpriority", DataType::Utf8, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from((1..=N_ORD).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(
-                (1..=N_ORD).map(|i| (i % N_CUST) + 1).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_ORD)
-                    .map(|i| statuses[i as usize % 3].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                (1..=N_ORD)
-                    .map(|i| 5000.0 + i as f64 * 321.0)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Date32Array::from(
-                (1..=N_ORD)
-                    .map(|i| BASE + (i as i32 * 13) % 120)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_ORD)
-                    .map(|i| prio[i as usize % 5].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-        ],
-    );
-
-    // lineitem — TPC-H-shaped, 2–4 lines per order.
-    let (mut lo, mut ll, mut lp, mut lq, mut lep, mut ld, mut lt, mut lf, mut ls) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
-    for ok in 1..=N_ORD {
-        for ln in 1..=(2 + ok % 3) {
-            lo.push(ok);
-            ll.push(ln);
-            lp.push((ok * 7 + ln) % 200 + 1);
-            let qty = 5.0 + ((ok + ln) % 40) as f64;
-            lq.push(qty);
-            lep.push(qty * (100.0 + (ok * 3 % 900) as f64));
-            ld.push(((ok + ln) % 10) as f64 / 100.0);
-            lt.push((ok % 8) as f64 / 100.0);
-            lf.push(flags[((ok + ln) as usize) % 3].to_string());
-            ls.push(BASE + (ok as i32 * 13) % 120 + ln as i32 * 2);
-        }
-    }
-    let lineitem = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int64, false),
-            Field::new("l_linenumber", DataType::Int64, false),
-            Field::new("l_partkey", DataType::Int64, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
-            Field::new("l_returnflag", DataType::Utf8, false),
-            Field::new("l_shipdate", DataType::Date32, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(lo)),
-            Arc::new(Int64Array::from(ll)),
-            Arc::new(Int64Array::from(lp)),
-            Arc::new(Float64Array::from(lq)),
-            Arc::new(Float64Array::from(lep)),
-            Arc::new(Float64Array::from(ld)),
-            Arc::new(Float64Array::from(lt)),
-            Arc::new(StringArray::from(lf)),
-            Arc::new(Date32Array::from(ls)),
-        ],
-    );
-
-    for (table, batch) in [
-        ("monthly_revenue", revenue),
-        ("customer", customer),
-        ("orders", orders),
-        ("lineitem", lineitem),
-    ] {
-        match batch {
-            Ok(b) => {
-                if let Err(e) = register_namespaced(engine, "main", "sales", table, b) {
-                    eprintln!("seed {table}: {e}");
-                }
-            }
-            Err(e) => eprintln!("build {table}: {e}"),
-        }
-    }
-}
-
-/// Register `batch` as `catalog.schema.table` in the engine, creating the catalog/schema if needed.
-fn register_namespaced(
-    engine: &Engine,
-    catalog: &str,
-    schema: &str,
-    table: &str,
-    batch: weft_loom::arrow::record_batch::RecordBatch,
-) -> Result<(), String> {
-    use datafusion::catalog::{
-        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
-    };
-    use datafusion::datasource::MemTable;
-
-    let ctx = engine.ctx();
-    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
-
-    let cat = match ctx.catalog(catalog) {
-        Some(c) => c,
-        None => {
-            let c: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
-            ctx.register_catalog(catalog, c.clone());
-            c
-        }
-    };
-    let sch = match cat.schema(schema) {
-        Some(s) => s,
-        None => {
-            let s: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
-            cat.register_schema(schema, s.clone())
-                .map_err(|e| e.to_string())?;
-            s
-        }
-    };
-    sch.register_table(table.to_string(), Arc::new(mem))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 /// A column in the catalog browser.
 #[derive(Debug, Serialize)]
@@ -2287,42 +2070,6 @@ mod tests {
         assert!(j["error"].is_null());
     }
 
-    #[tokio::test]
-    async fn seeded_catalog_is_queryable() {
-        let st = state();
-        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
-        let auth = format!("Bearer {token}");
-        // The seeded three-level table is queryable.
-        let resp = app(st.clone())
-            .oneshot(
-                Request::post("/api/sql")
-                    .header("content-type", "application/json")
-                    .header("authorization", &auth)
-                    .body(Body::from(
-                        r#"{"sql":"SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region ORDER BY region"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let j = body_json(resp).await;
-        assert!(j["error"].is_null(), "query errored: {j:?}");
-        assert_eq!(j["columns"][0], "region");
-        assert_eq!(j["row_count"], 2);
-        // The catalog endpoint surfaces it.
-        let resp = app(st)
-            .oneshot(
-                Request::get("/api/catalog")
-                    .header("authorization", &auth)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let cat = body_json(resp).await;
-        let s = serde_json::to_string(&cat).unwrap();
-        assert!(s.contains("\"main\"") && s.contains("\"sales\"") && s.contains("monthly_revenue"));
-    }
 
     #[tokio::test]
     async fn grant_create_and_list() {
