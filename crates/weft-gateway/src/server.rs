@@ -185,6 +185,8 @@ impl AppState {
         );
         let mut groups = HashMap::new();
         groups.insert("admins".to_string(), vec![username.to_string()]);
+        let engine = Arc::new(Engine::new());
+        seed_sample_data(&engine);
         Self {
             clusters: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -194,7 +196,7 @@ impl AppState {
             users: Arc::new(Mutex::new(users)),
             groups: Arc::new(Mutex::new(groups)),
             grants: Arc::new(Mutex::new(Vec::new())),
-            engine: Arc::new(Engine::new()),
+            engine,
             jwt_secret: Arc::new(jwt_secret),
             web_dir: Arc::new(web_dir),
             weft_bin: Arc::new(weft_bin),
@@ -282,6 +284,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/clusters/:id/stop", post(stop_cluster))
         .route("/api/clusters/:id/events", get(list_cluster_events))
         .route("/api/sql", post(run_sql))
+        .route("/api/catalog", get(get_catalog))
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
@@ -862,6 +865,211 @@ fn privilege_from_str(p: &str) -> Option<Privilege> {
     })
 }
 
+// ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
+
+/// Register a small set of sample tables under `main.sales` so the SQL editor + catalog browser
+/// have real, queryable data out of the box (e.g. `SELECT * FROM main.sales.monthly_revenue`). In
+/// production these come from the user's registered catalogs (local + external HMS/Glue/UC).
+fn seed_sample_data(engine: &Engine) {
+    use weft_loom::arrow::array::{Float64Array, Int64Array, StringArray};
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::arrow::record_batch::RecordBatch;
+
+    let revenue_schema = Arc::new(Schema::new(vec![
+        Field::new("month", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("revenue", DataType::Float64, false),
+    ]));
+    let revenue = RecordBatch::try_new(
+        revenue_schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                "2026-01", "2026-01", "2026-02", "2026-02", "2026-03", "2026-03",
+            ])),
+            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US", "EU"])),
+            Arc::new(Float64Array::from(vec![
+                120000.0, 88000.0, 135000.0, 91000.0, 142000.0, 99000.0,
+            ])),
+        ],
+    );
+
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::Int64, false),
+        Field::new("customer", DataType::Utf8, false),
+        Field::new("amount", DataType::Float64, false),
+        Field::new("status", DataType::Utf8, false),
+    ]));
+    let orders = RecordBatch::try_new(
+        orders_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1001, 1002, 1003, 1004, 1005])),
+            Arc::new(StringArray::from(vec![
+                "acme", "globex", "acme", "initech", "globex",
+            ])),
+            Arc::new(Float64Array::from(vec![
+                2500.0, 1800.0, 3200.0, 950.0, 4100.0,
+            ])),
+            Arc::new(StringArray::from(vec![
+                "shipped",
+                "pending",
+                "shipped",
+                "cancelled",
+                "shipped",
+            ])),
+        ],
+    );
+
+    let customers_schema = Arc::new(Schema::new(vec![
+        Field::new("customer_id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("segment", DataType::Utf8, false),
+    ]));
+    let customers = RecordBatch::try_new(
+        customers_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Acme Corp", "Globex", "Initech"])),
+            Arc::new(StringArray::from(vec!["enterprise", "smb", "enterprise"])),
+        ],
+    );
+
+    for (table, batch) in [
+        ("monthly_revenue", revenue),
+        ("orders", orders),
+        ("customers", customers),
+    ] {
+        if let Ok(b) = batch {
+            if let Err(e) = register_namespaced(engine, "main", "sales", table, b) {
+                eprintln!("seed {table}: {e}");
+            }
+        }
+    }
+}
+
+/// Register `batch` as `catalog.schema.table` in the engine, creating the catalog/schema if needed.
+fn register_namespaced(
+    engine: &Engine,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    batch: weft_loom::arrow::record_batch::RecordBatch,
+) -> Result<(), String> {
+    use datafusion::catalog::{
+        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+    };
+    use datafusion::datasource::MemTable;
+
+    let ctx = engine.ctx();
+    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
+
+    let cat = match ctx.catalog(catalog) {
+        Some(c) => c,
+        None => {
+            let c: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
+            ctx.register_catalog(catalog, c.clone());
+            c
+        }
+    };
+    let sch = match cat.schema(schema) {
+        Some(s) => s,
+        None => {
+            let s: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
+            cat.register_schema(schema, s.clone())
+                .map_err(|e| e.to_string())?;
+            s
+        }
+    };
+    sch.register_table(table.to_string(), Arc::new(mem))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A column in the catalog browser.
+#[derive(Debug, Serialize)]
+pub struct CatalogColumn {
+    /// Column name.
+    pub name: String,
+    /// Arrow data type (display).
+    pub data_type: String,
+}
+
+/// A table in the catalog browser.
+#[derive(Debug, Serialize)]
+pub struct CatalogTable {
+    /// Table name.
+    pub name: String,
+    /// Columns.
+    pub columns: Vec<CatalogColumn>,
+}
+
+/// A schema (namespace) in the catalog browser.
+#[derive(Debug, Serialize)]
+pub struct CatalogSchema {
+    /// Schema name.
+    pub name: String,
+    /// Tables.
+    pub tables: Vec<CatalogTable>,
+}
+
+/// A catalog in the catalog browser.
+#[derive(Debug, Serialize)]
+pub struct CatalogNamespace {
+    /// Catalog name.
+    pub name: String,
+    /// Schemas.
+    pub schemas: Vec<CatalogSchema>,
+}
+
+/// Introspect the engine's real catalogs/schemas/tables/columns — what the SQL editor can query.
+async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> {
+    let ctx = st.engine.ctx();
+    let mut out = Vec::new();
+    for cat_name in ctx.catalog_names() {
+        let Some(cat) = ctx.catalog(&cat_name) else {
+            continue;
+        };
+        let mut schemas = Vec::new();
+        for sch_name in cat.schema_names() {
+            if sch_name == "information_schema" {
+                continue;
+            }
+            let Some(sch) = cat.schema(&sch_name) else {
+                continue;
+            };
+            let mut tables = Vec::new();
+            for tbl_name in sch.table_names() {
+                if let Ok(Some(tbl)) = sch.table(&tbl_name).await {
+                    let columns = tbl
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| CatalogColumn {
+                            name: f.name().clone(),
+                            data_type: format!("{}", f.data_type()),
+                        })
+                        .collect();
+                    tables.push(CatalogTable {
+                        name: tbl_name,
+                        columns,
+                    });
+                }
+            }
+            schemas.push(CatalogSchema {
+                name: sch_name,
+                tables,
+            });
+        }
+        // Only surface catalogs that actually hold schemas with tables (skip empty internals).
+        if schemas.iter().any(|s| !s.tables.is_empty()) {
+            out.push(CatalogNamespace {
+                name: cat_name,
+                schemas,
+            });
+        }
+    }
+    Json(out)
+}
+
 /// Bind and serve the gateway on `addr`. Admin credentials come from `WEFT_ADMIN_USER` /
 /// `WEFT_ADMIN_PASSWORD` (defaults `admin` / `admin`), the JWT secret from `WEFT_JWT_SECRET`, and
 /// the SPA directory from `WEFT_WEB_DIR` (default `web/dist`).
@@ -999,6 +1207,43 @@ mod tests {
         assert_eq!(j["rows"][0][0], "1");
         assert_eq!(j["rows"][0][1], "hi");
         assert!(j["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn seeded_catalog_is_queryable() {
+        let st = state();
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let auth = format!("Bearer {token}");
+        // The seeded three-level table is queryable.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/api/sql")
+                    .header("content-type", "application/json")
+                    .header("authorization", &auth)
+                    .body(Body::from(
+                        r#"{"sql":"SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region ORDER BY region"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        assert!(j["error"].is_null(), "query errored: {j:?}");
+        assert_eq!(j["columns"][0], "region");
+        assert_eq!(j["row_count"], 2);
+        // The catalog endpoint surfaces it.
+        let resp = app(st)
+            .oneshot(
+                Request::get("/api/catalog")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cat = body_json(resp).await;
+        let s = serde_json::to_string(&cat).unwrap();
+        assert!(s.contains("\"main\"") && s.contains("\"sales\"") && s.contains("monthly_revenue"));
     }
 
     #[tokio::test]
