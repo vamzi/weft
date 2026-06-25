@@ -7,19 +7,19 @@ export default function DiffBlock() {
     <div className="overflow-hidden rounded-weft border border-hairline bg-code-bg">
       <div className="flex items-center gap-2 border-b border-white/10 px-4 py-2">
         <span className="h-2.5 w-2.5 rounded-full bg-white/15" />
-        <span className="font-mono text-xs text-code-text/50">session.py</span>
+        <span className="weft-code-dim font-mono text-xs">session.py</span>
       </div>
       <pre className="overflow-x-auto px-4 py-4 font-mono text-[13px] leading-relaxed">
-        <div className="text-code-text/55">from pyspark.sql import SparkSession</div>
-        <div className="text-code-text/55"> </div>
-        <div className="text-code-text/55">spark = (SparkSession.builder</div>
+        <div className="weft-code-dim">from pyspark.sql import SparkSession</div>
+        <div className="weft-code-dim"> </div>
+        <div className="weft-code-dim">spark = (SparkSession.builder</div>
         <div className="relative rounded-sm bg-danger/15 pl-3 text-danger before:absolute before:left-0 before:content-['-']">
           {"         .remote(\"sc://your-spark:15002\")"}
         </div>
         <div className="relative rounded-sm bg-success/15 pl-3 text-success before:absolute before:left-0 before:text-accent before:content-['+']">
           {"         .remote(\"sc://localhost:50051\")  # Weft"}
         </div>
-        <div className="text-code-text/55">         .getOrCreate())</div>
+        <div className="weft-code-dim">         .getOrCreate())</div>
       </pre>
     </div>
   );
