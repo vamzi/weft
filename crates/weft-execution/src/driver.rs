@@ -20,9 +20,15 @@ use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
 use crate::flight::run_stage_on_worker;
+use crate::membership::ClusterMembership;
 use crate::shuffle::protocol::StageTicket;
 
-/// A static cluster of worker Flight endpoints (e.g. `http://127.0.0.1:50561`).
+/// A cluster of worker Flight endpoints (e.g. `http://127.0.0.1:50561`) for one query.
+///
+/// This is a **snapshot** of the worker set taken at stage-scheduling time. For a static cluster
+/// it's built directly from a list ([`Cluster::new`]); on EKS it's snapshotted from a live
+/// [`ClusterMembership`] ([`Cluster::from_membership`]) so the partition count tracks the workers
+/// that are actually up when the query starts.
 #[derive(Debug, Clone)]
 pub struct Cluster {
     /// Worker endpoints. Partition `i` is owned by `workers[i]`.
@@ -33,6 +39,20 @@ impl Cluster {
     /// Build a cluster from a list of endpoints.
     pub fn new(workers: Vec<String>) -> Self {
         Self { workers }
+    }
+
+    /// Snapshot the current worker set from a live [`ClusterMembership`] provider. This is the seam
+    /// the EKS `K8sMembership` (DNS-SRV / EndpointSlice watch) drives: resolve the workers that are
+    /// up *now*, then schedule the query against that snapshot.
+    pub fn from_membership(membership: &dyn ClusterMembership) -> Self {
+        Self {
+            workers: membership.endpoints(),
+        }
+    }
+
+    /// Number of workers (== number of shuffle partitions) in this snapshot.
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
     }
 }
 
@@ -92,6 +112,25 @@ pub async fn run_distributed(
     plan: &DistributedPlan,
 ) -> Result<Vec<RecordBatch>> {
     run_stages(cluster, &plan.into_stages()).await
+}
+
+/// Run a two-stage [`DistributedPlan`] against a live [`ClusterMembership`], snapshotting the
+/// worker set at scheduling time. The membership-driven entry point the Spark Connect server's
+/// `--cluster` mode calls on EKS (vs. the static-list [`run_distributed`]).
+pub async fn run_distributed_with_membership(
+    membership: &dyn ClusterMembership,
+    plan: &DistributedPlan,
+) -> Result<Vec<RecordBatch>> {
+    run_stages(&Cluster::from_membership(membership), &plan.into_stages()).await
+}
+
+/// Run an arbitrary stage DAG against a live [`ClusterMembership`], snapshotting the worker set at
+/// scheduling time. See [`run_stages`] for the DAG contract.
+pub async fn run_stages_with_membership(
+    membership: &dyn ClusterMembership,
+    stages: &[StageDef],
+) -> Result<Vec<RecordBatch>> {
+    run_stages(&Cluster::from_membership(membership), stages).await
 }
 
 /// Run an arbitrary stage DAG across `cluster` and return the output stage's concatenated result.
@@ -207,5 +246,22 @@ fn stage_ticket(
         hash_key_cols: stage.hash_key_cols.clone(),
         upstream_stage_ids: stage.upstream_stage_ids.clone(),
         produce,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::membership::StaticMembership;
+
+    #[test]
+    fn cluster_snapshots_membership_at_scheduling_time() {
+        let membership = StaticMembership::new(vec!["a:50561".into(), "b:50561".into()]);
+        let cluster = Cluster::from_membership(&membership);
+        assert_eq!(cluster.worker_count(), 2);
+        assert_eq!(
+            cluster.workers,
+            vec!["a:50561".to_string(), "b:50561".to_string()]
+        );
     }
 }

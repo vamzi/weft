@@ -7,6 +7,8 @@
 use weft_common::Result;
 use weft_plan::LogicalPlan;
 
+pub mod dialect;
+
 /// Parse a Spark SQL statement into the warp IR. Implemented in Phase 0.
 pub fn parse(_sql: &str) -> Result<LogicalPlan> {
     weft_plan::lower_placeholder()
