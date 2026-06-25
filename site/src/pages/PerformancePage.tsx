@@ -56,7 +56,21 @@ export default function PerformancePage() {
 
       {/* Total runtime */}
       <section className="mt-10">
-        <BenchmarkChart engines={benchmarks.engines} />
+        <BenchmarkChart
+          engines={benchmarks.engines}
+          title={
+            benchmarks.commonCount
+              ? `Total hot runtime — ${benchmarks.commonCount} queries all engines completed`
+              : "Total hot runtime"
+          }
+        />
+        {benchmarks.commonCount != null && benchmarks.commonCount < benchmarks.queryCount && (
+          <p className="mt-2 text-xs text-muted">
+            To compare fairly, the bars sum the {benchmarks.commonCount} of {benchmarks.queryCount}{" "}
+            queries every engine executed — no engine is credited for skipping a hard query. Each
+            engine's full total and the exact queries it couldn't run are in the table below.
+          </p>
+        )}
       </section>
 
       {/* Per-query */}
@@ -72,7 +86,8 @@ export default function PerformancePage() {
             <thead className="bg-bg-subtle text-left text-xs uppercase tracking-wide text-muted">
               <tr>
                 <th className="px-4 py-2.5 font-medium">Engine</th>
-                <th className="px-4 py-2.5 font-medium">Total hot</th>
+                <th className="px-4 py-2.5 font-medium">Common-set total</th>
+                <th className="px-4 py-2.5 font-medium">Full total</th>
                 <th className="px-4 py-2.5 font-medium">Failed queries</th>
                 <th className="px-4 py-2.5 font-medium">Status</th>
               </tr>
@@ -84,11 +99,25 @@ export default function PerformancePage() {
                     {e.name}
                     {e.highlight && <span className="ml-2 text-xs text-accent">ours</span>}
                   </td>
-                  <td className="px-4 py-2.5 tabular-nums">
+                  <td className="px-4 py-2.5 tabular-nums font-semibold">
                     {e.total != null ? `${e.total.toFixed(2)}s` : "—"}
                   </td>
+                  <td className="px-4 py-2.5 tabular-nums text-muted">
+                    {e.totalAll != null ? `${e.totalAll.toFixed(2)}s` : "—"}
+                  </td>
                   <td className="px-4 py-2.5 tabular-nums">
-                    {e.failures != null ? e.failures : "—"}
+                    {e.failures ? (
+                      <span title={`Q${(e.failedQueries ?? []).join(", Q")}`}>
+                        {e.failures}{" "}
+                        <span className="text-xs text-muted">
+                          (Q{(e.failedQueries ?? []).join(", Q")})
+                        </span>
+                      </span>
+                    ) : e.failures === 0 ? (
+                      "0"
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td className="px-4 py-2.5">
                     <SourceTag source={e.source} />

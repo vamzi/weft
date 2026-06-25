@@ -5,14 +5,20 @@ import type { Engine } from "../lib/benchmarks";
  * to the slowest measured total; engines still `pending` draw a muted striped "awaiting run" bar
  * so the layout is honest and final before any number exists.
  */
-export default function BenchmarkChart({ engines }: { engines: Engine[] }) {
+export default function BenchmarkChart({
+  engines,
+  title = "Total hot runtime",
+}: {
+  engines: Engine[];
+  title?: string;
+}) {
   const measured = engines.filter((e) => e.total != null) as (Engine & { total: number })[];
   const max = measured.length ? Math.max(...measured.map((e) => e.total)) : 1;
 
   return (
     <div className="weft-card p-5 sm:p-6">
       <div className="mb-5 flex items-baseline justify-between">
-        <h3 className="text-sm font-semibold">Total hot runtime — 43 queries</h3>
+        <h3 className="text-sm font-semibold">{title}</h3>
         <span className="text-xs text-muted">seconds · lower is better</span>
       </div>
       <div className="space-y-3.5">

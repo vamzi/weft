@@ -38,27 +38,49 @@ def main():
     ap.add_argument("--machine", default="c6a.4xlarge")
     args = ap.parse_args()
 
-    out_engines = []
+    # First pass: load every available engine's per-query hot times.
+    loaded = {}
     run_date = args.run_date
     for spec in ENGINES:
         path = os.path.join(RESULTS, f"{spec['key']}.json")
         if not os.path.exists(path):
-            out_engines.append({
-                "key": spec["key"], "name": spec["name"], "highlight": spec["highlight"],
-                "total": None, "source": "pending", "perQuery": [], "failures": None,
-            })
             continue
         data = json.load(open(path))
-        per_query = [hot(row) for row in data.get("result", [])]
-        total = round(sum(h for h in per_query if h is not None), 3) if per_query else None
-        failures = sum(1 for h in per_query if h is None)
+        loaded[spec["key"]] = [hot(row) for row in data.get("result", [])]
         run_date = run_date or data.get("date")
+
+    # The common set: query indices that EVERY measured engine completed. The headline speedup and
+    # the main bar chart use totals over this set, so engines are compared on identical queries —
+    # an engine isn't credited for skipping a hard query. Per-engine full totals + the exact failed
+    # queries are still reported for transparency.
+    n = max((len(v) for v in loaded.values()), default=43)
+    common = [
+        qi for qi in range(n)
+        if loaded and all(v[qi] is not None for v in loaded.values() if qi < len(v))
+        and all(qi < len(v) for v in loaded.values())
+    ]
+
+    out_engines = []
+    for spec in ENGINES:
+        if spec["key"] not in loaded:
+            out_engines.append({
+                "key": spec["key"], "name": spec["name"], "highlight": spec["highlight"],
+                "total": None, "totalAll": None, "source": "pending",
+                "perQuery": [], "failures": None, "failedQueries": [],
+            })
+            continue
+        pq = loaded[spec["key"]]
+        total_all = round(sum(h for h in pq if h is not None), 3)
+        total_common = round(sum(pq[qi] for qi in common), 3) if common else None
+        failed = [qi for qi, h in enumerate(pq) if h is None]
         out_engines.append({
             "key": spec["key"], "name": spec["name"], "highlight": spec["highlight"],
-            "total": total,
+            "total": total_common,          # fair, common-set total (chart + speedup)
+            "totalAll": total_all,          # this engine's full successful-query total
             "source": f"measured (EC2 {args.machine} {run_date})",
-            "perQuery": per_query,
-            "failures": failures,
+            "perQuery": pq,
+            "failures": len(failed),
+            "failedQueries": failed,
         })
 
     doc = {
@@ -66,6 +88,7 @@ def main():
         "machine": args.machine,
         "runDate": run_date,
         "queryCount": 43,
+        "commonCount": len(common),
         "method": "Spark Connect, stock PySpark client, 3 tries/query, hot = min(try2, try3)",
         "engines": out_engines,
     }
