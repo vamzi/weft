@@ -149,7 +149,38 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
     for r in futures::future::join_all(futs).await {
         out.extend(r?);
     }
-    Ok(out)
+    // Drop zero-row batches: a worker that produced nothing returns a schema-only padding batch
+    // (the shuffle transport recovers an empty result as one typed-but-empty batch), and an empty
+    // result can infer a divergent schema. Keep just one if the whole result is empty.
+    let data: Vec<RecordBatch> = out.iter().filter(|b| b.num_rows() > 0).cloned().collect();
+    let out = if data.is_empty() {
+        out.into_iter().take(1).collect()
+    } else {
+        data
+    };
+    Ok(unify_schema(out))
+}
+
+/// Coerce gathered batches to one common schema (all fields nullable). Different workers can infer
+/// slightly different nullability for the same output (e.g. an empty result vs a populated one), and
+/// the concatenated result must be schema-consistent so a caller can re-register or concatenate it.
+fn unify_schema(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    use std::sync::Arc;
+    use weft_loom::arrow::datatypes::{Field, Schema};
+    let Some(first) = batches.first() else {
+        return batches;
+    };
+    let fields: Vec<Field> = first
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    batches
+        .into_iter()
+        .filter_map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()).ok())
+        .collect()
 }
 
 /// Build the [`StageTicket`] for running `stage` as partition `partition_id` on the cluster.

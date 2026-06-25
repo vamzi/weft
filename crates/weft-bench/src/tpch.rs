@@ -17,7 +17,7 @@ use crate::tpch_data;
 /// The 22 official TPC-H queries, loaded from `bench/tpch/queries/q{N}.sql` at compile time. The
 /// trailing `;` is stripped before execution (DataFusion runs a single statement). Standard SQL —
 /// `CAST('…' AS date)`, `INTERVAL`, EXISTS/correlated subqueries, CTEs.
-fn queries() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn queries() -> Vec<(&'static str, &'static str)> {
     macro_rules! q {
         ($n:literal) => {
             (
@@ -191,7 +191,7 @@ fn duckdb_result(duckdb: &str, dir: &Path, sql: &str) -> Option<String> {
 }
 
 /// Normalize weft result batches to sorted rows of cells (numbers rounded) for oracle comparison.
-fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+pub(crate) fn normalize_batches(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     // Render NULL as the literal `NULL` to match DuckDB's `-csv` output (weft's default is empty).
     let opts = FormatOptions::default().with_null("NULL");
     let mut rows = Vec::new();

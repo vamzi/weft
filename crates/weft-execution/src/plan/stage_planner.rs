@@ -157,6 +157,19 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
         .strip_prefix("SELECT * ")
         .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
 
+    // Broadcast is only correct if the sharded table is *scanned* exactly once (the driving fact).
+    // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
+    // local shard per worker and silently lose cross-shard rows, so reject it. (`base_tables` counts
+    // the plan-input scan only; subquery scans live in expressions, so descend into those too.)
+    let sharded_name = sharded[0].as_str();
+    let scans = count_table_scans(&agg.input, sharded_name);
+    if scans > 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: sharded table `{sharded_name}` scanned {scans}× \
+             (self-join / subquery) — not broadcast-safe"
+        )));
+    }
+
     let up = Unparser::default();
     let group_sql: Vec<String> = agg
         .group_expr
@@ -207,8 +220,9 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
 }
 
 /// Build the global finalize query (`ORDER BY` / `LIMIT` over the gathered `result` table), or
-/// `None` when the query has neither. Sort exprs reference output column names, which `result`
-/// carries, so they unparse directly (no remapping).
+/// `None` when the query has neither. Sort exprs reference output columns; `result` carries those
+/// under their unqualified output names, so column refs are unqualified (e.g. `lineitem.l_returnflag`
+/// → `l_returnflag`, matching `wrap_output`'s aliasing) before unparsing.
 fn build_finalize(p: &Peeled) -> Result<Option<String>> {
     if p.sort.is_none() && p.limit.is_none() {
         return Ok(None);
@@ -225,7 +239,10 @@ fn build_finalize(p: &Peeled) -> Result<Option<String>> {
                 } else {
                     "NULLS LAST"
                 };
-                Ok(format!("{} {dir} {nulls}", expr_sql(&up, &s.expr)?))
+                Ok(format!(
+                    "{} {dir} {nulls}",
+                    expr_sql(&up, &unqualify(&s.expr))?
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         if !parts.is_empty() {
@@ -415,6 +432,22 @@ fn strip_alias(e: &Expr) -> &Expr {
     }
 }
 
+/// Drop the table qualifier from every column reference (e.g. `lineitem.l_returnflag` →
+/// `l_returnflag`), so a sort over the gathered `result` table resolves against its unqualified
+/// output column names.
+fn unqualify(e: &Expr) -> Expr {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    e.clone()
+        .transform(|node| {
+            if let Expr::Column(c) = &node {
+                return Ok(Transformed::yes(datafusion::prelude::col(c.name.clone())));
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|t| t.data)
+        .unwrap_or(e.clone())
+}
+
 /// Replace any column reference whose flat name is in `remap` with the safe-named column.
 fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
     use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -448,6 +481,34 @@ fn scalar_as_usize(s: &datafusion::scalar::ScalarValue) -> Option<usize> {
         UInt32(Some(v)) => Some(*v as usize),
         _ => None,
     }
+}
+
+/// Count scans of table `name` anywhere in `lp` — across plan inputs **and** subquery plans nested
+/// in expressions (EXISTS / IN / scalar subqueries), so a correlated subquery over the table counts.
+fn count_table_scans(lp: &LogicalPlan, name: &str) -> usize {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut n = match lp {
+        LogicalPlan::TableScan(s) if s.table_name.table() == name => 1,
+        _ => 0,
+    };
+    for c in lp.inputs() {
+        n += count_table_scans(c, name);
+    }
+    for e in lp.expressions() {
+        let _ = e.apply(|node| {
+            let sub = match node {
+                Expr::Exists(ex) => Some(&ex.subquery.subquery),
+                Expr::InSubquery(iq) => Some(&iq.subquery.subquery),
+                Expr::ScalarSubquery(sq) => Some(&sq.subquery),
+                _ => None,
+            };
+            if let Some(plan) = sub {
+                n += count_table_scans(plan, name);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+    n
 }
 
 /// Collect the base (scanned) table names referenced anywhere in `lp`.

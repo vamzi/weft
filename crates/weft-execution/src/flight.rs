@@ -282,6 +282,15 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
     while let Some(batch) = rb.next().await {
         out.push(batch.map_err(|e| Error::Execution(format!("flight decode: {e}")))?);
     }
+    // The Flight encoder sends the schema but drops zero-row batches, so an empty result arrives as
+    // no batches at all. Recover a schema-carrying empty batch from the stream so a downstream
+    // consumer can still register the (empty) shuffle input — otherwise an all-empty bucket set
+    // would surface as "no batches".
+    if out.is_empty() {
+        if let Some(schema) = rb.schema() {
+            out.push(RecordBatch::new_empty(schema.clone()));
+        }
+    }
     Ok(out)
 }
 

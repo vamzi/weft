@@ -34,6 +34,7 @@ use weft_proto::spark::connect as sc;
 
 mod tpch;
 mod tpch_data;
+mod tpch_dist;
 
 const HITS_SCHEMA_TSV: &str = include_str!("../../../bench/clickbench/hits_schema.tsv");
 const CLICKBENCH_QUERIES: &str = include_str!("../../../bench/clickbench/queries.sql");
@@ -631,6 +632,14 @@ async fn run_correctness(rows: usize) {
     }
 }
 
+/// Parse the value following `name` in `args` as `T` (e.g. `--sf 0.1`, `--workers 4`).
+fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -651,17 +660,17 @@ async fn main() {
         Some("clickbench") | None => run_clickbench(rows).await,
         Some("clickbench-grpc") => run_clickbench_grpc(rows, data).await,
         Some("correctness") => run_correctness(rows).await,
-        Some("tpch") => {
-            let sf = args
-                .iter()
-                .position(|a| a == "--sf")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.05);
+        Some(cmd @ ("tpch" | "tpch-distributed")) => {
+            let sf: f64 = flag(&args, "--sf").unwrap_or(0.05);
             let dir = data
                 .clone()
                 .unwrap_or_else(|| format!("{}/weft-tpch-sf{sf}", std::env::temp_dir().display()));
-            tpch::run(sf, Path::new(&dir)).await;
+            if cmd == "tpch" {
+                tpch::run(sf, Path::new(&dir)).await;
+            } else {
+                let workers: usize = flag(&args, "--workers").unwrap_or(2);
+                tpch_dist::run(sf, Path::new(&dir), workers).await;
+            }
         }
         Some(other) => {
             eprintln!("unknown subcommand: {other}; try `clickbench` or `clickbench-grpc`");
