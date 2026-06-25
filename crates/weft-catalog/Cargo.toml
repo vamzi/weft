@@ -1,6 +1,6 @@
 [package]
 name = "weft-catalog"
-description = "Catalog providers: Unity (Iceberg REST + temp credentials), Glue, Hive Metastore, in-memory."
+description = "Pluggable catalog SPI + registry: bring your own metastore (Hive, Unity, Glue) or implement CatalogProvider."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 weft-common = { workspace = true }
-# TODO(deps): reqwest (Iceberg REST + Unity temporary-table-credentials), serde_json, object_store
+async-trait = "0.1"
+# Arrow `SchemaRef` for `TableMetadata.schema`. Pulled from DataFusion's re-export so the whole
+# workspace shares one `arrow` version (the same one `weft-loom` embeds and the bridge consumes).
+datafusion = { version = "54", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -14,14 +14,22 @@
 //! The strategy: tie Sail on the ~33 cheap queries (DataFusion parity), beat it 1.5–2× on
 //! the ~10 expensive ones. Winning those *is* winning the total.
 
+use std::sync::Arc;
+
 use datafusion::prelude::SessionContext;
 use weft_common::{Error, Result};
+
+pub mod catalog_bridge;
 
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
 
 use arrow::record_batch::RecordBatch;
+
+/// Native operators (Phase-1 carve-outs) that replace DataFusion's generic physical operators
+/// on the heavy ClickBench queries. See [`ops`] for status and scope.
+pub mod ops;
 
 /// Backend identifier reported in `EXPLAIN`.
 pub const NAME: &str = "loom";
@@ -49,7 +57,7 @@ fn env_bool(key: &str) -> Option<bool> {
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
-    ctx: SessionContext,
+    ctx: Arc<SessionContext>,
 }
 
 impl Engine {
@@ -111,7 +119,7 @@ impl Engine {
             }
             None => SessionContext::new_with_config(config),
         };
-        Self { ctx }
+        Self { ctx: Arc::new(ctx) }
     }
 
     /// Run a SQL string and collect the result as Arrow record batches.
@@ -237,7 +245,9 @@ impl Engine {
     }
 
     /// Register an in-memory table of `batches` under `name` — the worker-side landing zone
-    /// for shuffle input, so a downstream stage can read it as an ordinary table.
+    /// for shuffle input, so a downstream stage can read it as an ordinary table. Idempotent: any
+    /// existing table of the same name is replaced (a worker reuses its engine across queries, so
+    /// `shuffle_input` is re-registered each time).
     pub fn register_batches(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
         use datafusion::datasource::MemTable;
         use std::sync::Arc;
@@ -248,6 +258,8 @@ impl Engine {
         };
         let table = MemTable::try_new(schema, vec![batches])
             .map_err(|e| Error::Execution(format!("mem table `{name}`: {e}")))?;
+        // Drop any prior registration so re-registering the same name doesn't error.
+        let _ = self.ctx.deregister_table(name);
         self.ctx
             .register_table(name, Arc::new(table))
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
@@ -293,10 +305,7 @@ impl Engine {
         files: Vec<std::path::PathBuf>,
     ) -> Result<()> {
         use datafusion::datasource::file_format::parquet::ParquetFormat;
-        use datafusion::datasource::listing::{
-            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-        };
-        use std::sync::Arc;
+        use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 
         if files.is_empty() {
             return Err(Error::Plan(format!(
@@ -311,24 +320,54 @@ impl Engine {
             })
             .collect::<Result<Vec<_>>>()?;
         let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let state = self.ctx.state();
-        let config = ListingTableConfig::new_with_multi_paths(urls)
-            .with_listing_options(opts)
-            .infer_schema(&state)
-            .await
-            .map_err(|e| Error::Execution(format!("infer schema: {e}")))?;
-        let table = ListingTable::try_new(config)
-            .map_err(|e| Error::Execution(format!("listing table: {e}")))?;
+        let table = build_listing_table(&self.ctx.state(), urls, opts, None).await?;
         self.ctx
-            .register_table(name, Arc::new(table))
+            .register_table(name, table)
             .map_err(|e| Error::Execution(format!("register `{name}`: {e}")))?;
         Ok(())
     }
 
+    /// Register an external catalog under `name`, bridging it into DataFusion's catalog API so
+    /// `SELECT … FROM {name}.namespace.table` (and `spark.read.table("{name}.ns.t")`) resolve
+    /// **lazily** — the catalog is hit only when a query first references one of its tables.
+    pub fn register_catalog(&self, name: &str, provider: Arc<dyn weft_catalog::CatalogProvider>) {
+        let bridge = Arc::new(catalog_bridge::WeftCatalogProvider::new(
+            provider,
+            self.ctx.clone(),
+        ));
+        self.ctx.register_catalog(name, bridge);
+    }
+
     /// Access the underlying DataFusion context (e.g. to register tables/Parquet).
     pub fn ctx(&self) -> &SessionContext {
-        &self.ctx
+        self.ctx.as_ref()
     }
+}
+
+/// Build a DataFusion [`ListingTable`] over `urls` — the one place the Parquet/Delta/Iceberg
+/// readers and the catalog bridge converge. Infers the schema from the data files unless `schema`
+/// is supplied (a catalog that already knows the schema passes it, avoiding a metadata read and
+/// handling empty tables). Returned as a `TableProvider` so callers can register it or hand it to
+/// the bridge.
+pub(crate) async fn build_listing_table(
+    state: &datafusion::execution::context::SessionState,
+    urls: Vec<datafusion::datasource::listing::ListingTableUrl>,
+    options: datafusion::datasource::listing::ListingOptions,
+    schema: Option<arrow::datatypes::SchemaRef>,
+) -> Result<Arc<dyn datafusion::datasource::TableProvider>> {
+    use datafusion::datasource::listing::{ListingTable, ListingTableConfig};
+
+    let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
+    let config = match schema {
+        Some(s) => config.with_schema(s),
+        None => config
+            .infer_schema(state)
+            .await
+            .map_err(|e| Error::Execution(format!("infer schema: {e}")))?,
+    };
+    let table =
+        ListingTable::try_new(config).map_err(|e| Error::Execution(format!("listing table: {e}")))?;
+    Ok(Arc::new(table))
 }
 
 impl Default for Engine {
