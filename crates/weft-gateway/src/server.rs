@@ -27,6 +27,7 @@ use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
 use crate::cloud;
+use crate::cluster_client;
 use weft_catalog_glue::GlueCatalog;
 
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
@@ -1128,15 +1129,38 @@ pub struct SqlResponse {
 /// [`weft_sql::dialect`] first. In production this routes to the target cluster's Spark Connect
 /// endpoint; here it runs in-process on the same engine — real execution, real results.
 async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Json<SqlResponse> {
-    // Running SQL against a cluster counts as activity (resets its idle timer).
-    if let Some(cid) = &req.cluster_id {
-        st.touch(cid);
+    const MAX_ROWS: usize = 1000;
+    // If a RUNNING cluster is selected, route execution to its Spark Connect endpoint (the real
+    // data-plane hop); otherwise run on the gateway's embedded engine. A non-running selection
+    // falls back to the embedded engine.
+    if let Some(cid) = req.cluster_id.as_deref().filter(|s| !s.is_empty()) {
+        st.touch(cid); // counts as activity → resets the cluster's idle timer
+        let endpoint = {
+            let clusters = st.clusters.lock().unwrap();
+            clusters.get(cid).and_then(|c| {
+                if c.state == Phase::Running.as_str() {
+                    c.connect_endpoint.clone()
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(ep) = endpoint {
+            return match cluster_client::run_sql_on_cluster(&ep, &req.sql, MAX_ROWS).await {
+                Ok(batches) => Json(batches_to_response(&batches)),
+                Err(e) => Json(SqlResponse {
+                    columns: vec![],
+                    rows: vec![],
+                    row_count: 0,
+                    error: Some(format!("cluster `{cid}`: {e}")),
+                }),
+            };
+        }
     }
     let sql = weft_sql::dialect::to_datafusion_sql(&req.sql);
     // Cap execution at the UI display limit so an unbounded `SELECT *` over a huge external table
     // (e.g. 100M-row ClickBench `hits`) reads only enough row groups instead of materializing the
     // whole result into memory (which previously OOMed → "load failed"). LIMIT pushes into the scan.
-    const MAX_ROWS: usize = 1000;
     let result = async {
         let df = st.engine.ctx().sql(&sql).await?;
         let df = df.limit(0, Some(MAX_ROWS))?;

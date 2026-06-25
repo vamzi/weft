@@ -11,6 +11,7 @@
 //! persistence/auth/Spark-Connect-routing layering on top of the same surface.
 
 pub mod cloud;
+pub mod cluster_client;
 pub mod server;
 
 /// HTTP methods used by the gateway API.

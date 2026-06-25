@@ -21,6 +21,8 @@ weft-sql = { workspace = true }
 weft-catalog = { workspace = true }
 weft-catalog-hive = { workspace = true }
 weft-catalog-glue = { workspace = true }
+weft-proto = { workspace = true }
+tonic = "0.12"
 datafusion = "54"
 async-trait = "0.1"
 axum = "0.7"
