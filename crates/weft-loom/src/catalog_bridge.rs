@@ -167,6 +167,7 @@ async fn metadata_to_provider(
     match md.format {
         TableFormat::Parquet => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -175,6 +176,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Csv => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -183,6 +185,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Json => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -202,6 +205,44 @@ async fn metadata_to_provider(
             let files = weft_datasource::iceberg_active_files(&path).map_err(weft_to_df)?;
             parquet_files_provider(state, &md.location, files, md.schema.clone()).await
         }
+    }
+}
+
+/// Ensure an object store is registered on the session's runtime for a remote table location so
+/// DataFusion can read it. Currently handles `s3://` — credentials come from the environment or the
+/// EC2 instance role (IMDS) via object_store's default provider; no static keys. Registering on the
+/// shared runtime is idempotent and persists for the session, so query-time resolution finds it.
+/// `file://` and bare paths need nothing and are skipped.
+fn ensure_remote_store(state: &SessionState, url: &datafusion::datasource::listing::ListingTableUrl) {
+    if url.scheme() != "s3" {
+        return;
+    }
+    let os_url = url.object_store(); // canonical `s3://bucket` key
+    if state.runtime_env().object_store(&os_url).is_ok() {
+        return; // already registered for this bucket
+    }
+    // `os_url` is the canonical `s3://bucket/` — pull the bucket from the authority.
+    let bucket = os_url
+        .as_str()
+        .strip_prefix("s3://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    if bucket.is_empty() {
+        return;
+    }
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+    match object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(&bucket)
+        .with_region(region)
+        .build()
+    {
+        Ok(store) => {
+            state
+                .runtime_env()
+                .register_object_store(os_url.as_ref(), Arc::new(store));
+        }
+        Err(e) => eprintln!("warn: could not register S3 object store for `{bucket}`: {e}"),
     }
 }
 

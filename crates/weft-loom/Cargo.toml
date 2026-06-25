@@ -18,6 +18,10 @@ async-trait = "0.1"
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.
 # Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
 datafusion = "54"
+# Read table data from object stores (S3) for Glue/Hive locations on `s3://`. Pinned to the same
+# 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
+# EC2 instance-role (IMDS) credential provider — no static keys.
+object_store = { version = "0.13", features = ["aws"] }
 # Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
 rayon = "1"
 
