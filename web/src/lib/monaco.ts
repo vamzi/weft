@@ -5,13 +5,12 @@
  *   the --weft-* design tokens, so the editor matches the brand. The dark code
  *   surface (--weft-code-bg) is the default editor background.
  * - Registers a governed-catalog completion provider for the built-in `sql`
- *   language: catalog/schema/table/column objects from the mock catalog API
- *   plus a curated set of SQL keywords. Live, the same provider would be fed by
- *   POST /api/complete instead of the in-memory catalog snapshot.
+ *   language: catalog/schema/table/column objects from the LIVE catalog API
+ *   (GET /api/catalog) plus a curated set of SQL keywords.
  */
 import type { Monaco } from "@monaco-editor/react";
 import type { languages } from "monaco-editor";
-import { api, type CatalogObject } from "./api";
+import { api, type CatalogNamespace } from "./api";
 
 export const WEFT_DARK = "weft-dark";
 export const WEFT_LIGHT = "weft-light";
@@ -33,7 +32,7 @@ const SQL_KEYWORDS = [
 ];
 
 let installed = false;
-let catalogSnapshot: CatalogObject[] = [];
+let catalogSnapshot: CatalogNamespace[] = [];
 
 /**
  * One-time setup: themes + completion provider. Safe to call on every editor
@@ -44,8 +43,8 @@ export function setupMonacoSql(monaco: Monaco): void {
   if (installed) return;
   installed = true;
 
-  // Warm the catalog snapshot used for completions.
-  api.listCatalog().then((objs) => (catalogSnapshot = objs)).catch(() => {});
+  // Warm the snapshot of the LIVE catalog used for completions.
+  api.getCatalog().then((cat) => (catalogSnapshot = cat)).catch(() => {});
 
   monaco.languages.registerCompletionItemProvider("sql", {
     triggerCharacters: [" ", ".", "("],
@@ -60,43 +59,52 @@ export function setupMonacoSql(monaco: Monaco): void {
 
       const Kind = monaco.languages.CompletionItemKind;
       const suggestions: languages.CompletionItem[] = [];
+      const seenColumns = new Set<string>();
 
-      // Catalog objects (catalog → schema → table/view → columns).
-      for (const obj of catalogSnapshot) {
-        const detail =
-          obj.kind === "table" || obj.kind === "view"
-            ? obj.parent
-              ? `${obj.parent}.${obj.name}`
-              : obj.name
-            : obj.kind;
+      // Live catalog (catalog → schema → table → columns).
+      for (const cat of catalogSnapshot) {
         suggestions.push({
-          label: obj.name,
-          kind:
-            obj.kind === "catalog"
-              ? Kind.Module
-              : obj.kind === "schema"
-                ? Kind.Class
-                : obj.kind === "view"
-                  ? Kind.Interface
-                  : Kind.Struct,
-          insertText: obj.name,
-          detail,
+          label: cat.name,
+          kind: Kind.Module,
+          insertText: cat.name,
+          detail: "catalog",
           range,
-          sortText: `0_${obj.kind}_${obj.name}`,
+          sortText: `0_catalog_${cat.name}`,
         });
-      }
-
-      // Columns from known tables.
-      for (const [tbl, cols] of Object.entries(KNOWN_COLUMNS)) {
-        for (const col of cols) {
+        for (const schema of cat.schemas) {
+          const schemaFqn = `${cat.name}.${schema.name}`;
           suggestions.push({
-            label: col,
-            kind: Kind.Field,
-            insertText: col,
-            detail: `column · ${tbl}`,
+            label: schema.name,
+            kind: Kind.Class,
+            insertText: schema.name,
+            detail: `schema · ${schemaFqn}`,
             range,
-            sortText: `1_col_${col}`,
+            sortText: `0_schema_${schema.name}`,
           });
+          for (const table of schema.tables) {
+            const tableFqn = `${schemaFqn}.${table.name}`;
+            suggestions.push({
+              label: table.name,
+              kind: Kind.Struct,
+              insertText: table.name,
+              detail: `table · ${tableFqn}`,
+              range,
+              sortText: `0_table_${table.name}`,
+            });
+            for (const col of table.columns) {
+              // De-dupe identically-named columns across tables.
+              if (seenColumns.has(col.name)) continue;
+              seenColumns.add(col.name);
+              suggestions.push({
+                label: col.name,
+                kind: Kind.Field,
+                insertText: col.name,
+                detail: `${col.data_type} · ${table.name}`,
+                range,
+                sortText: `1_col_${col.name}`,
+              });
+            }
+          }
         }
       }
 
@@ -115,13 +123,6 @@ export function setupMonacoSql(monaco: Monaco): void {
     },
   });
 }
-
-/** Column hints surfaced in completion; mirrors the mock catalog tables. */
-const KNOWN_COLUMNS: Record<string, string[]> = {
-  orders: ["o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority"],
-  lineitem: ["l_orderkey", "l_partkey", "l_quantity", "l_extendedprice", "l_discount", "l_returnflag", "l_shipdate"],
-  monthly_revenue: ["month", "revenue", "orders"],
-};
 
 function defineThemes(monaco: Monaco): void {
   const accent = stripHash(token("--weft-accent", "#ff6a00"));

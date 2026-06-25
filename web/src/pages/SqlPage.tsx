@@ -26,8 +26,8 @@ interface LiveResult {
   durationMs: number;
 }
 
-// A simple default query that runs anywhere — proves the live path end to end.
-const STARTER_SQL = `SELECT 1 AS a, 'hello' AS b;`;
+// A default query over a real seeded table — runs out of the box.
+const STARTER_SQL = `SELECT * FROM main.sales.monthly_revenue`;
 
 const STATUS_TONE: Record<Query["status"], "success" | "warning" | "danger" | "muted"> = {
   finished: "success",

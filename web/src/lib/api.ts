@@ -117,6 +117,32 @@ export interface TableDetail {
   columns: Column[];
 }
 
+// Live catalog (GET /api/catalog) -------------------------------------------
+
+/** One column of a real, queryable table. */
+export interface CatalogColumn {
+  name: string;
+  data_type: string;
+}
+
+/** A real table with its column schema. */
+export interface CatalogTable {
+  name: string;
+  columns: CatalogColumn[];
+}
+
+/** A schema (namespace) holding tables. */
+export interface CatalogSchema {
+  name: string;
+  tables: CatalogTable[];
+}
+
+/** A top-level catalog/namespace holding schemas. */
+export interface CatalogNamespace {
+  name: string;
+  schemas: CatalogSchema[];
+}
+
 export type ExternalCatalogType = "hms" | "glue" | "unity" | "local";
 
 export interface AttachCatalogInput {
@@ -879,6 +905,15 @@ export const api = {
   },
 
   // Catalog ---------------------------------------------------------------
+  /**
+   * GET /api/catalog (LIVE) — the real, queryable catalog tree
+   * (namespace → schema → table → columns). Goes through `request()`, which
+   * attaches the bearer token.
+   */
+  async getCatalog(): Promise<CatalogNamespace[]> {
+    return request("GET", "/api/catalog");
+  },
+
   /** GET /api/catalog */
   async listCatalog(): Promise<CatalogObject[]> {
     if (!USE_MOCK) return request("GET", "/api/catalog");
