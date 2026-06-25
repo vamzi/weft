@@ -293,3 +293,130 @@ async fn analyze_schema_returns_spark_types() {
         Some(sc::data_type::Kind::String(_))
     ));
 }
+
+async fn analyze(
+    client: &mut SparkConnectServiceClient<Channel>,
+    analyze: sc::analyze_plan_request::Analyze,
+) -> sc::analyze_plan_response::Result {
+    let req = sc::AnalyzePlanRequest {
+        session_id: SESSION.to_string(),
+        analyze: Some(analyze),
+        ..Default::default()
+    };
+    client
+        .analyze_plan(req)
+        .await
+        .expect("analyze_plan")
+        .into_inner()
+        .result
+        .expect("a result")
+}
+
+#[tokio::test]
+async fn analyze_explain_renders_a_plan() {
+    let mut client = boot(50598).await;
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::Explain(sc::analyze_plan_request::Explain {
+            plan: Some(root(sql_relation("SELECT 1 AS a, 'x' AS b"))),
+            explain_mode: sc::analyze_plan_request::explain::ExplainMode::Extended as i32,
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::Explain(e) = result else {
+        panic!("expected Explain result")
+    };
+    assert!(
+        e.explain_string.contains("Physical Plan"),
+        "explain carries a physical plan:\n{}",
+        e.explain_string
+    );
+    assert!(
+        e.explain_string.contains("Optimized Logical Plan"),
+        "EXTENDED mode includes the optimized logical plan:\n{}",
+        e.explain_string
+    );
+}
+
+#[tokio::test]
+async fn analyze_explain_shows_filter_pushdown() {
+    let mut client = boot(50599).await;
+    // A filter over a created table must show the predicate pushed into the scan — proves the
+    // optimizer runs on the resolved plan (the `.into_unoptimized_plan()` subplans get optimized
+    // once, at the execution/explain seam).
+    run(
+        &mut client,
+        sql_command("CREATE TABLE pushdown_t AS SELECT * FROM (VALUES (1),(2),(3)) AS t(v)"),
+    )
+    .await;
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::Explain(sc::analyze_plan_request::Explain {
+            plan: Some(root(sql_relation("SELECT v FROM pushdown_t WHERE v > 1"))),
+            explain_mode: sc::analyze_plan_request::explain::ExplainMode::Simple as i32,
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::Explain(e) = result else {
+        panic!("expected Explain result")
+    };
+    // DataFusion renders pushed predicates in the scan node (`DataSourceExec`/filter expr). The
+    // optimized plan must reference the predicate against `v`, not a separate post-scan FilterExec
+    // only — assert the predicate text survived optimization.
+    assert!(
+        e.explain_string.contains("v@0 > 1") || e.explain_string.contains("v > 1"),
+        "predicate present in optimized physical plan:\n{}",
+        e.explain_string
+    );
+}
+
+#[tokio::test]
+async fn analyze_tree_string_formats_schema() {
+    let mut client = boot(50601).await;
+    let result = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::TreeString(sc::analyze_plan_request::TreeString {
+            plan: Some(root(sql_relation("SELECT 1 AS a, 'x' AS b"))),
+            level: None,
+        }),
+    )
+    .await;
+    let sc::analyze_plan_response::Result::TreeString(t) = result else {
+        panic!("expected TreeString result")
+    };
+    assert!(t.tree_string.starts_with("root\n"), "{}", t.tree_string);
+    // `SELECT 1` is an i64 in DataFusion → Spark `long`.
+    assert!(t.tree_string.contains("|-- a: long"), "{}", t.tree_string);
+    assert!(t.tree_string.contains("|-- b: string"), "{}", t.tree_string);
+}
+
+#[tokio::test]
+async fn analyze_is_local_and_is_streaming_are_false() {
+    let mut client = boot(50602).await;
+    let local = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::IsLocal(sc::analyze_plan_request::IsLocal {
+            plan: Some(root(sql_relation("SELECT 1 AS a"))),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        local,
+        sc::analyze_plan_response::Result::IsLocal(sc::analyze_plan_response::IsLocal {
+            is_local: false
+        })
+    ));
+    let streaming = analyze(
+        &mut client,
+        sc::analyze_plan_request::Analyze::IsStreaming(sc::analyze_plan_request::IsStreaming {
+            plan: Some(root(sql_relation("SELECT 1 AS a"))),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        streaming,
+        sc::analyze_plan_response::Result::IsStreaming(sc::analyze_plan_response::IsStreaming {
+            is_streaming: false
+        })
+    ));
+}

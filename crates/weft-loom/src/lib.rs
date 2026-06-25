@@ -156,6 +156,61 @@ impl Engine {
             .map_err(|e| Error::Execution(e.to_string()))
     }
 
+    /// Build the (unoptimized) logical plan for a SQL query, without executing it.
+    /// Used by Spark Connect `AnalyzePlan(Explain)` for a `spark.sql(...)` command.
+    pub async fn logical_plan(&self, query: &str) -> Result<datafusion::logical_expr::LogicalPlan> {
+        self.ctx
+            .state()
+            .create_logical_plan(query)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))
+    }
+
+    /// Render a Spark-style `EXPLAIN` string for a logical plan, for Spark Connect
+    /// `AnalyzePlan(Explain)` (PySpark `df.explain()`). `extended` mirrors Spark's EXTENDED mode:
+    /// it prepends the parsed + optimized logical plans; otherwise only the physical plan is shown
+    /// (Spark's SIMPLE mode). Running the optimizer here also exercises the same passes (predicate
+    /// / projection pushdown) the execution path applies, so the output reflects what will run.
+    pub async fn explain(
+        &self,
+        plan: &datafusion::logical_expr::LogicalPlan,
+        extended: bool,
+    ) -> Result<String> {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if extended {
+            let _ = write!(
+                out,
+                "== Parsed Logical Plan ==\n{}\n",
+                plan.display_indent()
+            );
+        }
+        let optimized = self
+            .ctx
+            .state()
+            .optimize(plan)
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        if extended {
+            let _ = write!(
+                out,
+                "== Optimized Logical Plan ==\n{}\n",
+                optimized.display_indent()
+            );
+        }
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(&optimized)
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        let _ = write!(
+            out,
+            "== Physical Plan ==\n{}",
+            datafusion::physical_plan::displayable(physical.as_ref()).indent(false)
+        );
+        Ok(out)
+    }
+
     /// Execute a DataFusion logical plan to record batches — the seam the Spark Connect relation
     /// translator uses to run lowered `DataFrame` plans.
     pub async fn execute_logical_plan(
