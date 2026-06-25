@@ -58,6 +58,12 @@ flowchart TD
 **Boundary contract:** everything between operators is Apache Arrow. `weft-hvm` is the only
 place data leaves Arrow, and only for coarse routed fragments — never the columnar hot loop.
 
+**External catalogs:** `weft-catalog` is a pluggable, async `CatalogProvider` SPI; `weft-loom`
+bridges it onto DataFusion's `CatalogProvider`/`SchemaProvider` so an external metastore resolves
+table names **lazily** (the catalog is hit only when a query first references a table). Configure
+one the Spark way — `spark.sql.catalog.<name>.type=hive` — or implement the trait. Hive Metastore
+ships as the reference provider (`weft-catalog-hive`). See [catalogs.md](catalogs.md).
+
 ## How a GROUP BY actually runs
 
 In `weft-loom`: a cache-efficient **radix-partitioned, open-addressing hash table with an

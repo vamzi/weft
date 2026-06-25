@@ -17,6 +17,7 @@ weft-optimizer = { workspace = true }
 weft-physical = { workspace = true }
 weft-execution = { workspace = true }
 weft-catalog = { workspace = true }
+weft-catalog-hive = { workspace = true }
 weft-loom = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
 tonic = "0.12"
@@ -27,3 +28,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"

@@ -92,7 +92,11 @@ struct WeftSchemaProvider {
 }
 
 impl WeftSchemaProvider {
-    fn new(catalog: Arc<dyn WeftCatalog>, namespace: Vec<String>, ctx: Arc<SessionContext>) -> Self {
+    fn new(
+        catalog: Arc<dyn WeftCatalog>,
+        namespace: Vec<String>,
+        ctx: Arc<SessionContext>,
+    ) -> Self {
         Self {
             catalog,
             namespace,
@@ -163,15 +167,16 @@ async fn metadata_to_provider(
     match md.format {
         TableFormat::Parquet => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
-            let opts =
-                ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+            let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
+                .with_file_extension(".parquet");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
                 .await
                 .map_err(weft_to_df)
         }
         TableFormat::Csv => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
-            let opts = ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
+            let opts =
+                ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
                 .await
                 .map_err(weft_to_df)
@@ -288,7 +293,10 @@ mod tests {
                     TableFormat::Parquet,
                 ))
             } else {
-                Err(Error::Plan(format!("no such table: {}.{table}", ns.join("."))))
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
             }
         }
     }

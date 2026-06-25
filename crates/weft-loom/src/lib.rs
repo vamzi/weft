@@ -342,6 +342,36 @@ impl Engine {
     pub fn ctx(&self) -> &SessionContext {
         self.ctx.as_ref()
     }
+
+    /// Schema (database) names in the built-in in-process catalog — backs `listDatabases` for the
+    /// default `spark_catalog` (the catalog holding temp views and ad-hoc registered tables).
+    pub fn builtin_namespaces(&self) -> Vec<String> {
+        let default = self.default_catalog_name();
+        match self.ctx.catalog(&default) {
+            Some(cat) => cat.schema_names(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Table names in `schema` of the built-in catalog — backs `listTables` for `spark_catalog`.
+    pub fn builtin_table_names(&self, schema: &str) -> Vec<String> {
+        let default = self.default_catalog_name();
+        self.ctx
+            .catalog(&default)
+            .and_then(|c| c.schema(schema))
+            .map(|s| s.table_names())
+            .unwrap_or_default()
+    }
+
+    fn default_catalog_name(&self) -> String {
+        self.ctx
+            .state()
+            .config()
+            .options()
+            .catalog
+            .default_catalog
+            .clone()
+    }
 }
 
 /// Build a DataFusion [`ListingTable`] over `urls` — the one place the Parquet/Delta/Iceberg
@@ -365,8 +395,8 @@ pub(crate) async fn build_listing_table(
             .await
             .map_err(|e| Error::Execution(format!("infer schema: {e}")))?,
     };
-    let table =
-        ListingTable::try_new(config).map_err(|e| Error::Execution(format!("listing table: {e}")))?;
+    let table = ListingTable::try_new(config)
+        .map_err(|e| Error::Execution(format!("listing table: {e}")))?;
     Ok(Arc::new(table))
 }
 

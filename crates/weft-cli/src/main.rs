@@ -52,8 +52,41 @@ async fn run_server(args: &[String]) -> weft_common::Result<()> {
     let port = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50051);
+    let catalogs = catalog_conf(args);
+    if !catalogs.is_empty() {
+        eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
+    }
     eprintln!("Weft Spark Connect server listening on sc://0.0.0.0:{port}");
-    serve(ServerConfig { port }).await
+    serve(ServerConfig { port, catalogs }).await
+}
+
+/// Collect startup catalog config from repeated `--catalog-conf key=value` flags and the
+/// `WEFT_CATALOG_CONF` env var (`;`-separated `key=value`). Keys are full Spark config keys, e.g.
+/// `spark.sql.catalog.prod.type=hive`. Example:
+///   weft spark server --catalog-conf spark.sql.catalog.prod.type=hive \
+///                     --catalog-conf spark.sql.catalog.prod.uri=thrift://hms:9083
+fn catalog_conf(args: &[String]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut insert_kv = |kv: &str| {
+        if let Some((k, v)) = kv.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    };
+    if let Ok(env) = std::env::var("WEFT_CATALOG_CONF") {
+        for kv in env.split(';').filter(|s| !s.trim().is_empty()) {
+            insert_kv(kv);
+        }
+    }
+    for (i, a) in args.iter().enumerate() {
+        if a == "--catalog-conf" {
+            if let Some(kv) = args.get(i + 1) {
+                insert_kv(kv);
+            }
+        } else if let Some(kv) = a.strip_prefix("--catalog-conf=") {
+            insert_kv(kv);
+        }
+    }
+    out
 }
 
 async fn run_worker(args: &[String]) -> weft_common::Result<()> {
