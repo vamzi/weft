@@ -30,6 +30,19 @@ export interface Benchmarks {
 
 export const benchmarks = raw as Benchmarks;
 
+/** One distinct, solid color per engine — shared by every chart so bars/legends stay consistent.
+ *  Weft keeps the brand orange; the others get clearly distinguishable hues (not faint grey). */
+export const ENGINE_COLORS: Record<string, string> = {
+  weft: "var(--weft-accent)", // brand orange
+  sail: "#2563eb", // blue
+  spark: "#64748b", // slate
+  gluten: "#16a34a", // green
+};
+
+export function engineColor(key: string): string {
+  return ENGINE_COLORS[key] ?? "var(--weft-text-muted)";
+}
+
 export function isMeasured(e: Engine): boolean {
   return e.total != null;
 }
