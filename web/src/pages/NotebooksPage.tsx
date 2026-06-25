@@ -23,6 +23,7 @@ import {
   api,
   type CellKind,
   type CellResult,
+  type Cluster,
   type Notebook,
   type NotebookCell,
   type NotebookDoc,
@@ -171,12 +172,24 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
   const [running, setRunning] = useState<Record<string, boolean>>({});
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [addKind, setAddKind] = useState<CellKind>("sql");
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [clusterId, setClusterId] = useState("");
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firstLoad = useRef(true);
 
   useEffect(() => {
     api.getNotebook(id).then(setDoc);
   }, [id]);
+
+  // Cluster picker (same model as the SQL editor): all cells in a notebook run on the chosen
+  // cluster; default to a RUNNING one, else the embedded control-plane engine.
+  useEffect(() => {
+    api.listClusters().then((cs) => {
+      setClusters(cs);
+      const running = cs.find((c) => c.state === "running");
+      setClusterId(running?.id ?? "");
+    });
+  }, []);
 
   // Autosave (debounced) whenever the doc changes after the initial load.
   useEffect(() => {
@@ -240,7 +253,7 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
       if (cell.kind === "sql") {
         // LIVE: SQL cells execute on the engine via POST /api/sql.
         const startedAt = performance.now();
-        const r = await api.runSql(cell.source);
+        const r = await api.runSql(cell.source, clusterId || undefined);
         const durationMs = Math.round(performance.now() - startedAt);
         if (r.error) {
           result = { kind: "sql", text: r.error, durationMs };
@@ -284,6 +297,19 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
       subtitle="SQL cells run live on the engine; Python & Markdown cells are demo-only for now."
       actions={
         <div className="flex items-center gap-2">
+          <select
+            aria-label="Cluster"
+            className="weft-input w-auto"
+            value={clusterId}
+            onChange={(e) => setClusterId(e.target.value)}
+          >
+            <option value="">embedded engine</option>
+            {clusters.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name} ({c.state})
+              </option>
+            ))}
+          </select>
           <SaveIndicator state={saveState} />
           <button type="button" className="weft-btn-ghost" onClick={onClose}>
             Back to notebooks
