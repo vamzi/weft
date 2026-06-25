@@ -16,17 +16,18 @@ import { StatusBadge } from "../components/StatusBadge";
 import { PlayIcon, SparklesIcon } from "../components/icons";
 import { useTheme } from "../lib/theme";
 import { setupMonacoSql, WEFT_DARK, WEFT_LIGHT } from "../lib/monaco";
-import { api, type Cluster, type Query, type QueryResult } from "../lib/api";
+import { api, type Cluster, type Query } from "../lib/api";
 
-const STARTER_SQL = `-- Run SQL on a Weft cluster. Try Ctrl+Space for catalog-aware completion.
-SELECT
-  l_returnflag,
-  l_linestatus,
-  SUM(l_quantity)      AS sum_qty,
-  COUNT(*)             AS count_order
-FROM main.sales.lineitem
-GROUP BY l_returnflag, l_linestatus
-ORDER BY l_returnflag, l_linestatus;`;
+/** Live result for the grid: the gateway's columns/rows plus a client-side timing. */
+interface LiveResult {
+  columns: string[];
+  rows: (string | number | null)[][];
+  rowCount: number;
+  durationMs: number;
+}
+
+// A simple default query that runs anywhere — proves the live path end to end.
+const STARTER_SQL = `SELECT 1 AS a, 'hello' AS b;`;
 
 const STATUS_TONE: Record<Query["status"], "success" | "warning" | "danger" | "muted"> = {
   finished: "success",
@@ -40,7 +41,7 @@ export function SqlPage() {
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [clusterId, setClusterId] = useState("");
   const [sql, setSql] = useState(STARTER_SQL);
-  const [result, setResult] = useState<QueryResult | null>(null);
+  const [result, setResult] = useState<LiveResult | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Query[]>([]);
@@ -53,7 +54,6 @@ export function SqlPage() {
       const running = cs.find((c) => c.state === "running");
       setClusterId(running?.id ?? cs[0]?.id ?? "");
     });
-    api.queryHistory().then(setHistory);
   }, []);
 
   // Keep Monaco theme in sync with the app theme toggle.
@@ -69,18 +69,42 @@ export function SqlPage() {
   };
 
   async function run() {
-    if (!clusterId || running) return;
+    if (running) return; // cluster is optional — the engine runs in-process
     setRunning(true);
     setError(null);
+    const startedAt = performance.now();
     try {
-      const r = await api.runQuery(sql, clusterId);
-      setResult(r);
-      setHistory(await api.queryHistory());
+      const r = await api.runSql(sql, clusterId || undefined);
+      const durationMs = Math.round(performance.now() - startedAt);
+      if (r.error) {
+        setError(r.error);
+        setResult(null);
+        recordHistory(sql, clusterId, durationMs, "failed");
+      } else {
+        setResult({ columns: r.columns, rows: r.rows, rowCount: r.row_count, durationMs });
+        recordHistory(sql, clusterId, durationMs, "finished");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Query failed");
+      setResult(null);
     } finally {
       setRunning(false);
     }
+  }
+
+  function recordHistory(text: string, cluster: string, durationMs: number, status: Query["status"]) {
+    setHistory((h) => [
+      {
+        id: `h-${Date.now()}`,
+        text,
+        status,
+        clusterId: cluster,
+        user: "you",
+        durationMs,
+        startedAt: new Date().toISOString(),
+      },
+      ...h,
+    ].slice(0, 25));
   }
 
   function applyGenerated(generated: string) {
@@ -101,6 +125,7 @@ export function SqlPage() {
             value={clusterId}
             onChange={(e) => setClusterId(e.target.value)}
           >
+            <option value="">embedded engine</option>
             {clusters.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name} ({c.state})
@@ -111,7 +136,7 @@ export function SqlPage() {
             type="button"
             className="weft-btn-primary"
             onClick={run}
-            disabled={running || !clusterId}
+            disabled={running}
           >
             <PlayIcon width={15} height={15} />
             {running ? "Running…" : "Run"}
@@ -158,14 +183,22 @@ function ResultGrid({
   error,
   running,
 }: {
-  result: QueryResult | null;
+  result: LiveResult | null;
   error: string | null;
   running: boolean;
 }) {
   if (error) {
     return (
-      <div className="weft-card px-4 py-3 text-sm" style={{ color: "var(--weft-danger)" }}>
-        {error}
+      <div
+        className="weft-card px-4 py-3 text-sm"
+        role="alert"
+        style={{
+          color: "var(--weft-danger)",
+          backgroundColor: "color-mix(in srgb, var(--weft-danger) 8%, transparent)",
+        }}
+      >
+        <span className="font-semibold">Query error: </span>
+        <span className="font-mono">{error}</span>
       </div>
     );
   }
@@ -266,8 +299,7 @@ function AiAssistPanel({ onInsert }: { onInsert: (sql: string) => void }) {
     if (!prompt.trim() || busy) return;
     setBusy(true);
     try {
-      // Live, this hits POST /api/ai/generate and the model returns
-      // schema-constrained JSON ({ sql }) grounded on the governed catalog.
+      // No AI backend yet: this returns a canned, prompt-flavored example query.
       const { sql } = await api.aiGenerateSql(prompt.trim());
       setGenerated(sql);
     } finally {
@@ -280,10 +312,13 @@ function AiAssistPanel({ onInsert }: { onInsert: (sql: string) => void }) {
       <div className="flex items-center gap-2 text-sm font-semibold text-body">
         <SparklesIcon width={16} height={16} />
         AI assist
+        <span className="rounded-full bg-bg-subtle px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted">
+          example
+        </span>
       </div>
       <p className="text-xs text-muted">
-        Describe what you want in plain English. The model returns schema-grounded SQL you can insert
-        and edit.
+        Demo only — no AI backend is wired yet. "Generate SQL" inserts a canned example query you can
+        edit and run.
       </p>
       <textarea
         className="weft-input min-h-[88px] resize-y font-sans"

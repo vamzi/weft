@@ -1,19 +1,52 @@
 /*
  * Typed gateway client.
  *
- * Mirrors the frozen route table in crates/weft-gateway/src/lib.rs (the `ROUTES`
- * const). The browser speaks ONLY to this REST/WebSocket edge — never gRPC.
- *
- * Today every function returns mocked data. The real network call is a one-line
- * swap: set USE_MOCK to false (or wire it to import.meta.env), and each function
- * already routes through `request()` / the mock branch by the same path string,
- * so flipping the flag hits the gateway at those exact paths.
+ * The browser speaks ONLY to this REST edge (served SAME-ORIGIN by the gateway),
+ * never gRPC. Auth, clusters, SQL, and admin (users/groups/grants) are LIVE —
+ * they hit the real `/api/...` endpoints. Catalog, dashboards, and jobs have no
+ * live backend yet, so those keep returning mock fixtures (clearly noted in the
+ * UI). Every live call funnels through the single `request()` chokepoint, which
+ * attaches the bearer token and, on 401, clears it and bounces to the login.
  */
 
+/**
+ * `USE_MOCK` toggles the demo-only sections (catalog / dashboards / jobs). The
+ * live sections ignore it entirely — they always hit the gateway.
+ */
 const USE_MOCK = true;
 
-/** Base path for the gateway. With Vite's dev proxy this stays relative. */
+/** Same-origin: the SPA is served by the gateway, so all paths are relative. */
 const API_BASE = "";
+
+// ---------------------------------------------------------------------------
+// Token storage (localStorage) — the single source of the bearer token.
+// ---------------------------------------------------------------------------
+
+const TOKEN_KEY = "weft_token";
+
+export function getToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setToken(token: string): void {
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    // ignore storage failures (private mode, etc.)
+  }
+}
+
+export function clearToken(): void {
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // ignore
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Domain types
@@ -237,11 +270,64 @@ export interface JobRun {
   taskRuns: TaskRun[];
 }
 
+/** The signed-in user, as `GET /api/me` returns it. */
 export interface Principal {
-  id: string;
-  displayName: string;
-  email: string;
+  user: string;
   groups: string[];
+  authenticated: boolean;
+}
+
+/** `POST /api/auth/login` response. */
+export interface LoginResult {
+  token: string;
+  user: string;
+  groups: string[];
+}
+
+/** Whether the signed-in principal is an administrator (member of `admins`). */
+export function isAdmin(me: Principal | null): boolean {
+  return !!me?.groups?.includes("admins");
+}
+
+// Admin: users / groups / grants (mirror the gateway DTOs) -------------------
+
+export interface AdminUser {
+  username: string;
+  groups: string[];
+}
+
+export interface CreateUserInput {
+  username: string;
+  password: string;
+  groups: string[];
+}
+
+export interface AdminGroup {
+  name: string;
+  members: string[];
+}
+
+export interface CreateGroupInput {
+  name: string;
+  members: string[];
+}
+
+export type SecurableType =
+  | "catalog"
+  | "schema"
+  | "table"
+  | "view"
+  | "metastore"
+  | "connection";
+
+/** A grant exactly as the gateway exchanges it (`GET/POST/DELETE /api/grants`). */
+export interface GrantDto {
+  securable_type: SecurableType;
+  securable_name: string;
+  privilege: string;
+  principal_kind: PrincipalType;
+  principal_id: string;
+  effect: GrantEffect;
 }
 
 // Governance / Unity-Catalog-style grants -----------------------------------
@@ -252,7 +338,9 @@ export type Privilege =
   | "USE CATALOG"
   | "USE SCHEMA"
   | "ALL PRIVILEGES"
-  | "BROWSE";
+  | "BROWSE"
+  | "CREATE TABLE"
+  | "MANAGE";
 
 export type PrincipalType = "user" | "group";
 
@@ -285,21 +373,46 @@ export interface GrantInput {
 // Transport — single chokepoint so going live is a one-line change per path.
 // ---------------------------------------------------------------------------
 
+/**
+ * The single network chokepoint. Attaches `Authorization: Bearer <token>` to
+ * every call, and on 401 clears the token and reloads to the login gate. Set
+ * `auth: false` for the login call itself (no token yet). Empty bodies (204) and
+ * non-JSON responses resolve to `undefined`.
+ */
 async function request<T>(
   method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
+  opts: { auth?: boolean } = {},
 ): Promise<T> {
+  const { auth = true } = opts;
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (auth) {
+    const token = getToken();
+    if (token) headers["authorization"] = `Bearer ${token}`;
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-    credentials: "include",
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
+
+  if (res.status === 401 && auth) {
+    // Token missing/expired — drop it and bounce to the login gate.
+    clearToken();
+    if (typeof window !== "undefined") window.location.reload();
+    throw new Error("unauthorized");
+  }
   if (!res.ok) {
     throw new Error(`${method} ${path} → ${res.status} ${res.statusText}`);
   }
-  return (await res.json()) as T;
+
+  // 204 / empty body → no JSON to parse.
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
@@ -307,45 +420,6 @@ const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------
 // Mock fixtures
 // ---------------------------------------------------------------------------
-
-let mockClusters: Cluster[] = [
-  {
-    id: "c-7f3a",
-    name: "analytics-prod",
-    state: "running",
-    size: "large",
-    minWorkers: 2,
-    maxWorkers: 8,
-    activeWorkers: 5,
-    runtime: "weft-1.4 (Spark 3.5)",
-    creator: "data-platform",
-    createdAt: "2026-05-12T09:14:00Z",
-  },
-  {
-    id: "c-91b2",
-    name: "etl-nightly",
-    state: "stopped",
-    size: "medium",
-    minWorkers: 1,
-    maxWorkers: 4,
-    activeWorkers: 0,
-    runtime: "weft-1.4 (Spark 3.5)",
-    creator: "ingest-team",
-    createdAt: "2026-04-30T22:00:00Z",
-  },
-  {
-    id: "c-2de8",
-    name: "ml-feature-build",
-    state: "pending",
-    size: "xlarge",
-    minWorkers: 4,
-    maxWorkers: 16,
-    activeWorkers: 2,
-    runtime: "weft-1.4-ml (Spark 3.5)",
-    creator: "ml-eng",
-    createdAt: "2026-06-22T11:30:00Z",
-  },
-];
 
 const mockCatalog: CatalogObject[] = [
   { id: "cat-main", name: "main", kind: "catalog", parent: null, owner: "admin" },
@@ -598,10 +672,9 @@ const mockJobRuns: Record<string, JobRun[]> = {
 };
 
 const mockMe: Principal = {
-  id: "u-42",
-  displayName: "Vamsi K",
-  email: "vamsi@weft.dev",
+  user: "vamsi",
   groups: ["data-platform", "admins"],
+  authenticated: true,
 };
 
 const mockSecurables: Securable[] = [
@@ -683,60 +756,112 @@ let mockHistory: Query[] = [
 // ---------------------------------------------------------------------------
 
 export const api = {
-  /** GET /api/me */
-  async me(): Promise<Principal> {
-    if (!USE_MOCK) return request("GET", "/api/me");
-    await delay();
-    return mockMe;
+  // Auth (LIVE) -----------------------------------------------------------
+  /** POST /api/auth/login — store the token on success; throws on 401. */
+  async login(username: string, password: string): Promise<LoginResult> {
+    const res = await request<LoginResult>(
+      "POST",
+      "/api/auth/login",
+      { username, password },
+      { auth: false },
+    );
+    setToken(res.token);
+    return res;
   },
 
-  // Clusters --------------------------------------------------------------
+  /** POST /api/auth/logout — clears the local token regardless of the result. */
+  async logout(): Promise<void> {
+    try {
+      await request<void>("POST", "/api/auth/logout");
+    } catch {
+      // best-effort; we clear locally either way
+    }
+    clearToken();
+  },
+
+  /** GET /api/me (LIVE) — the signed-in principal; throws/401s if not authed. */
+  async me(): Promise<Principal> {
+    return request("GET", "/api/me");
+  },
+
+  // Clusters (LIVE) -------------------------------------------------------
   /** GET /api/clusters */
   async listClusters(): Promise<Cluster[]> {
-    if (!USE_MOCK) return request("GET", "/api/clusters");
-    await delay();
-    return [...mockClusters];
+    const raw = await request<GatewayCluster[]>("GET", "/api/clusters");
+    return raw.map(fromGatewayCluster);
   },
 
   /** POST /api/clusters */
   async createCluster(input: CreateClusterInput): Promise<Cluster> {
-    if (!USE_MOCK) return request("POST", "/api/clusters", input);
-    await delay();
-    const cluster: Cluster = {
-      id: `c-${Math.random().toString(16).slice(2, 6)}`,
+    const raw = await request<GatewayCluster>("POST", "/api/clusters", {
       name: input.name,
-      state: "pending",
-      size: input.size,
-      minWorkers: input.minWorkers,
-      maxWorkers: input.maxWorkers,
-      activeWorkers: 0,
-      runtime: "weft-1.4 (Spark 3.5)",
-      creator: mockMe.displayName,
-      createdAt: new Date().toISOString(),
-    };
-    mockClusters = [cluster, ...mockClusters];
-    return cluster;
+      worker_min: input.minWorkers,
+      worker_max: input.maxWorkers,
+      worker_size: input.size,
+    });
+    return fromGatewayCluster(raw);
   },
 
   /** POST /api/clusters/:id/start */
   async startCluster(id: string): Promise<Cluster> {
-    if (!USE_MOCK) return request("POST", `/api/clusters/${id}/start`);
-    await delay();
-    return mutateCluster(id, (c) => ({ ...c, state: "running", activeWorkers: c.minWorkers }));
+    const raw = await request<GatewayCluster>("POST", `/api/clusters/${id}/start`);
+    return fromGatewayCluster(raw);
   },
 
   /** POST /api/clusters/:id/stop */
   async stopCluster(id: string): Promise<Cluster> {
-    if (!USE_MOCK) return request("POST", `/api/clusters/${id}/stop`);
-    await delay();
-    return mutateCluster(id, (c) => ({ ...c, state: "stopped", activeWorkers: 0 }));
+    const raw = await request<GatewayCluster>("POST", `/api/clusters/${id}/stop`);
+    return fromGatewayCluster(raw);
   },
 
   /** DELETE /api/clusters/:id */
   async deleteCluster(id: string): Promise<void> {
-    if (!USE_MOCK) return request("DELETE", `/api/clusters/${id}`);
-    await delay();
-    mockClusters = mockClusters.filter((c) => c.id !== id);
+    await request<void>("DELETE", `/api/clusters/${id}`);
+  },
+
+  // Admin: users / groups / grants (LIVE) ---------------------------------
+  /** GET /api/admin/users */
+  async listUsers(): Promise<AdminUser[]> {
+    return request("GET", "/api/admin/users");
+  },
+
+  /** POST /api/admin/users */
+  async createUser(input: CreateUserInput): Promise<void> {
+    await request<void>("POST", "/api/admin/users", input);
+  },
+
+  /** GET /api/admin/groups */
+  async listGroups(): Promise<AdminGroup[]> {
+    return request("GET", "/api/admin/groups");
+  },
+
+  /** POST /api/admin/groups */
+  async createGroup(input: CreateGroupInput): Promise<void> {
+    await request<void>("POST", "/api/admin/groups", input);
+  },
+
+  /** GET /api/grants */
+  async listGrants(): Promise<GrantDto[]> {
+    return request("GET", "/api/grants");
+  },
+
+  /** POST /api/grants */
+  async createGrant(grant: GrantDto): Promise<void> {
+    await request<void>("POST", "/api/grants", grant);
+  },
+
+  /** DELETE /api/grants — body is the grant to revoke. */
+  async revokeGrant(grant: GrantDto): Promise<void> {
+    await request<void>("DELETE", "/api/grants", grant);
+  },
+
+  /**
+   * POST /api/sql (LIVE) — run a query on the engine. Returns the raw gateway
+   * shape ({columns, rows, row_count, error}); the caller renders `error` in a
+   * banner when present.
+   */
+  async runSql(sql: string, clusterId?: string): Promise<SqlResponse> {
+    return request("POST", "/api/sql", { sql, cluster_id: clusterId });
   },
 
   // Catalog ---------------------------------------------------------------
@@ -792,7 +917,7 @@ export const api = {
         text: sql,
         status: "finished",
         clusterId,
-        user: mockMe.email.split("@")[0],
+        user: mockMe.user,
         durationMs: mockResult.durationMs,
         startedAt: new Date().toISOString(),
       },
@@ -1074,13 +1199,56 @@ function mockWidgetData(widgetId: string): WidgetData {
   return { columns: ["label", "value"], rows };
 }
 
-function mutateCluster(id: string, fn: (c: Cluster) => Cluster): Cluster {
-  let updated: Cluster | undefined;
-  mockClusters = mockClusters.map((c) => {
-    if (c.id !== id) return c;
-    updated = fn(c);
-    return updated;
-  });
-  if (!updated) throw new Error(`cluster ${id} not found`);
-  return updated;
+// ---------------------------------------------------------------------------
+// Gateway ↔ UI mapping for the live cluster endpoints.
+// ---------------------------------------------------------------------------
+
+/** The cluster shape the gateway returns (`{id,name,state,worker_*}`). */
+interface GatewayCluster {
+  id: string;
+  name: string;
+  state: string;
+  worker_min: number;
+  worker_max: number;
+  worker_size: string;
+}
+
+const KNOWN_SIZES: ClusterSize[] = ["small", "medium", "large", "xlarge"];
+
+/** Map the gateway's lifecycle string onto the UI's `ClusterState`. */
+function toClusterState(state: string): ClusterState {
+  const s = state.toLowerCase();
+  if (s === "running") return "running";
+  if (s === "stopped" || s === "terminated") return "stopped";
+  if (s === "terminating") return "terminating";
+  if (s === "error" || s === "failed") return "error";
+  return "pending"; // pending / provisioning / unknown
+}
+
+/** Widen the gateway cluster into the richer UI `Cluster` (defaults for fields the API doesn't carry). */
+function fromGatewayCluster(c: GatewayCluster): Cluster {
+  const size = (KNOWN_SIZES as string[]).includes(c.worker_size)
+    ? (c.worker_size as ClusterSize)
+    : "small";
+  const state = toClusterState(c.state);
+  return {
+    id: c.id,
+    name: c.name,
+    state,
+    size,
+    minWorkers: c.worker_min,
+    maxWorkers: c.worker_max,
+    activeWorkers: state === "running" ? c.worker_min : 0,
+    runtime: "weft (Spark Connect)",
+    creator: "—",
+    createdAt: new Date().toISOString(),
+  };
+}
+
+/** `POST /api/sql` response — the raw gateway shape. */
+export interface SqlResponse {
+  columns: string[];
+  rows: string[][];
+  row_count: number;
+  error: string | null;
 }

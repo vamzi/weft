@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Page } from "../components/Layout";
+import { DemoNote } from "../components/DemoNote";
 import {
   ChevronRightIcon,
   DatabaseIcon,
@@ -120,6 +121,7 @@ export function CatalogPage() {
         </button>
       }
     >
+      <DemoNote text="Demo data — live catalog wiring pending." />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_1fr]">
         <div className="weft-card p-2">
           {roots.length === 0 ? (

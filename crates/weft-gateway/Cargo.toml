@@ -16,14 +16,19 @@ weft-common = { workspace = true }
 weft-meta = { workspace = true }
 weft-govern = { workspace = true }
 weft-clustermgr = { workspace = true }
+weft-loom = { workspace = true }
+weft-sql = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# TODO(deps): tonic (Spark Connect client to clusters), jsonwebtoken + openidconnect (OIDC/JWT) +
-# a SAML SP lib, sqlx (via weft-meta) for persistence, tower-http (CORS/trace), utoipa (OpenAPI).
-# The router below serves the frozen ROUTES surface with an in-memory store; persistence + auth +
-# the Spark Connect client pool layer on top.
+jsonwebtoken = "9"
+bcrypt = "0.15"
+tower-http = { version = "0.5", features = ["fs"] }
+# TODO(deps): tonic (Spark Connect client to clusters), openidconnect (OIDC) + a SAML SP lib for
+# full SSO, sqlx (via weft-meta) for the user/grant store. The router below serves the frozen
+# ROUTES surface + the web SPA with local username/password auth (bcrypt + JWT) as the break-glass
+# admin path; OIDC/SAML/SCIM layer on top of the same session-JWT seam.
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

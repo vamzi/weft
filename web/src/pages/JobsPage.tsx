@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Page } from "../components/Layout";
+import { DemoNote } from "../components/DemoNote";
 import { StatusBadge } from "../components/StatusBadge";
 import { ChevronRightIcon, PlayIcon } from "../components/icons";
 import {
@@ -41,6 +42,7 @@ export function JobsPage() {
 
   return (
     <Page title="Jobs" subtitle="Scheduled task DAGs with run history.">
+      <DemoNote text="Demo data — live jobs wiring pending." />
       {jobs.length === 0 ? (
         <p className="text-sm text-muted">Loading jobs…</p>
       ) : (

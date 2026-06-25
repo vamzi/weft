@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Page } from "../components/Layout";
+import { DemoNote } from "../components/DemoNote";
 import { ChevronRightIcon, PlusIcon } from "../components/icons";
 import {
   api,
@@ -25,6 +26,7 @@ export function DashboardsPage() {
 
   return (
     <Page title="Dashboards" subtitle="Saved queries rendered as charts on a widget grid.">
+      <DemoNote text="Demo data — live dashboards wiring pending." />
       {dashboards.length === 0 ? (
         <p className="text-sm text-muted">Loading dashboards…</p>
       ) : (

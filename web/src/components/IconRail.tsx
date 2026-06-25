@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 import type { ComponentType, SVGProps } from "react";
 import {
+  AdminIcon,
   CatalogIcon,
   ClustersIcon,
   DashboardIcon,
@@ -9,11 +10,15 @@ import {
   PermissionsIcon,
   SqlIcon,
 } from "./icons";
+import { isAdmin } from "../lib/api";
+import { useAuth } from "../lib/auth";
 
 interface Section {
   to: string;
   label: string;
   Icon: ComponentType<SVGProps<SVGSVGElement>>;
+  /** Only shown to members of the `admins` group. */
+  adminOnly?: boolean;
 }
 
 export const SECTIONS: Section[] = [
@@ -24,12 +29,17 @@ export const SECTIONS: Section[] = [
   { to: "/notebooks", label: "Notebooks", Icon: NotebookIcon },
   { to: "/dashboards", label: "Dashboards", Icon: DashboardIcon },
   { to: "/jobs", label: "Jobs", Icon: JobsIcon },
+  { to: "/admin", label: "Admin", Icon: AdminIcon, adminOnly: true },
 ];
 
 export function IconRail() {
+  const { me } = useAuth();
+  const admin = isAdmin(me);
+  const sections = SECTIONS.filter((s) => !s.adminOnly || admin);
+
   return (
     <nav className="flex w-16 shrink-0 flex-col items-center gap-1 border-r border-hairline bg-bg-subtle py-3">
-      {SECTIONS.map(({ to, label, Icon }) => (
+      {sections.map(({ to, label, Icon }) => (
         <NavLink
           key={to}
           to={to}

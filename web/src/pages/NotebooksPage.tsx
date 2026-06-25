@@ -14,6 +14,7 @@ self.MonacoEnvironment = {
 loader.config({ monaco });
 
 import { Page } from "../components/Layout";
+import { DemoNote } from "../components/DemoNote";
 import { PlayIcon, PlusIcon, SparklesIcon, TrashIcon, ChevronRightIcon } from "../components/icons";
 import { useTheme } from "../lib/theme";
 import { setupMonacoSql, WEFT_DARK, WEFT_LIGHT } from "../lib/monaco";
@@ -58,6 +59,7 @@ export function NotebooksPage() {
       title="Notebooks"
       subtitle="Multi-language notebooks with per-cell output (SQL, Python, Markdown)."
     >
+      <DemoNote text="Notebook list & autosave are demo data — live wiring pending. SQL cells, however, execute live on the engine." />
       {notebooks.length === 0 ? (
         <p className="text-sm text-muted">Loading notebooks…</p>
       ) : (
@@ -165,8 +167,25 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
   async function runCell(cell: NotebookCell) {
     setRunning((r) => ({ ...r, [cell.id]: true }));
     try {
-      // Live: streams output over the /api/notebooks/:id/run WebSocket.
-      const result = await api.runCell(cell);
+      let result: CellResult;
+      if (cell.kind === "sql") {
+        // LIVE: SQL cells execute on the engine via POST /api/sql.
+        const startedAt = performance.now();
+        const r = await api.runSql(cell.source);
+        const durationMs = Math.round(performance.now() - startedAt);
+        if (r.error) {
+          result = { kind: "sql", text: r.error, durationMs };
+        } else {
+          result = {
+            kind: "sql",
+            table: { columns: r.columns, rows: r.rows, rowCount: r.row_count, durationMs },
+            durationMs,
+          };
+        }
+      } else {
+        // Python / Markdown don't execute server-side yet — the mock echoes them.
+        result = await api.runCell(cell);
+      }
       setResults((r) => ({ ...r, [cell.id]: result }));
     } finally {
       setRunning((r) => ({ ...r, [cell.id]: false }));
@@ -193,7 +212,7 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
   return (
     <Page
       title={doc.name}
-      subtitle="Run cells individually; output appears inline below each cell."
+      subtitle="SQL cells run live on the engine; Python & Markdown cells are demo-only for now."
       actions={
         <div className="flex items-center gap-2">
           <SaveIndicator state={saveState} />

@@ -141,3 +141,12 @@ export const PlugIcon = (p: IconProps) => (
     <path d="M9 2v6M15 2v6M7 8h10v3a5 5 0 0 1-10 0V8zM12 16v6" />
   </svg>
 );
+
+export const AdminIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="8" r="3.25" />
+    <path d="M4.5 20a7.5 7.5 0 0 1 15 0" />
+    <path d="M19 3.5l.7 1.6 1.8.2-1.35 1.2.4 1.75L19 7.4l-1.55.85.4-1.75L16.5 5.3l1.8-.2z" />
+  </svg>
+);
+
