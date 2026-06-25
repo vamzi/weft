@@ -10,6 +10,7 @@
 //! current-principal, and cluster-lifecycle endpoints against an in-memory store today, with
 //! persistence/auth/Spark-Connect-routing layering on top of the same surface.
 
+pub mod cloud;
 pub mod server;
 
 /// HTTP methods used by the gateway API.

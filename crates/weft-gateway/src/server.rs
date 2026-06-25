@@ -16,7 +16,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ use weft_govern::{Effect, Grant, Principal, Privilege, Securable, SecurableType}
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
+use crate::cloud;
 use weft_catalog_glue::GlueCatalog;
 
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
@@ -90,6 +91,10 @@ pub struct Cluster {
     /// The cluster's real Spark Connect endpoint once `RUNNING` (e.g. `sc://host:51001`).
     #[serde(default)]
     pub connect_endpoint: Option<String>,
+    /// Backing EC2 instance id (set for EC2-backed clusters) — persisted so the cluster can be
+    /// re-adopted (deleted / auto-terminated) after a control-plane restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 /// One lifecycle event for a cluster (the reconcile trace the UI shows).
@@ -208,8 +213,16 @@ pub struct AppState {
     groups: Arc<Mutex<HashMap<String, Vec<String>>>>,
     grants: Arc<Mutex<Vec<Grant>>>,
     connections: Arc<Mutex<Vec<ConnectionInfo>>>,
-    /// Where attached connections are persisted (JSON) so they survive restarts and seed clusters.
-    conn_file: Arc<PathBuf>,
+    /// Saved notebooks (the Workspace).
+    notebooks: Arc<Mutex<Vec<NotebookDoc>>>,
+    /// Saved SQL queries (the Workspace).
+    queries: Arc<Mutex<Vec<SavedQuery>>>,
+    /// DynamoDB table holding the `clusters` + `connections` collection blobs (durable, survives a
+    /// control-plane restart/replacement). Workspace docs go to S3 instead.
+    ddb_table: Arc<String>,
+    /// S3 URIs for the workspace blobs (notebooks, saved queries).
+    nb_uri: Arc<String>,
+    q_uri: Arc<String>,
     engine: Arc<Engine>,
     jwt_secret: Arc<Vec<u8>>,
     web_dir: Arc<PathBuf>,
@@ -259,9 +272,15 @@ impl AppState {
         groups.insert("admins".to_string(), vec![username.to_string()]);
         let engine = Arc::new(Engine::new());
         seed_sample_data(&engine);
-        let conn_file = PathBuf::from(
-            std::env::var("WEFT_CONNECTIONS_FILE").unwrap_or_else(|_| "connections.json".into()),
-        );
+        let ddb_table =
+            std::env::var("WEFT_DDB_TABLE").unwrap_or_else(|_| "weft-control-plane".into());
+        // Workspace S3 prefix (e.g. s3://bucket/control-plane); notebooks/queries are blobs under it.
+        let ws_prefix = std::env::var("WEFT_WORKSPACE_S3")
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        let nb_uri = format!("{ws_prefix}/notebooks.json");
+        let q_uri = format!("{ws_prefix}/queries.json");
         let st = Self {
             clusters: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -272,7 +291,11 @@ impl AppState {
             groups: Arc::new(Mutex::new(groups)),
             grants: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Mutex::new(Vec::new())),
-            conn_file: Arc::new(conn_file),
+            notebooks: Arc::new(Mutex::new(Vec::new())),
+            queries: Arc::new(Mutex::new(Vec::new())),
+            ddb_table: Arc::new(ddb_table),
+            nb_uri: Arc::new(nb_uri),
+            q_uri: Arc::new(q_uri),
             engine,
             jwt_secret: Arc::new(jwt_secret),
             web_dir: Arc::new(web_dir),
@@ -285,45 +308,107 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
         };
-        st.load_connections();
         st
     }
 
-    /// Re-register connections persisted to [`Self::conn_file`] (best-effort): populate the list and
-    /// bridge each provider back into the engine so attached catalogs survive a restart.
-    fn load_connections(&self) {
-        let data = match std::fs::read_to_string(self.conn_file.as_ref()) {
-            Ok(d) => d,
-            Err(_) => return, // no file yet — nothing to restore
-        };
-        let saved: Vec<ConnectionInfo> = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("warn: ignoring corrupt {}: {e}", self.conn_file.display());
-                return;
-            }
-        };
-        for c in saved {
-            match build_connection_provider(&c.kind, &c.name, &c.options) {
-                Ok(p) => {
-                    self.engine.register_catalog(&c.name, p);
-                    self.connections.lock().unwrap().push(c);
+    /// Allocate a unique id with the given prefix (e.g. `nb-7`, `q-3`).
+    fn new_oid(&self, prefix: &str) -> String {
+        let mut n = self.next_id.lock().unwrap();
+        *n += 1;
+        format!("{prefix}-{n}")
+    }
+
+    // Durable persistence (best-effort, off the request path). Workspace → S3; clusters +
+    // connections → DynamoDB. Each collection is a single JSON blob; loads happen at startup.
+
+    fn save_notebooks(&self) {
+        let body = serde_json::to_string(&*self.notebooks.lock().unwrap()).unwrap_or_default();
+        tokio::spawn(cloud::s3_put((*self.nb_uri).clone(), body));
+    }
+
+    fn save_queries(&self) {
+        let body = serde_json::to_string(&*self.queries.lock().unwrap()).unwrap_or_default();
+        tokio::spawn(cloud::s3_put((*self.q_uri).clone(), body));
+    }
+
+    fn save_connections(&self) {
+        let body = serde_json::to_string(&*self.connections.lock().unwrap()).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "connections".into(),
+            body,
+        ));
+    }
+
+    fn save_clusters(&self) {
+        let snapshot: Vec<Cluster> = self.clusters.lock().unwrap().values().cloned().collect();
+        let body = serde_json::to_string(&snapshot).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "clusters".into(),
+            body,
+        ));
+    }
+
+    /// Load all durable state at startup (called from `serve`, async): connections (re-register
+    /// their catalogs), workspace docs, and clusters (re-adopt EC2 instances; mark dead local ones).
+    async fn load_from_cloud(&self) {
+        // Connections (DynamoDB) → re-register each provider into the engine.
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "connections").await {
+            if let Ok(saved) = serde_json::from_str::<Vec<ConnectionInfo>>(&body) {
+                for c in saved {
+                    match build_connection_provider(&c.kind, &c.name, &c.options) {
+                        Ok(p) => {
+                            self.engine.register_catalog(&c.name, p);
+                            self.connections.lock().unwrap().push(c);
+                        }
+                        Err(e) => eprintln!("warn: skipping connection `{}`: {e}", c.name),
+                    }
                 }
-                Err(e) => eprintln!("warn: skipping connection `{}`: {e}", c.name),
+            }
+        }
+        // Workspace (S3).
+        if let Some(body) = cloud::s3_get(&self.nb_uri).await {
+            if let Ok(v) = serde_json::from_str::<Vec<NotebookDoc>>(&body) {
+                *self.notebooks.lock().unwrap() = v;
+            }
+        }
+        if let Some(body) = cloud::s3_get(&self.q_uri).await {
+            if let Ok(v) = serde_json::from_str::<Vec<SavedQuery>>(&body) {
+                *self.queries.lock().unwrap() = v;
+            }
+        }
+        // Clusters (DynamoDB) → re-adopt so the idle reaper + delete can manage them again.
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "clusters").await {
+            if let Ok(saved) = serde_json::from_str::<Vec<Cluster>>(&body) {
+                self.adopt_clusters(saved).await;
             }
         }
     }
 
-    /// Persist the current connection set to [`Self::conn_file`] (best-effort).
-    fn save_connections(&self) {
-        let conns = self.connections.lock().unwrap();
-        match serde_json::to_string_pretty(&*conns) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(self.conn_file.as_ref(), json) {
-                    eprintln!("warn: could not persist connections: {e}");
+    /// Re-adopt persisted clusters after a restart. EC2-backed clusters get their runtime handle
+    /// rebuilt from the stored `instance_id` (so delete/auto-terminate work again) and a fresh idle
+    /// window; local-process clusters can't survive a restart, so they're marked `STOPPED`.
+    async fn adopt_clusters(&self, saved: Vec<Cluster>) {
+        for mut c in saved {
+            match c.instance_id.clone() {
+                Some(instance_id) => {
+                    self.runtimes
+                        .lock()
+                        .await
+                        .insert(c.id.clone(), ClusterRuntime::Ec2 { instance_id });
+                    self.touch(&c.id); // fresh idle window so the reaper doesn't kill it instantly
+                }
+                None => {
+                    // A local-process cluster can't survive a control-plane restart.
+                    if c.state == Phase::Running.as_str() || c.state == Phase::Provisioning.as_str()
+                    {
+                        c.state = Phase::Terminated.as_str().to_string();
+                        c.connect_endpoint = None;
+                    }
                 }
             }
-            Err(e) => eprintln!("warn: could not serialize connections: {e}"),
+            self.clusters.lock().unwrap().insert(c.id.clone(), c);
         }
     }
 
@@ -349,12 +434,29 @@ impl AppState {
     }
 
     fn set_state(&self, id: &str, state: Phase, endpoint: Option<String>) {
-        if let Some(c) = self.clusters.lock().unwrap().get_mut(id) {
-            c.state = state.as_str().to_string();
-            if endpoint.is_some() {
-                c.connect_endpoint = endpoint;
+        let changed = {
+            let mut clusters = self.clusters.lock().unwrap();
+            if let Some(c) = clusters.get_mut(id) {
+                c.state = state.as_str().to_string();
+                if endpoint.is_some() {
+                    c.connect_endpoint = endpoint;
+                }
+                true
+            } else {
+                false
             }
+        };
+        if changed {
+            self.save_clusters();
         }
+    }
+
+    /// Record the EC2 instance backing a cluster (so it can be re-adopted after a restart).
+    fn set_cluster_instance(&self, id: &str, instance_id: &str) {
+        if let Some(c) = self.clusters.lock().unwrap().get_mut(id) {
+            c.instance_id = Some(instance_id.to_string());
+        }
+        self.save_clusters();
     }
 
     fn alloc_port(&self) -> u16 {
@@ -403,6 +505,26 @@ fn now_secs() -> usize {
         .as_secs() as usize
 }
 
+/// Current time as an ISO-8601 UTC string (e.g. `2026-06-25T14:40:00Z`) — what the web renders for
+/// `updatedAt`. Computed from unix seconds (civil-from-days) so we avoid a date-library dependency.
+fn now_iso() -> String {
+    let secs = now_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
 // ─────────────────────────────────────────── Router ─────────────────────────────────────────────
 
 /// Build the gateway router: public auth + health, Bearer-gated `/api/*`, and the SPA fallback.
@@ -420,7 +542,18 @@ pub fn app(state: AppState) -> Router {
             "/api/connections",
             get(list_connections).post(create_connection),
         )
-        .route("/api/connections/:name", axum::routing::delete(delete_connection))
+        .route("/api/connections/:name", delete(delete_connection))
+        // Workspace: notebooks + saved SQL queries
+        .route("/api/notebooks", get(list_notebooks).post(create_notebook))
+        .route(
+            "/api/notebooks/:id",
+            get(get_notebook).put(save_notebook).delete(delete_notebook),
+        )
+        .route("/api/queries", get(list_queries).post(create_query))
+        .route(
+            "/api/queries/:id",
+            get(get_query).put(save_query).delete(delete_query),
+        )
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
@@ -533,11 +666,13 @@ async fn create_cluster(
         worker_max: body.worker_max,
         worker_size: body.worker_size,
         connect_endpoint: None,
+        instance_id: None,
     };
     st.clusters
         .lock()
         .unwrap()
         .insert(id.clone(), cluster.clone());
+    st.save_clusters();
     st.add_event(
         &id,
         format!(
@@ -679,6 +814,9 @@ async fn provision_ec2(st: AppState, id: String) {
             instance_id: instance_id.clone(),
         },
     );
+    // Persist the instance id so the cluster can be re-adopted (deleted/auto-terminated) if the
+    // control plane restarts before the instance is torn down.
+    st.set_cluster_instance(&id, &instance_id);
     st.add_event(
         &id,
         format!("EC2 instance {instance_id} launching; waiting for it to boot"),
@@ -885,6 +1023,7 @@ async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> S
     }
     kill_runtime(&st, &id).await;
     st.events.lock().unwrap().remove(&id);
+    st.save_clusters();
     StatusCode::NO_CONTENT
 }
 
@@ -994,13 +1133,23 @@ async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Jso
         st.touch(cid);
     }
     let sql = weft_sql::dialect::to_datafusion_sql(&req.sql);
-    match st.engine.sql(&sql).await {
+    // Cap execution at the UI display limit so an unbounded `SELECT *` over a huge external table
+    // (e.g. 100M-row ClickBench `hits`) reads only enough row groups instead of materializing the
+    // whole result into memory (which previously OOMed → "load failed"). LIMIT pushes into the scan.
+    const MAX_ROWS: usize = 1000;
+    let result = async {
+        let df = st.engine.ctx().sql(&sql).await?;
+        let df = df.limit(0, Some(MAX_ROWS))?;
+        df.collect().await
+    }
+    .await;
+    match result {
         Ok(batches) => Json(batches_to_response(&batches)),
         Err(e) => Json(SqlResponse {
             columns: vec![],
             rows: vec![],
             row_count: 0,
-            error: Some(format!("{e:?}")),
+            error: Some(format!("{e}")),
         }),
     }
 }
@@ -1357,6 +1506,225 @@ async fn delete_connection(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ───────────────────────────── Workspace: notebooks + saved SQL queries ─────────────────────────
+
+/// One cell in a notebook. `kind` is `sql` | `python` | `markdown`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NotebookCell {
+    pub id: String,
+    pub kind: String,
+    pub source: String,
+}
+
+/// A saved notebook (ordered cells). Persisted to `WEFT_NOTEBOOKS_FILE`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NotebookDoc {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub cells: Vec<NotebookCell>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+/// List-view summary of a notebook (matches the web `Notebook` shape).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotebookSummary {
+    pub id: String,
+    pub name: String,
+    pub language: String,
+    pub owner: String,
+    pub updated_at: String,
+    pub cells: usize,
+}
+
+/// A saved SQL query (the Workspace). Persisted to `WEFT_QUERIES_FILE`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub sql: String,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+/// `POST /api/notebooks` body.
+#[derive(Deserialize)]
+pub struct CreateNotebook {
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `POST /api/queries` body.
+#[derive(Deserialize)]
+pub struct CreateQuery {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub sql: String,
+}
+
+async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>> {
+    let nbs = st.notebooks.lock().unwrap();
+    Json(
+        nbs.iter()
+            .map(|n| NotebookSummary {
+                id: n.id.clone(),
+                name: n.name.clone(),
+                language: n
+                    .cells
+                    .first()
+                    .map(|c| c.kind.clone())
+                    .unwrap_or_else(|| "sql".into()),
+                owner: "admin".into(),
+                updated_at: n.updated_at.clone(),
+                cells: n.cells.len(),
+            })
+            .collect(),
+    )
+}
+
+async fn create_notebook(
+    State(st): State<AppState>,
+    Json(b): Json<CreateNotebook>,
+) -> Json<NotebookDoc> {
+    let name = if b.name.trim().is_empty() {
+        "Untitled notebook".to_string()
+    } else {
+        b.name
+    };
+    let doc = NotebookDoc {
+        id: st.new_oid("nb"),
+        name,
+        cells: vec![NotebookCell {
+            id: st.new_oid("cell"),
+            kind: "sql".into(),
+            source: "SELECT * FROM main.sales.lineitem LIMIT 10".into(),
+        }],
+        updated_at: now_iso(),
+    };
+    st.notebooks.lock().unwrap().push(doc.clone());
+    st.save_notebooks();
+    Json(doc)
+}
+
+async fn get_notebook(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NotebookDoc>, (StatusCode, String)> {
+    st.notebooks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|n| n.id == id)
+        .cloned()
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no notebook `{id}`")))
+}
+
+async fn save_notebook(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(mut doc): Json<NotebookDoc>,
+) -> Json<serde_json::Value> {
+    doc.id = id.clone();
+    doc.updated_at = now_iso();
+    {
+        let mut nbs = st.notebooks.lock().unwrap();
+        match nbs.iter_mut().find(|n| n.id == id) {
+            Some(slot) => *slot = doc.clone(),
+            None => nbs.push(doc.clone()), // upsert (e.g. first save of a client-created doc)
+        }
+    }
+    st.save_notebooks();
+    Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at }))
+}
+
+async fn delete_notebook(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    let removed = {
+        let mut nbs = st.notebooks.lock().unwrap();
+        let before = nbs.len();
+        nbs.retain(|n| n.id != id);
+        before != nbs.len()
+    };
+    if removed {
+        st.save_notebooks();
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn list_queries(State(st): State<AppState>) -> Json<Vec<SavedQuery>> {
+    Json(st.queries.lock().unwrap().clone())
+}
+
+async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) -> Json<SavedQuery> {
+    let name = if b.name.trim().is_empty() {
+        "Untitled query".to_string()
+    } else {
+        b.name
+    };
+    let q = SavedQuery {
+        id: st.new_oid("q"),
+        name,
+        sql: b.sql,
+        updated_at: now_iso(),
+    };
+    st.queries.lock().unwrap().push(q.clone());
+    st.save_queries();
+    Json(q)
+}
+
+async fn get_query(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SavedQuery>, (StatusCode, String)> {
+    st.queries
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|q| q.id == id)
+        .cloned()
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no query `{id}`")))
+}
+
+async fn save_query(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(mut q): Json<SavedQuery>,
+) -> Json<serde_json::Value> {
+    q.id = id.clone();
+    q.updated_at = now_iso();
+    {
+        let mut qs = st.queries.lock().unwrap();
+        match qs.iter_mut().find(|x| x.id == id) {
+            Some(slot) => *slot = q.clone(),
+            None => qs.push(q.clone()),
+        }
+    }
+    st.save_queries();
+    Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at }))
+}
+
+async fn delete_query(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    let removed = {
+        let mut qs = st.queries.lock().unwrap();
+        let before = qs.len();
+        qs.retain(|q| q.id != id);
+        before != qs.len()
+    };
+    if removed {
+        st.save_queries();
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 // ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
 
 /// Register a small set of sample tables under `main.sales` so the SQL editor + catalog browser
@@ -1697,6 +2065,8 @@ pub async fn serve(addr: &str) -> std::io::Result<()> {
         weft_bin,
         public_host,
     );
+    // Restore durable state (clusters/connections from DynamoDB, workspace from S3) before serving.
+    state.load_from_cloud().await;
     // Background reaper: auto-terminate idle running clusters.
     tokio::spawn(idle_reaper(state.clone()));
     let listener = tokio::net::TcpListener::bind(addr).await?;

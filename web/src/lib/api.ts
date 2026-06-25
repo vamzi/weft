@@ -208,6 +208,14 @@ export interface Notebook {
   cells: number;
 }
 
+/** A saved SQL query (GET/POST/PUT/DELETE /api/queries). */
+export interface SavedQuery {
+  id: string;
+  name: string;
+  sql: string;
+  updatedAt: string;
+}
+
 // Notebook editing model -----------------------------------------------------
 
 export type CellKind = "sql" | "python" | "markdown";
@@ -566,11 +574,6 @@ const mockTableDetails: Record<string, TableDetail> = {
   },
 };
 
-const mockNotebooks: Notebook[] = [
-  { id: "nb-01", name: "Revenue exploration", language: "python", owner: "analyst", updatedAt: "2026-06-23T17:20:00Z", cells: 14 },
-  { id: "nb-02", name: "TPC-H Q1 deep dive", language: "sql", owner: "data-platform", updatedAt: "2026-06-20T10:02:00Z", cells: 6 },
-];
-
 const mockDashboards: Dashboard[] = [
   { id: "db-01", name: "Sales overview", owner: "sales-lead", updatedAt: "2026-06-22T12:00:00Z", tiles: 8 },
   { id: "db-02", name: "Cluster utilization", owner: "data-platform", updatedAt: "2026-06-24T07:00:00Z", tiles: 5 },
@@ -581,27 +584,6 @@ const mockJobs: Job[] = [
   { id: "j-02", name: "feature-refresh", status: "running", schedule: "@hourly", lastRun: "2026-06-24T08:00:00Z", owner: "ml-eng" },
   { id: "j-03", name: "weekly-report", status: "scheduled", schedule: "0 6 * * 1", lastRun: "2026-06-17T06:00:00Z", owner: "analyst" },
 ];
-
-/** Opened notebook documents keyed by id (ordered cells). */
-const mockNotebookDocs: Record<string, NotebookDoc> = {
-  "nb-01": {
-    id: "nb-01",
-    name: "Revenue exploration",
-    cells: [
-      { id: "cell-1", kind: "markdown", source: "# Revenue exploration\n\nMonthly revenue across the sales lake, then a quick Python sanity check." },
-      { id: "cell-2", kind: "sql", source: "SELECT\n  date_trunc('month', o_orderdate) AS month,\n  SUM(l_extendedprice * (1 - l_discount)) AS revenue\nFROM main.sales.orders o\nJOIN main.sales.lineitem l ON l.l_orderkey = o.o_orderkey\nGROUP BY 1\nORDER BY 1;" },
-      { id: "cell-3", kind: "python", source: "import pandas as pd\n\ndf = spark.sql('SELECT * FROM main.sales.monthly_revenue').toPandas()\nprint(df.describe())" },
-    ],
-  },
-  "nb-02": {
-    id: "nb-02",
-    name: "TPC-H Q1 deep dive",
-    cells: [
-      { id: "cell-1", kind: "markdown", source: "## TPC-H Q1\n\nPricing summary report over `lineitem`." },
-      { id: "cell-2", kind: "sql", source: "SELECT\n  l_returnflag,\n  l_linestatus,\n  SUM(l_quantity) AS sum_qty,\n  COUNT(*) AS count_order\nFROM main.sales.lineitem\nGROUP BY l_returnflag, l_linestatus\nORDER BY l_returnflag, l_linestatus;" },
-    ],
-  },
-};
 
 /** Opened dashboard documents keyed by id (their widgets). */
 const mockDashboardDocs: Record<string, DashboardDoc> = {
@@ -729,12 +711,6 @@ const mockJobRuns: Record<string, JobRun[]> = {
   ],
 };
 
-const mockMe: Principal = {
-  user: "vamsi",
-  groups: ["data-platform", "admins"],
-  authenticated: true,
-};
-
 const mockSecurables: Securable[] = [
   { fqn: "main", kind: "catalog", label: "main (catalog)" },
   { fqn: "main.sales", kind: "schema", label: "main.sales (schema)" },
@@ -764,19 +740,6 @@ const mockGrants: Record<string, Grant[]> = {
   "main.sales.monthly_revenue": [
     { id: "g-9", principal: "analysts", principalType: "group", privilege: "SELECT", effect: "allow" },
   ],
-};
-
-/** Deterministic-ish mock result set for the SQL editor grid. */
-const mockResult: QueryResult = {
-  columns: ["l_returnflag", "l_linestatus", "sum_qty", "sum_base_price", "avg_disc", "count_order"],
-  rows: [
-    ["A", "F", 37734107, "56586554400.73", "0.0500", 1478493],
-    ["N", "F", 991417, "1487504710.38", "0.0497", 38854],
-    ["N", "O", 74476040, "111701729697.74", "0.0500", 2920374],
-    ["R", "F", 37719753, "56568041380.90", "0.0500", 1478870],
-  ],
-  rowCount: 4,
-  durationMs: 1843,
 };
 
 let mockHistory: Query[] = [
@@ -1001,26 +964,14 @@ export const api = {
   },
 
   /**
-   * POST /api/sql — run a query on a cluster.
-   * Live: streams Arrow IPC over the /api/sql WebSocket into the grid. The mock
-   * returns a fixed result set and records the run into history.
+   * POST /api/sql (LIVE) — run a query on the engine. Maps the gateway shape
+   * ({columns, rows, row_count, error}) onto the UI `QueryResult`; throws when
+   * the engine reports an error.
    */
   async runQuery(sql: string, clusterId: string): Promise<QueryResult> {
-    if (!USE_MOCK) return request("POST", "/api/sql", { sql, clusterId });
-    await delay(600);
-    mockHistory = [
-      {
-        id: `h-${Math.random().toString(16).slice(2, 6)}`,
-        text: sql,
-        status: "finished",
-        clusterId,
-        user: mockMe.user,
-        durationMs: mockResult.durationMs,
-        startedAt: new Date().toISOString(),
-      },
-      ...mockHistory,
-    ];
-    return mockResult;
+    const r = await request<SqlResponse>("POST", "/api/sql", { sql, cluster_id: clusterId });
+    if (r.error) throw new Error(r.error);
+    return { columns: r.columns, rows: r.rows, rowCount: r.row_count, durationMs: 0 };
   },
 
   /**
@@ -1034,56 +985,80 @@ export const api = {
     return { sql: mockSqlForPrompt(prompt) };
   },
 
-  // Notebooks -------------------------------------------------------------
+  // Notebooks (LIVE) ------------------------------------------------------
   /** GET /api/notebooks */
   async listNotebooks(): Promise<Notebook[]> {
-    if (!USE_MOCK) return request("GET", "/api/notebooks");
-    await delay();
-    return [...mockNotebooks];
+    return request("GET", "/api/notebooks");
+  },
+
+  /** POST /api/notebooks — create a notebook (one starter sql cell). */
+  async createNotebook(name: string): Promise<NotebookDoc> {
+    return request("POST", "/api/notebooks", { name });
   },
 
   /** GET /api/notebooks/:id — open a notebook with its ordered cells. */
   async getNotebook(id: string): Promise<NotebookDoc> {
-    if (!USE_MOCK) return request("GET", `/api/notebooks/${id}`);
-    await delay();
-    const doc = mockNotebookDocs[id];
-    if (!doc) throw new Error(`no notebook ${id}`);
-    // Return a deep-ish copy so the editor mutates its own state, not the mock.
-    return { ...doc, cells: doc.cells.map((c) => ({ ...c })) };
+    return request("GET", `/api/notebooks/${id}`);
   },
 
-  /**
-   * PUT /api/notebooks/:id — autosave the whole notebook (cells + name).
-   * The mock just records it; live this persists the document.
-   */
+  /** PUT /api/notebooks/:id — persist the whole notebook (cells + name). */
   async saveNotebook(doc: NotebookDoc): Promise<{ ok: true; savedAt: string }> {
-    if (!USE_MOCK) return request("PUT", `/api/notebooks/${doc.id}`, doc);
-    await delay(150);
-    mockNotebookDocs[doc.id] = { ...doc, cells: doc.cells.map((c) => ({ ...c })) };
-    return { ok: true, savedAt: new Date().toISOString() };
+    return request("PUT", `/api/notebooks/${doc.id}`, doc);
+  },
+
+  /** DELETE /api/notebooks/:id */
+  async deleteNotebook(id: string): Promise<void> {
+    await request<void>("DELETE", `/api/notebooks/${id}`);
   },
 
   /**
-   * POST /api/notebooks/:id/run — run one cell.
-   * Live: streams output over the /api/notebooks/:id/run WebSocket (per-cell,
-   * incremental). The mock synthesizes a kind-appropriate result.
+   * Run one cell. SQL executes live on the engine via POST /api/sql; Python
+   * and Markdown are handled client-side (no server execution yet).
    */
   async runCell(cell: NotebookCell): Promise<CellResult> {
-    if (!USE_MOCK)
-      return request("POST", `/api/notebooks/${cell.id}/run`, { cell });
-    await delay(500);
     if (cell.kind === "sql") {
-      return { kind: "sql", table: mockResult, durationMs: mockResult.durationMs };
+      const r = await request<SqlResponse>("POST", "/api/sql", { sql: cell.source });
+      if (r.error) throw new Error(r.error);
+      return {
+        kind: "sql",
+        table: { columns: r.columns, rows: r.rows, rowCount: r.row_count, durationMs: 0 },
+        durationMs: 0,
+      };
     }
     if (cell.kind === "markdown") {
       return { kind: "markdown", text: cell.source, durationMs: 0 };
     }
-    // python — echo a plausible stdout for the snippet.
     return {
       kind: "python",
-      text: mockPythonOutput(cell.source),
-      durationMs: 318,
+      text: "Python execution isn't available on this engine yet — use SQL cells.",
+      durationMs: 0,
     };
+  },
+
+  // Saved SQL queries (LIVE) ----------------------------------------------
+  /** GET /api/queries */
+  async listSavedQueries(): Promise<SavedQuery[]> {
+    return request("GET", "/api/queries");
+  },
+
+  /** GET /api/queries/:id */
+  async getSavedQuery(id: string): Promise<SavedQuery> {
+    return request("GET", `/api/queries/${id}`);
+  },
+
+  /** POST /api/queries — create a saved query. */
+  async createSavedQuery(name: string, sql: string): Promise<SavedQuery> {
+    return request("POST", "/api/queries", { name, sql });
+  },
+
+  /** PUT /api/queries/:id — update a saved query. */
+  async updateSavedQuery(q: SavedQuery): Promise<{ ok: true; savedAt: string }> {
+    return request("PUT", `/api/queries/${q.id}`, q);
+  },
+
+  /** DELETE /api/queries/:id */
+  async deleteSavedQuery(id: string): Promise<void> {
+    await request<void>("DELETE", `/api/queries/${id}`);
   },
 
   /**
@@ -1241,24 +1216,6 @@ function mockSqlForPrompt(prompt: string): string {
     return `-- ${prompt}\nSELECT o_custkey, SUM(o_totalprice) AS spend\nFROM main.sales.orders\nGROUP BY o_custkey\nORDER BY spend DESC\nLIMIT 10;`;
   }
   return `-- ${prompt}\nSELECT *\nFROM main.sales.orders\nLIMIT 100;`;
-}
-
-/** Plausible Python stdout for a notebook python cell (mock only). */
-function mockPythonOutput(source: string): string {
-  if (/print\s*\(/.test(source) && /describe/.test(source)) {
-    return [
-      "              revenue       orders",
-      "count   1.200000e+01    12.000000",
-      "mean    9.418e+09       2.4e+06",
-      "std     1.204e+09       3.1e+05",
-      "min     7.512e+09       1.9e+06",
-      "max     1.117e+11       2.9e+06",
-    ].join("\n");
-  }
-  if (/print\s*\(/.test(source)) {
-    return "ok";
-  }
-  return "[1] executed in 0.31s — 0 rows materialized";
 }
 
 /** Prompt-flavored notebook skeleton for the mock AI generator. */
