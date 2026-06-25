@@ -101,10 +101,63 @@ pub struct ClusterEvent {
     pub message: String,
 }
 
-/// The OS process actually backing a `RUNNING` cluster on this node (the single-box analog of the
-/// driver+worker pods the EKS operator would create).
-struct ClusterRuntime {
-    child: tokio::process::Child,
+/// The real compute backing a `RUNNING` cluster: either a dedicated **EC2 instance** (production
+/// path) or a local OS process (fallback for local/dev when no EC2 config is set).
+enum ClusterRuntime {
+    /// A `weft spark server` process on the control-plane node.
+    Process(tokio::process::Child),
+    /// A dedicated EC2 instance running `weft spark server`.
+    Ec2 { instance_id: String },
+}
+
+/// Config for launching a real EC2 instance per cluster. Present (from env) → create-cluster spins
+/// up an actual instance; absent → fall back to a local process.
+#[derive(Clone)]
+struct Ec2ClusterConfig {
+    /// AMI for cluster instances.
+    ami: String,
+    /// Security group (must allow the Spark Connect port).
+    sg: String,
+    /// Optional subnet.
+    subnet: Option<String>,
+    /// Optional SSH key name.
+    key: Option<String>,
+    /// Public URL to download the `weft` binary onto the cluster instance.
+    weft_url: String,
+    /// AWS region.
+    region: String,
+    /// Path to the AWS CLI.
+    aws_bin: String,
+}
+
+impl Ec2ClusterConfig {
+    /// Build from env; returns `None` (→ local-process clusters) unless the required vars are set:
+    /// `WEFT_CLUSTER_AMI`, `WEFT_CLUSTER_SG`, `WEFT_CLUSTER_WEFT_URL`.
+    fn from_env() -> Option<Self> {
+        let ami = std::env::var("WEFT_CLUSTER_AMI").ok()?;
+        let sg = std::env::var("WEFT_CLUSTER_SG").ok()?;
+        let weft_url = std::env::var("WEFT_CLUSTER_WEFT_URL").ok()?;
+        Some(Self {
+            ami,
+            sg,
+            subnet: std::env::var("WEFT_CLUSTER_SUBNET").ok(),
+            key: std::env::var("WEFT_CLUSTER_KEY").ok(),
+            weft_url,
+            region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string()),
+            aws_bin: std::env::var("WEFT_AWS_BIN").unwrap_or_else(|_| "aws".to_string()),
+        })
+    }
+}
+
+/// Map a cluster's `worker_size` to an EC2 instance type.
+fn instance_type_for(size: &str) -> &'static str {
+    match size {
+        "small" => "t3.medium",
+        "medium" => "t3.large",
+        "large" => "c6a.xlarge",
+        "xlarge" => "c6a.2xlarge",
+        _ => "t3.medium",
+    }
 }
 
 /// Body for `POST /api/clusters`.
@@ -151,6 +204,11 @@ pub struct AppState {
     web_dir: Arc<PathBuf>,
     weft_bin: Arc<String>,
     public_host: Arc<String>,
+    ec2: Arc<Option<Ec2ClusterConfig>>,
+    /// Last "use" time per cluster (unix secs) — drives idle auto-termination.
+    last_activity: Arc<Mutex<HashMap<String, u64>>>,
+    /// Seconds of inactivity before a running cluster is auto-terminated (0 = never).
+    idle_secs: u64,
 }
 
 impl AppState {
@@ -205,7 +263,21 @@ impl AppState {
             web_dir: Arc::new(web_dir),
             weft_bin: Arc::new(weft_bin),
             public_host: Arc::new(public_host),
+            ec2: Arc::new(Ec2ClusterConfig::from_env()),
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+            idle_secs: std::env::var("WEFT_CLUSTER_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800),
         }
+    }
+
+    /// Mark a cluster as just-used (resets its idle timer).
+    fn touch(&self, id: &str) {
+        self.last_activity
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), now_secs() as u64);
     }
 
     fn add_event(&self, id: &str, message: impl Into<String>) {
@@ -419,6 +491,7 @@ async fn create_cluster(
     );
     // Provision a real compute backend (Databricks-style: create implies start). Async so the API
     // returns immediately while the cluster comes up — poll the list / events to watch it advance.
+    st.touch(&id);
     tokio::spawn(provision(st.clone(), id));
     (StatusCode::CREATED, Json(cluster))
 }
@@ -427,16 +500,151 @@ async fn create_cluster(
 /// operator would create driver + worker pods here; on this single node it spawns a `weft spark
 /// server` on an allocated port — a genuine, connectable endpoint.
 async fn provision(st: AppState, id: String) {
+    st.set_state(&id, Phase::Provisioning, None);
+    if st.ec2.as_ref().is_some() {
+        provision_ec2(st, id).await;
+    } else {
+        provision_process(st, id).await;
+    }
+}
+
+/// Launch a real EC2 instance running `weft spark server` for this cluster.
+async fn provision_ec2(st: AppState, id: String) {
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, Duration};
+    let cfg = st.ec2.as_ref().clone().expect("ec2 config");
+
+    let size = st
+        .clusters
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|c| c.worker_size.clone())
+        .unwrap_or_else(|| "small".into());
+    let itype = instance_type_for(&size);
+    st.add_event(
+        &id,
+        format!("Launching EC2 instance ({itype}) for cluster compute"),
+    );
+
+    // user-data: download the weft binary and run the Spark Connect server on boot.
+    let user_data = format!(
+        "#!/bin/bash\nset -e\ncurl -fsSL '{}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\n/usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n",
+        cfg.weft_url
+    );
+    let user_data_b64 = base64_encode(user_data.as_bytes());
+
+    let mut args: Vec<String> = vec![
+        "ec2".into(), "run-instances".into(),
+        "--image-id".into(), cfg.ami.clone(),
+        "--instance-type".into(), itype.to_string(),
+        "--security-group-ids".into(), cfg.sg.clone(),
+        "--user-data".into(), user_data_b64,
+        "--tag-specifications".into(),
+        format!("ResourceType=instance,Tags=[{{Key=Name,Value=weft-cluster-{id}}},{{Key=project,Value=weft-cluster}}]"),
+        "--region".into(), cfg.region.clone(),
+        "--query".into(), "Instances[0].InstanceId".into(),
+        "--output".into(), "text".into(),
+    ];
+    if let Some(subnet) = &cfg.subnet {
+        args.push("--subnet-id".into());
+        args.push(subnet.clone());
+    }
+    if let Some(key) = &cfg.key {
+        args.push("--key-name".into());
+        args.push(key.clone());
+    }
+
+    let instance_id = match run_aws(&cfg.aws_bin, &args).await {
+        Ok(out) => out.trim().to_string(),
+        Err(e) => {
+            st.set_state(&id, Phase::Error, None);
+            st.add_event(&id, format!("Failed to launch EC2 instance: {e}"));
+            return;
+        }
+    };
+    st.runtimes.lock().await.insert(
+        id.clone(),
+        ClusterRuntime::Ec2 {
+            instance_id: instance_id.clone(),
+        },
+    );
+    st.add_event(
+        &id,
+        format!("EC2 instance {instance_id} launching; waiting for it to boot"),
+    );
+
+    // Wait for a public IP (instance running) — up to ~120s.
+    let mut ip = None;
+    for _ in 0..60 {
+        if let Ok(out) = run_aws(
+            &cfg.aws_bin,
+            &[
+                "ec2".into(),
+                "describe-instances".into(),
+                "--instance-ids".into(),
+                instance_id.clone(),
+                "--region".into(),
+                cfg.region.clone(),
+                "--query".into(),
+                "Reservations[0].Instances[0].PublicIpAddress".into(),
+                "--output".into(),
+                "text".into(),
+            ],
+        )
+        .await
+        {
+            let v = out.trim();
+            if !v.is_empty() && v != "None" {
+                ip = Some(v.to_string());
+                break;
+            }
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    let Some(ip) = ip else {
+        st.set_state(&id, Phase::Error, None);
+        st.add_event(&id, "EC2 instance did not report a public IP in time");
+        return;
+    };
+    st.add_event(&id, format!("Instance running at {ip}; waiting for Spark Connect to accept (booting + installing weft)"));
+
+    // Wait for the Spark Connect port to accept — the instance boots, downloads weft, and starts
+    // the server (up to ~3 min).
+    let mut up = false;
+    for _ in 0..90 {
+        if TcpStream::connect((ip.as_str(), 50051)).await.is_ok() {
+            up = true;
+            break;
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+    if up {
+        let endpoint = format!("sc://{ip}:50051");
+        st.set_state(&id, Phase::Running, Some(endpoint.clone()));
+        st.add_event(
+            &id,
+            format!("Cluster RUNNING on EC2 {instance_id} — Spark Connect endpoint {endpoint}"),
+        );
+    } else {
+        st.set_state(&id, Phase::Error, None);
+        st.add_event(
+            &id,
+            "Spark Connect did not come up on the EC2 instance in time",
+        );
+    }
+}
+
+/// Fallback: run `weft spark server` as a local process (no EC2 config).
+async fn provision_process(st: AppState, id: String) {
     use tokio::net::TcpStream;
     use tokio::time::{sleep, Duration};
 
-    st.set_state(&id, Phase::Provisioning, None);
     let port = st.alloc_port();
     st.add_event(
         &id,
-        format!("Provisioning compute (allocating Spark Connect port {port})"),
+        format!("Provisioning compute (local process, Spark Connect port {port})"),
     );
-
     if st.weft_bin.is_empty() {
         st.set_state(&id, Phase::Error, None);
         st.add_event(
@@ -445,7 +653,6 @@ async fn provision(st: AppState, id: String) {
         );
         return;
     }
-
     let child = tokio::process::Command::new(st.weft_bin.as_str())
         .args(["spark", "server", "--port", &port.to_string()])
         .stdout(std::process::Stdio::null())
@@ -462,13 +669,11 @@ async fn provision(st: AppState, id: String) {
     st.runtimes
         .lock()
         .await
-        .insert(id.clone(), ClusterRuntime { child });
+        .insert(id.clone(), ClusterRuntime::Process(child));
     st.add_event(
         &id,
         "Compute process launched; waiting for the Spark Connect endpoint to accept",
     );
-
-    // Wait for the endpoint to listen (up to ~20s).
     let mut up = false;
     for _ in 0..40 {
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -488,6 +693,46 @@ async fn provision(st: AppState, id: String) {
         st.set_state(&id, Phase::Error, None);
         st.add_event(&id, "Compute did not become ready in time");
     }
+}
+
+/// Run an `aws` CLI command, returning stdout on success.
+async fn run_aws(aws_bin: &str, args: &[String]) -> Result<String, String> {
+    let out = tokio::process::Command::new(aws_bin)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("exec aws: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Minimal base64 (standard alphabet) for the EC2 user-data payload.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 async fn get_cluster(
@@ -536,6 +781,7 @@ async fn start_cluster(
     if !exists {
         return Err(StatusCode::NOT_FOUND);
     }
+    st.touch(&id);
     let already_up = st.runtimes.lock().await.contains_key(&id);
     if !already_up {
         st.add_event(&id, "Start requested");
@@ -572,8 +818,30 @@ async fn stop_cluster(
 
 /// Kill the OS process backing a cluster, if any.
 async fn kill_runtime(st: &AppState, id: &str) {
-    if let Some(mut rt) = st.runtimes.lock().await.remove(id) {
-        let _ = rt.child.kill().await;
+    let rt = st.runtimes.lock().await.remove(id);
+    match rt {
+        Some(ClusterRuntime::Process(mut child)) => {
+            let _ = child.kill().await;
+        }
+        Some(ClusterRuntime::Ec2 { instance_id }) => {
+            if let Some(cfg) = st.ec2.as_ref().as_ref() {
+                let _ = run_aws(
+                    &cfg.aws_bin,
+                    &[
+                        "ec2".into(),
+                        "terminate-instances".into(),
+                        "--instance-ids".into(),
+                        instance_id,
+                        "--region".into(),
+                        cfg.region.clone(),
+                        "--output".into(),
+                        "text".into(),
+                    ],
+                )
+                .await;
+            }
+        }
+        None => {}
     }
 }
 
@@ -606,6 +874,10 @@ pub struct SqlResponse {
 /// [`weft_sql::dialect`] first. In production this routes to the target cluster's Spark Connect
 /// endpoint; here it runs in-process on the same engine — real execution, real results.
 async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Json<SqlResponse> {
+    // Running SQL against a cluster counts as activity (resets its idle timer).
+    if let Some(cid) = &req.cluster_id {
+        st.touch(cid);
+    }
     let sql = weft_sql::dialect::to_datafusion_sql(&req.sql);
     match st.engine.sql(&sql).await {
         Ok(batches) => Json(batches_to_response(&batches)),
@@ -1166,8 +1438,46 @@ pub async fn serve(addr: &str) -> std::io::Result<()> {
         weft_bin,
         public_host,
     );
+    // Background reaper: auto-terminate idle running clusters.
+    tokio::spawn(idle_reaper(state.clone()));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await
+}
+
+/// Periodically terminate `RUNNING` clusters that have had no activity for `idle_secs` — so
+/// forgotten compute (and its EC2 cost) doesn't linger.
+async fn idle_reaper(st: AppState) {
+    use tokio::time::{sleep, Duration};
+    if st.idle_secs == 0 {
+        return;
+    }
+    loop {
+        sleep(Duration::from_secs(60)).await;
+        let now = now_secs() as u64;
+        // Find running clusters idle beyond the timeout.
+        let stale: Vec<String> = {
+            let clusters = st.clusters.lock().unwrap();
+            let activity = st.last_activity.lock().unwrap();
+            clusters
+                .iter()
+                .filter(|(_, c)| c.state == Phase::Running.as_str())
+                .filter(|(id, _)| {
+                    let last = activity.get(id.as_str()).copied().unwrap_or(0);
+                    now.saturating_sub(last) >= st.idle_secs
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in stale {
+            let mins = st.idle_secs / 60;
+            st.add_event(
+                &id,
+                format!("Auto-terminating: idle for {mins}+ minutes (no activity)"),
+            );
+            kill_runtime(&st, &id).await;
+            st.set_state(&id, Phase::Terminated, None);
+        }
+    }
 }
 
 #[cfg(test)]
