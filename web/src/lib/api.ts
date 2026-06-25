@@ -67,6 +67,15 @@ export interface Cluster {
   runtime: string;
   creator: string;
   createdAt: string;
+  /** `sc://host:port` the user points PySpark at — only set once RUNNING. */
+  connect_endpoint: string | null;
+}
+
+/** One lifecycle event from `GET /api/clusters/:id/events`. */
+export interface ClusterEvent {
+  /** Unix seconds. */
+  at: number;
+  message: string;
 }
 
 export interface CreateClusterInput {
@@ -819,6 +828,11 @@ export const api = {
     await request<void>("DELETE", `/api/clusters/${id}`);
   },
 
+  /** GET /api/clusters/:id/events — lifecycle events (oldest first). */
+  async clusterEvents(id: string): Promise<ClusterEvent[]> {
+    return request("GET", `/api/clusters/${id}/events`);
+  },
+
   // Admin: users / groups / grants (LIVE) ---------------------------------
   /** GET /api/admin/users */
   async listUsers(): Promise<AdminUser[]> {
@@ -1211,6 +1225,7 @@ interface GatewayCluster {
   worker_min: number;
   worker_max: number;
   worker_size: string;
+  connect_endpoint?: string | null;
 }
 
 const KNOWN_SIZES: ClusterSize[] = ["small", "medium", "large", "xlarge"];
@@ -1242,6 +1257,7 @@ function fromGatewayCluster(c: GatewayCluster): Cluster {
     runtime: "weft (Spark Connect)",
     creator: "—",
     createdAt: new Date().toISOString(),
+    connect_endpoint: c.connect_endpoint ?? null,
   };
 }
 
