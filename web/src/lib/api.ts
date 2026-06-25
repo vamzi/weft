@@ -152,6 +152,29 @@ export interface AttachCatalogInput {
   comment?: string;
 }
 
+// Live connections (external catalogs) --------------------------------------
+
+/** The kind of external metastore a connection points at. */
+export type ConnectionKind = "glue" | "hive";
+
+/** One attached external catalog (GET /api/connections). */
+export interface Connection {
+  name: string;
+  kind: ConnectionKind;
+  region?: string;
+}
+
+/**
+ * Kind-specific options for `POST /api/connections`:
+ *  - glue → `{ region }` (default `us-west-2`); credentials come from the
+ *    server's instance role, never the UI.
+ *  - hive → `{ uri: "thrift://host:port" }`.
+ */
+export interface ConnectionOptions {
+  region?: string;
+  uri?: string;
+}
+
 export interface QueryResult {
   columns: string[];
   rows: (string | number | null)[][];
@@ -935,6 +958,26 @@ export const api = {
     if (!USE_MOCK) return request("POST", "/api/catalog/connections", input);
     await delay(400);
     return { ok: true, name: input.name };
+  },
+
+  // Connections (LIVE) ----------------------------------------------------
+  /** GET /api/connections — the external catalogs currently attached. */
+  async getConnections(): Promise<Connection[]> {
+    return request("GET", "/api/connections");
+  },
+
+  /**
+   * POST /api/connections — attach an external catalog under `name`.
+   * `kind` is `"glue"` (options `{ region }`) or `"hive"`
+   * (options `{ uri: "thrift://host:port" }`). Live introspection means the
+   * new catalog's databases/tables show up in `GET /api/catalog` afterwards.
+   */
+  async createConnection(
+    name: string,
+    kind: ConnectionKind,
+    options: ConnectionOptions,
+  ): Promise<void> {
+    await request<void>("POST", "/api/connections", { name, kind, options });
   },
 
   // SQL / queries ---------------------------------------------------------

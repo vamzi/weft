@@ -1217,17 +1217,32 @@ async fn create_connection(
 /// have real, queryable data out of the box (e.g. `SELECT * FROM main.sales.monthly_revenue`). In
 /// production these come from the user's registered catalogs (local + external HMS/Glue/UC).
 fn seed_sample_data(engine: &Engine) {
-    use weft_loom::arrow::array::{Float64Array, Int64Array, StringArray};
+    use weft_loom::arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
     use weft_loom::arrow::datatypes::{DataType, Field, Schema};
     use weft_loom::arrow::record_batch::RecordBatch;
 
-    let revenue_schema = Arc::new(Schema::new(vec![
-        Field::new("month", DataType::Utf8, false),
-        Field::new("region", DataType::Utf8, false),
-        Field::new("revenue", DataType::Float64, false),
-    ]));
+    // 2026-01-01 as days since the Unix epoch (Date32). Orders/lineitems spread over ~4 months.
+    const BASE: i32 = 20454;
+    const N_CUST: i64 = 10;
+    const N_ORD: i64 = 30;
+    let segments = [
+        "BUILDING",
+        "AUTOMOBILE",
+        "MACHINERY",
+        "HOUSEHOLD",
+        "FURNITURE",
+    ];
+    let statuses = ["O", "F", "P"];
+    let prio = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
+    let flags = ["A", "N", "R"];
+
+    // monthly_revenue — a simple roll-up table for quick demos.
     let revenue = RecordBatch::try_new(
-        revenue_schema,
+        Arc::new(Schema::new(vec![
+            Field::new("month", DataType::Utf8, false),
+            Field::new("region", DataType::Utf8, false),
+            Field::new("revenue", DataType::Float64, false),
+        ])),
         vec![
             Arc::new(StringArray::from(vec![
                 "2026-01", "2026-01", "2026-02", "2026-02", "2026-03", "2026-03",
@@ -1239,55 +1254,140 @@ fn seed_sample_data(engine: &Engine) {
         ],
     );
 
-    let orders_schema = Arc::new(Schema::new(vec![
-        Field::new("order_id", DataType::Int64, false),
-        Field::new("customer", DataType::Utf8, false),
-        Field::new("amount", DataType::Float64, false),
-        Field::new("status", DataType::Utf8, false),
-    ]));
-    let orders = RecordBatch::try_new(
-        orders_schema,
+    // customer — TPC-H-shaped.
+    let customer = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_name", DataType::Utf8, false),
+            Field::new("c_mktsegment", DataType::Utf8, false),
+            Field::new("c_acctbal", DataType::Float64, false),
+            Field::new("c_nationkey", DataType::Int64, false),
+        ])),
         vec![
-            Arc::new(Int64Array::from(vec![1001, 1002, 1003, 1004, 1005])),
-            Arc::new(StringArray::from(vec![
-                "acme", "globex", "acme", "initech", "globex",
-            ])),
-            Arc::new(Float64Array::from(vec![
-                2500.0, 1800.0, 3200.0, 950.0, 4100.0,
-            ])),
-            Arc::new(StringArray::from(vec![
-                "shipped",
-                "pending",
-                "shipped",
-                "cancelled",
-                "shipped",
-            ])),
+            Arc::new(Int64Array::from((1..=N_CUST).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                (1..=N_CUST)
+                    .map(|i| format!("Customer#{i:03}"))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (1..=N_CUST)
+                    .map(|i| segments[(i as usize - 1) % segments.len()].to_string())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (1..=N_CUST)
+                    .map(|i| 1000.0 + i as f64 * 137.5)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (1..=N_CUST).map(|i| i % 5).collect::<Vec<_>>(),
+            )),
         ],
     );
 
-    let customers_schema = Arc::new(Schema::new(vec![
-        Field::new("customer_id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("segment", DataType::Utf8, false),
-    ]));
-    let customers = RecordBatch::try_new(
-        customers_schema,
+    // orders — TPC-H-shaped, with a real Date32 o_orderdate.
+    let orders = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, false),
+            Field::new("o_orderstatus", DataType::Utf8, false),
+            Field::new("o_totalprice", DataType::Float64, false),
+            Field::new("o_orderdate", DataType::Date32, false),
+            Field::new("o_orderpriority", DataType::Utf8, false),
+        ])),
         vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Acme Corp", "Globex", "Initech"])),
-            Arc::new(StringArray::from(vec!["enterprise", "smb", "enterprise"])),
+            Arc::new(Int64Array::from((1..=N_ORD).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (1..=N_ORD).map(|i| (i % N_CUST) + 1).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (1..=N_ORD)
+                    .map(|i| statuses[i as usize % 3].to_string())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (1..=N_ORD)
+                    .map(|i| 5000.0 + i as f64 * 321.0)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Date32Array::from(
+                (1..=N_ORD)
+                    .map(|i| BASE + (i as i32 * 13) % 120)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (1..=N_ORD)
+                    .map(|i| prio[i as usize % 5].to_string())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    );
+
+    // lineitem — TPC-H-shaped, 2–4 lines per order.
+    let (mut lo, mut ll, mut lp, mut lq, mut lep, mut ld, mut lt, mut lf, mut ls) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    for ok in 1..=N_ORD {
+        for ln in 1..=(2 + ok % 3) {
+            lo.push(ok);
+            ll.push(ln);
+            lp.push((ok * 7 + ln) % 200 + 1);
+            let qty = 5.0 + ((ok + ln) % 40) as f64;
+            lq.push(qty);
+            lep.push(qty * (100.0 + (ok * 3 % 900) as f64));
+            ld.push(((ok + ln) % 10) as f64 / 100.0);
+            lt.push((ok % 8) as f64 / 100.0);
+            lf.push(flags[((ok + ln) as usize) % 3].to_string());
+            ls.push(BASE + (ok as i32 * 13) % 120 + ln as i32 * 2);
+        }
+    }
+    let lineitem = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_linenumber", DataType::Int64, false),
+            Field::new("l_partkey", DataType::Int64, false),
+            Field::new("l_quantity", DataType::Float64, false),
+            Field::new("l_extendedprice", DataType::Float64, false),
+            Field::new("l_discount", DataType::Float64, false),
+            Field::new("l_tax", DataType::Float64, false),
+            Field::new("l_returnflag", DataType::Utf8, false),
+            Field::new("l_shipdate", DataType::Date32, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(lo)),
+            Arc::new(Int64Array::from(ll)),
+            Arc::new(Int64Array::from(lp)),
+            Arc::new(Float64Array::from(lq)),
+            Arc::new(Float64Array::from(lep)),
+            Arc::new(Float64Array::from(ld)),
+            Arc::new(Float64Array::from(lt)),
+            Arc::new(StringArray::from(lf)),
+            Arc::new(Date32Array::from(ls)),
         ],
     );
 
     for (table, batch) in [
         ("monthly_revenue", revenue),
+        ("customer", customer),
         ("orders", orders),
-        ("customers", customers),
+        ("lineitem", lineitem),
     ] {
-        if let Ok(b) = batch {
-            if let Err(e) = register_namespaced(engine, "main", "sales", table, b) {
-                eprintln!("seed {table}: {e}");
+        match batch {
+            Ok(b) => {
+                if let Err(e) = register_namespaced(engine, "main", "sales", table, b) {
+                    eprintln!("seed {table}: {e}");
+                }
             }
+            Err(e) => eprintln!("build {table}: {e}"),
         }
     }
 }
