@@ -4132,6 +4132,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-catalog-glue"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "weft-catalog",
+]
+
+[[package]]
 name = "weft-catalog-hive"
 version = "0.0.0"
 dependencies = [
@@ -4176,6 +4186,7 @@ dependencies = [
  "uuid",
  "weft-analyzer",
  "weft-catalog",
+ "weft-catalog-glue",
  "weft-catalog-hive",
  "weft-common",
  "weft-execution",
@@ -4228,6 +4239,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "weft-catalog",
+ "weft-catalog-glue",
  "weft-catalog-hive",
  "weft-clustermgr",
  "weft-common",
