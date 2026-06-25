@@ -1,12 +1,5 @@
 import { useState } from "react";
-import type { Engine } from "../lib/benchmarks";
-
-const COLORS: Record<string, string> = {
-  weft: "var(--weft-accent)",
-  sail: "#3b82f6",
-  spark: "#9ca3af",
-  gluten: "#16a34a",
-};
+import { engineColor, type Engine } from "../lib/benchmarks";
 
 /**
  * Per-query hot-time bars across all 43 queries, grouped by engine. SVG, no chart lib — themeable
@@ -58,7 +51,7 @@ export default function PerQueryChart({ engines, queryCount }: { engines: Engine
               <span key={e.key} className="flex items-center gap-1.5">
                 <span
                   className="inline-block h-2.5 w-2.5 rounded-sm"
-                  style={{ background: COLORS[e.key] ?? "var(--weft-text-muted)" }}
+                  style={{ background: engineColor(e.key) }}
                 />
                 {e.name}
               </span>
@@ -100,7 +93,7 @@ export default function PerQueryChart({ engines, queryCount }: { engines: Engine
                   y={padT + plotH - h}
                   width={barW}
                   height={Math.max(0.5, h)}
-                  fill={COLORS[e.key] ?? "var(--weft-text-muted)"}
+                  fill={engineColor(e.key)}
                 >
                   <title>{`${e.name} · Q${qi}: ${v.toFixed(3)}s`}</title>
                 </rect>

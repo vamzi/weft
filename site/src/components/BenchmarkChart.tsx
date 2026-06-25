@@ -1,4 +1,4 @@
-import type { Engine } from "../lib/benchmarks";
+import { engineColor, type Engine } from "../lib/benchmarks";
 
 /**
  * Total-runtime horizontal bar chart (lower = faster). Measured engines draw a solid bar scaled
@@ -40,11 +40,13 @@ export default function BenchmarkChart({
                   className={
                     pending
                       ? "h-full rounded-weft-sm border border-dashed border-hairline bg-[repeating-linear-gradient(45deg,transparent,transparent_6px,var(--weft-border)_6px,var(--weft-border)_7px)]"
-                      : e.highlight
-                        ? "h-full rounded-weft-sm bg-accent"
-                        : "h-full rounded-weft-sm bg-muted/60"
+                      : "h-full rounded-weft-sm"
                   }
-                  style={{ width: `${pct}%` }}
+                  style={
+                    pending
+                      ? { width: `${pct}%` }
+                      : { width: `${pct}%`, backgroundColor: engineColor(e.key) }
+                  }
                 />
               </div>
               <div className="text-right text-sm tabular-nums">
