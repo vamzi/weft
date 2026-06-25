@@ -40,7 +40,10 @@ fn make_data(rows: usize, groups: i64) -> Vec<RecordBatch> {
         out.push(
             RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int64Array::from(ks)), Arc::new(Int64Array::from(vs))],
+                vec![
+                    Arc::new(Int64Array::from(ks)),
+                    Arc::new(Int64Array::from(vs)),
+                ],
             )
             .unwrap(),
         );
@@ -52,20 +55,36 @@ fn make_data(rows: usize, groups: i64) -> Vec<RecordBatch> {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4_000_000);
-    let groups: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let rows: usize = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4_000_000);
+    let groups: i64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
     let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let batches = make_data(rows, groups);
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     println!(
         "rows={total_rows} groups={groups} iters={iters} cores={}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0),
     );
 
     let aggs = vec![
-        AggSpec { kind: AggKind::Sum, input: Some(1), name: "s".into() },
-        AggSpec { kind: AggKind::Count, input: None, name: "c".into() },
+        AggSpec {
+            kind: AggKind::Sum,
+            input: Some(1),
+            name: "s".into(),
+        },
+        AggSpec {
+            kind: AggKind::Count,
+            input: None,
+            name: "c".into(),
+        },
     ];
     let sch = schema();
 
@@ -95,8 +114,14 @@ async fn main() {
     }
 
     let mrows = total_rows as f64 / 1e6;
-    println!("native : {native_best:.4}s  ({:.1} Mrows/s)  groups={native_groups}", mrows / native_best);
-    println!("datafusion: {df_best:.4}s  ({:.1} Mrows/s)  groups={df_groups}", mrows / df_best);
+    println!(
+        "native : {native_best:.4}s  ({:.1} Mrows/s)  groups={native_groups}",
+        mrows / native_best
+    );
+    println!(
+        "datafusion: {df_best:.4}s  ({:.1} Mrows/s)  groups={df_groups}",
+        mrows / df_best
+    );
     println!("speedup (df/native): {:.2}x", df_best / native_best);
     assert_eq!(native_groups, df_groups, "group counts must match");
 }

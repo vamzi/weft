@@ -12,10 +12,16 @@
 //!   shuffle path uses, so strings/dates/multi-column keys all work);
 //! - aggregates: `COUNT(*)` / `COUNT(col)`, and `SUM`/`MIN`/`MAX` over `Int64` and `Float64`.
 //!
-//! Not yet here (tracked follow-ups): per-partition spill under the bounded memory pool, more
-//! aggregate kinds/types, and the `PhysicalOptimizerRule` that swaps DataFusion's `AggregateExec`
-//! for this kernel on matching plans. Until that rewrite lands this is a tested building block,
-//! not yet on the query path.
+//! **Measured reality (see `examples/bench_hashagg.rs`): this kernel does NOT beat DataFusion 54
+//! for in-process aggregation.** On 16 cores it reaches ~50% of DataFusion's throughput at low
+//! cardinality and is worse at very high cardinality (the partial-table merge dominates).
+//! DataFusion's vectorized hash aggregation (ahash, tuned `GroupsAccumulator`, repartition
+//! parallelism) is already near the hardware limit; beating it decisively is a Velox/DuckDB-class
+//! effort, not a quick carve-out. So this is deliberately **not** wired onto the ClickBench query
+//! path — routing through it would regress. It is kept as a correct, tested building block for
+//! places where Weft already owns the data and the boundary (e.g. the distributed shuffle reduce,
+//! where inputs are pre-aggregated partials and small). The durable benchmark margin lives in
+//! distributed scale-out and the Bend niche — not in reimplementing DataFusion's columnar core.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -152,6 +158,23 @@ pub fn group_aggregate(
     }
     let out_schema: SchemaRef = Arc::new(Schema::new(out_fields));
 
+    // Fast path: a single non-null `Int64` group key with integer/count aggregates. This is the
+    // common high-cardinality shape (group by an integer id). It skips the `RowConverter` and the
+    // `HashMap<OwnedRow>` of the general path — both ruinously slow vs DataFusion — for a tight
+    // open-addressing table keyed directly on the `i64`, parallelized across key-hash shards.
+    if group_cols.len() == 1
+        && matches!(schema.field(group_cols[0]).data_type(), DataType::Int64)
+        && !schema.field(group_cols[0]).is_nullable()
+        && ops.iter().all(|o| {
+            matches!(
+                o,
+                Op::Count { .. } | Op::SumI(_) | Op::MinI(_) | Op::MaxI(_)
+            )
+        })
+    {
+        return agg_i64_key(&out_schema, batches, group_cols[0], &ops);
+    }
+
     // Phase 1 — radix-partition rows by key hash into `p` disjoint buckets.
     let p = partition_count();
     let parts = partition_rows(batches, group_cols, &key_fields, p)?;
@@ -171,6 +194,278 @@ pub fn group_aggregate(
     }
     concat_batches(&out_schema, &outs)
         .map_err(|e| Error::Execution(format!("concat aggregated partitions: {e}")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fast path: single non-null Int64 group key, integer/count aggregates.
+// ---------------------------------------------------------------------------------------------
+
+/// Finalizer mix (fmix64) — spreads an `i64` key across all bits so low-bit slot indexing is
+/// well-distributed without a hashing crate.
+#[inline]
+fn mix(k: i64) -> u64 {
+    let mut h = k as u64;
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h
+}
+
+/// Open-addressing (linear-probe) table mapping an `i64` key to a dense group id, with the
+/// per-group accumulators stored flat (`gid * stride + a`).
+struct I64Table {
+    slot_gid: Vec<u32>, // u32::MAX = empty
+    slot_key: Vec<i64>,
+    mask: usize,
+    keys: Vec<i64>, // gid -> key
+    accs: Vec<Acc>, // gid * stride + agg
+    stride: usize,
+    init: Vec<Acc>,
+}
+
+impl I64Table {
+    fn new(init: Vec<Acc>) -> Self {
+        let cap = 1024;
+        I64Table {
+            slot_gid: vec![u32::MAX; cap],
+            slot_key: vec![0; cap],
+            mask: cap - 1,
+            keys: Vec::new(),
+            accs: Vec::new(),
+            stride: init.len(),
+            init,
+        }
+    }
+
+    #[inline]
+    fn get_or_insert(&mut self, key: i64) -> usize {
+        if (self.keys.len() + 1) * 2 > self.slot_gid.len() {
+            self.grow();
+        }
+        let mut slot = (mix(key) as usize) & self.mask;
+        loop {
+            let g = self.slot_gid[slot];
+            if g == u32::MAX {
+                let gid = self.keys.len();
+                self.slot_gid[slot] = gid as u32;
+                self.slot_key[slot] = key;
+                self.keys.push(key);
+                self.accs.extend_from_slice(&self.init);
+                return gid;
+            }
+            if self.slot_key[slot] == key {
+                return g as usize;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let newcap = self.slot_gid.len() * 2;
+        let mask = newcap - 1;
+        let mut sg = vec![u32::MAX; newcap];
+        let mut sk = vec![0i64; newcap];
+        for (gid, &key) in self.keys.iter().enumerate() {
+            let mut slot = (mix(key) as usize) & mask;
+            while sg[slot] != u32::MAX {
+                slot = (slot + 1) & mask;
+            }
+            sg[slot] = gid as u32;
+            sk[slot] = key;
+        }
+        self.slot_gid = sg;
+        self.slot_key = sk;
+        self.mask = mask;
+    }
+
+    /// Fold another table's partial groups into this one (re-combinable aggregates only).
+    fn merge(&mut self, other: &I64Table, ops: &[Op]) {
+        for (ogid, &key) in other.keys.iter().enumerate() {
+            let g = self.get_or_insert(key);
+            let (sb, ob) = (g * self.stride, ogid * self.stride);
+            for (a, op) in ops.iter().enumerate() {
+                combine(&mut self.accs[sb + a], other.accs[ob + a], op);
+            }
+        }
+    }
+}
+
+#[inline]
+fn is_null(nulls: Option<&crate::arrow::buffer::NullBuffer>, i: usize) -> bool {
+    nulls.is_some_and(|n| n.is_null(i))
+}
+
+/// Combine a source partial accumulator into a destination (used by [`I64Table::merge`]).
+fn combine(dst: &mut Acc, src: Acc, op: &Op) {
+    match (op, dst, src) {
+        (Op::Count { .. }, Acc::Count(d), Acc::Count(s)) => *d += s,
+        (Op::SumI(_), Acc::I64(d), Acc::I64(s)) => {
+            *d = match (*d, s) {
+                (None, x) | (x, None) => x,
+                (Some(a), Some(b)) => Some(a.wrapping_add(b)),
+            }
+        }
+        (Op::MinI(_), Acc::I64(d), Acc::I64(s)) => {
+            *d = match (*d, s) {
+                (None, x) | (x, None) => x,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            }
+        }
+        (Op::MaxI(_), Acc::I64(d), Acc::I64(s)) => {
+            *d = match (*d, s) {
+                (None, x) | (x, None) => x,
+                (Some(a), Some(b)) => Some(a.max(b)),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Aggregate one contiguous slice of batches into a partial [`I64Table`].
+fn agg_i64_chunk(
+    batches: &[RecordBatch],
+    key_col: usize,
+    ops: &[Op],
+    init: &[Acc],
+) -> Result<I64Table> {
+    let mut table = I64Table::new(init.to_vec());
+    for batch in batches {
+        let n = batch.num_rows();
+        if n == 0 {
+            continue;
+        }
+        let kv = i64_col(batch, key_col)?.values();
+        // Pre-resolve each aggregate's typed input slice + null buffer once per batch.
+        let mut ins: Vec<Option<(&[i64], Option<&crate::arrow::buffer::NullBuffer>)>> =
+            Vec::with_capacity(ops.len());
+        for op in ops {
+            ins.push(match op {
+                Op::Count { input: None } => None,
+                Op::Count { input: Some(c) } | Op::SumI(c) | Op::MinI(c) | Op::MaxI(c) => {
+                    let a = i64_col(batch, *c)?;
+                    Some((a.values(), a.nulls()))
+                }
+                _ => None,
+            });
+        }
+        let stride = table.stride;
+        for i in 0..n {
+            let base = table.get_or_insert(kv[i]) * stride;
+            for (a, op) in ops.iter().enumerate() {
+                let acc = &mut table.accs[base + a];
+                match op {
+                    Op::Count { input } => {
+                        let inc = match input {
+                            None => true,
+                            Some(_) => !is_null(ins[a].unwrap().1, i),
+                        };
+                        if inc {
+                            if let Acc::Count(x) = acc {
+                                *x += 1;
+                            }
+                        }
+                    }
+                    Op::SumI(_) => {
+                        let (s, nulls) = ins[a].unwrap();
+                        if !is_null(nulls, i) {
+                            if let Acc::I64(d) = acc {
+                                *d = Some(d.unwrap_or(0).wrapping_add(s[i]));
+                            }
+                        }
+                    }
+                    Op::MinI(_) => {
+                        let (s, nulls) = ins[a].unwrap();
+                        if !is_null(nulls, i) {
+                            if let Acc::I64(d) = acc {
+                                *d = Some(d.map_or(s[i], |p| p.min(s[i])));
+                            }
+                        }
+                    }
+                    Op::MaxI(_) => {
+                        let (s, nulls) = ins[a].unwrap();
+                        if !is_null(nulls, i) {
+                            if let Acc::I64(d) = acc {
+                                *d = Some(d.map_or(s[i], |p| p.max(s[i])));
+                            }
+                        }
+                    }
+                    _ => unreachable!("fast path ops are Count/SumI/MinI/MaxI"),
+                }
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Fast-path driver: aggregate `batches` (single `Int64` key) into the output batch. Shards the
+/// input across cores, aggregates each shard into a partial table, then merges (the aggregates
+/// are all re-combinable, so per-group merge is correct).
+fn agg_i64_key(
+    out_schema: &SchemaRef,
+    batches: &[RecordBatch],
+    key_col: usize,
+    ops: &[Op],
+) -> Result<RecordBatch> {
+    let init: Vec<Acc> = ops.iter().map(Acc::init).collect();
+    let stride = init.len();
+
+    let p = partition_count();
+    let per = ((batches.len() + p - 1) / p).max(1);
+    let chunks: Vec<&[RecordBatch]> = batches.chunks(per).collect();
+
+    let mut partials: Vec<I64Table> = chunks
+        .par_iter()
+        .map(|c| agg_i64_chunk(c, key_col, ops, &init))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut global = match partials.pop() {
+        Some(t) => t,
+        None => I64Table::new(init),
+    };
+    for partial in &partials {
+        global.merge(partial, ops);
+    }
+
+    // Materialize: key column, then one column per aggregate.
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(stride + 1);
+    cols.push(Arc::new(Int64Array::from(global.keys.clone())));
+    for (a, op) in ops.iter().enumerate() {
+        cols.push(build_col_flat(
+            op,
+            &global.accs,
+            global.keys.len(),
+            stride,
+            a,
+        ));
+    }
+    RecordBatch::try_new(out_schema.clone(), cols)
+        .map_err(|e| Error::Execution(format!("build aggregated batch: {e}")))
+}
+
+/// Materialize aggregate `a` from flat per-group accumulators.
+fn build_col_flat(op: &Op, accs: &[Acc], ngroups: usize, stride: usize, a: usize) -> ArrayRef {
+    match op {
+        Op::Count { .. } => {
+            let v: Vec<i64> = (0..ngroups)
+                .map(|g| match accs[g * stride + a] {
+                    Acc::Count(n) => n,
+                    _ => 0,
+                })
+                .collect();
+            Arc::new(Int64Array::from(v))
+        }
+        _ => {
+            let v: Vec<Option<i64>> = (0..ngroups)
+                .map(|g| match accs[g * stride + a] {
+                    Acc::I64(x) => x,
+                    _ => None,
+                })
+                .collect();
+            Arc::new(Int64Array::from(v))
+        }
+    }
 }
 
 /// Resolve each [`AggSpec`] against the schema, rejecting unsupported (kind, type) combinations.
