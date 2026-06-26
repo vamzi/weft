@@ -3,7 +3,7 @@
   "files_total": 303,
   "files_skipped": 63,
   "blocks_total": 12641,
-  "strict_pass": 669,
+  "strict_pass": 987,
   "semantic_pass": 5599,
   "buckets": {
     "correctness": 244,
@@ -20,7 +20,7 @@
     "null-semantics": 47,
     "ordering": 31,
     "parser-unsupported": 1348,
-    "pass": 669,
-    "schema-only": 2456
+    "pass": 987,
+    "schema-only": 2138
   }
 }

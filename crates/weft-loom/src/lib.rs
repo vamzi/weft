@@ -27,6 +27,10 @@ mod schema_adapt;
 /// Spark-only scalar functions (DataFusion `ScalarUDF`s) registered into every [`Engine`].
 pub mod spark_functions;
 
+/// Spark-compatible output column naming for the top result projection (drop-in `df.columns`
+/// parity). See [`spark_names::project_spark_names`].
+mod spark_names;
+
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
@@ -441,12 +445,7 @@ impl Engine {
     /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
     /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
-        let query = normalize_spark_sql(query);
-        let df = self
-            .ctx
-            .sql(query.as_ref())
-            .await
-            .map_err(|e| Error::Plan(e.to_string()))?;
+        let df = self.plan_spark(query).await?;
         df.collect()
             .await
             .map_err(|e| Error::Execution(e.to_string()))
@@ -455,13 +454,23 @@ impl Engine {
     /// Resolve the result schema of `query` without executing it — the logical-plan schema.
     /// Used by Spark Connect `AnalyzePlan(Schema)` (PySpark `df.schema` / `printSchema`).
     pub async fn schema(&self, query: &str) -> Result<arrow::datatypes::SchemaRef> {
+        let df = self.plan_spark(query).await?;
+        Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
+    }
+
+    /// Plan `query` and rewrite its top output projection to use Spark-compatible column names, so
+    /// the executed result and `df.schema` both expose the same column names Spark would. Shared by
+    /// [`Engine::sql`] and [`Engine::schema`] so the two never disagree.
+    async fn plan_spark(&self, query: &str) -> Result<datafusion::dataframe::DataFrame> {
         let query = normalize_spark_sql(query);
         let df = self
             .ctx
             .sql(query.as_ref())
             .await
             .map_err(|e| Error::Plan(e.to_string()))?;
-        Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
+        let (state, plan) = df.into_parts();
+        let plan = spark_names::project_spark_names(plan);
+        Ok(datafusion::dataframe::DataFrame::new(state, plan))
     }
 
     /// Build the optimized DataFusion physical plan for `query`. The driver side of
