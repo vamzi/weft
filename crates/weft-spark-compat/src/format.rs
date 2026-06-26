@@ -16,9 +16,10 @@
 
 use datafusion::arrow::array::{
     Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Float64Array,
-    LargeBinaryArray, ListArray, MapArray, StructArray,
+    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
+    ListArray, MapArray, StructArray,
 };
-use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, IntervalUnit, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 
@@ -100,6 +101,9 @@ pub fn spark_type(dt: &DataType) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        // Spark spells the legacy `CalendarInterval` type simply `interval` (Arrow's `Debug`
+        // would give `Interval(MonthDayNano)`).
+        DataType::Interval(_) => "interval".into(),
         DataType::Map(field, _) => {
             // The map entries are a Struct<key, value>.
             if let DataType::Struct(kv) = field.data_type() {
@@ -116,10 +120,21 @@ pub fn spark_type(dt: &DataType) -> String {
     }
 }
 
-/// Render a single cell (`array[row]`) Spark-style.
+/// Render a single cell (`array[row]`) Spark-style for a **top-level** column.
 pub fn fmt_value(array: &dyn Array, row: usize) -> String {
+    fmt_cell(array, row, false)
+}
+
+/// Render `array[row]` Spark-style. `nested` mirrors Spark's `HiveResult.toHiveString(value,
+/// nested = true)`: when the value is an *element* of a container (array / struct / map), Spark
+/// (a) double-quotes string leaves (`["1","2"]`, not `[1,2]`), (b) renders a NULL as lowercase
+/// `null` (a *top-level* NULL stays `NULL`), and (c) keeps recursing for nested containers
+/// (`[["h"]]`). Non-string scalars (ints, decimals, dates, timestamps, booleans, binary) render
+/// identically whether nested or not. This is **harness display only** — it never runs on the
+/// engine path, so it just aligns weft's rendering with Spark's golden rendering.
+fn fmt_cell(array: &dyn Array, row: usize, nested: bool) -> String {
     if array.is_null(row) {
-        return "NULL".into();
+        return if nested { "null".into() } else { "NULL".into() };
     }
     match array.data_type() {
         DataType::Float32 => {
@@ -155,8 +170,9 @@ pub fn fmt_value(array: &dyn Array, row: usize) -> String {
                 });
             match child {
                 Some(elems) => {
+                    // Elements are nested: Spark quotes string leaves and recurses.
                     let parts: Vec<String> = (0..elems.len())
-                        .map(|k| fmt_value(elems.as_ref(), k))
+                        .map(|k| fmt_cell(elems.as_ref(), k, true))
                         .collect();
                     format!("[{}]", parts.join(","))
                 }
@@ -168,7 +184,7 @@ pub fn fmt_value(array: &dyn Array, row: usize) -> String {
             let parts: Vec<String> = s
                 .columns()
                 .iter()
-                .map(|c| fmt_value(c.as_ref(), row))
+                .map(|c| fmt_cell(c.as_ref(), row, true))
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -181,12 +197,17 @@ pub fn fmt_value(array: &dyn Array, row: usize) -> String {
                 .map(|k| {
                     format!(
                         "{}:{}",
-                        fmt_value(keys.as_ref(), k),
-                        fmt_value(vals.as_ref(), k)
+                        fmt_cell(keys.as_ref(), k, true),
+                        fmt_cell(vals.as_ref(), k, true)
                     )
                 })
                 .collect();
             format!("{{{}}}", parts.join(","))
+        }
+        // Spark double-quotes a string only when it is nested inside a container; a top-level
+        // string column renders bare (it falls through to the `_ => leaf` arm below).
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View if nested => {
+            format!("\"{}\"", leaf(array, row))
         }
         // Spark's `hiveResultString` renders BinaryType as `new String(bytes, UTF_8)` — the bytes
         // decoded as UTF-8 with U+FFFD for invalid sequences — NOT Arrow's hex dump. (e.g.
@@ -220,8 +241,114 @@ pub fn fmt_value(array: &dyn Array, row: usize) -> String {
                 .value(row);
             String::from_utf8_lossy(v).into_owned()
         }
+        // Spark renders the legacy CalendarInterval (which DataFusion stores as an Arrow
+        // interval) via `CalendarInterval.toString` / `IntervalUtils.toMultiUnitsString`: full
+        // *plural* unit words, months normalized into years + months, and seconds at microsecond
+        // resolution with trailing zeros stripped — NOT Arrow's abbreviated `999 mons` /
+        // `16 mins 39.000000000 secs`. The stored Arrow value is identical; only the string
+        // rendering differs, so this is a pure parity-oracle fix (never on Engine::sql's path).
+        DataType::Interval(unit) => fmt_interval(array, row, unit),
         _ => leaf(array, row),
     }
+}
+
+/// Render an Arrow interval cell the way Spark renders a legacy `CalendarInterval`
+/// (`org.apache.spark.unsafe.types.CalendarInterval.toString`). All three Arrow interval layouts
+/// collapse to Spark's `(months, days, microseconds)` triple before formatting.
+fn fmt_interval(array: &dyn Array, row: usize, unit: &IntervalUnit) -> String {
+    let (months, days, micros) = match unit {
+        IntervalUnit::YearMonth => {
+            let v = array
+                .as_any()
+                .downcast_ref::<IntervalYearMonthArray>()
+                .unwrap()
+                .value(row);
+            (v as i64, 0i64, 0i64)
+        }
+        IntervalUnit::DayTime => {
+            let v = array
+                .as_any()
+                .downcast_ref::<IntervalDayTimeArray>()
+                .unwrap()
+                .value(row);
+            (0i64, v.days as i64, v.milliseconds as i64 * 1_000)
+        }
+        IntervalUnit::MonthDayNano => {
+            let v = array
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .unwrap()
+                .value(row);
+            // Spark's CalendarInterval carries microseconds, so drop sub-microsecond nanos
+            // (truncating toward zero, matching Java integer division).
+            (v.months as i64, v.days as i64, v.nanoseconds / 1_000)
+        }
+    };
+    fmt_calendar_interval(months, days, micros)
+}
+
+/// Spark's multi-units interval string from `(months, days, microseconds)`. Mirrors
+/// `CalendarInterval.toString`: only non-zero components are emitted, each `"<n> <plural-unit>"`,
+/// space-joined; an all-zero interval renders `"0 seconds"`.
+fn fmt_calendar_interval(months: i64, days: i64, micros: i64) -> String {
+    const MICROS_PER_HOUR: i64 = 3_600_000_000;
+    const MICROS_PER_MINUTE: i64 = 60_000_000;
+    if months == 0 && days == 0 && micros == 0 {
+        return "0 seconds".into();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if months != 0 {
+        let years = months / 12;
+        let mons = months % 12;
+        if years != 0 {
+            parts.push(format!("{years} years"));
+        }
+        if mons != 0 {
+            parts.push(format!("{mons} months"));
+        }
+    }
+    if days != 0 {
+        parts.push(format!("{days} days"));
+    }
+    if micros != 0 {
+        let mut rest = micros;
+        let hours = rest / MICROS_PER_HOUR;
+        rest %= MICROS_PER_HOUR;
+        let minutes = rest / MICROS_PER_MINUTE;
+        rest %= MICROS_PER_MINUTE;
+        if hours != 0 {
+            parts.push(format!("{hours} hours"));
+        }
+        if minutes != 0 {
+            parts.push(format!("{minutes} minutes"));
+        }
+        if rest != 0 {
+            parts.push(format!("{} seconds", fmt_interval_seconds(rest)));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Render the fractional-second component (`micros`) like Java
+/// `BigDecimal.valueOf(micros, 6).stripTrailingZeros().toPlainString()`: integral values print
+/// with no decimal point, otherwise up to six fraction digits with trailing zeros stripped.
+/// Negative values carry a leading `-`.
+fn fmt_interval_seconds(micros: i64) -> String {
+    let neg = micros < 0;
+    let abs = micros.unsigned_abs();
+    let whole = abs / 1_000_000;
+    let frac = abs % 1_000_000;
+    let mut s = String::new();
+    if neg {
+        s.push('-');
+    }
+    if frac == 0 {
+        s.push_str(&whole.to_string());
+    } else {
+        let frac_str = format!("{frac:06}");
+        s.push_str(&format!("{whole}.{}", frac_str.trim_end_matches('0')));
+    }
+    s
 }
 
 /// Leaf rendering via Arrow's display (with `NULL` for nulls) — used for the scalar types
@@ -296,6 +423,40 @@ mod tests {
     }
 
     #[test]
+    fn interval_renders_spark_multi_units() {
+        // Goldens from postgreSQL/interval.sql (`SELECT interval '999' second`, etc.).
+        assert_eq!(
+            fmt_calendar_interval(0, 0, 999_000_000),
+            "16 minutes 39 seconds"
+        );
+        assert_eq!(
+            fmt_calendar_interval(0, 0, 59_940_000_000),
+            "16 hours 39 minutes"
+        );
+        assert_eq!(fmt_calendar_interval(0, 0, 3_596_400_000_000), "999 hours");
+        assert_eq!(fmt_calendar_interval(0, 999, 0), "999 days");
+        assert_eq!(fmt_calendar_interval(999, 0, 0), "83 years 3 months");
+        assert_eq!(fmt_calendar_interval(12, 0, 0), "1 years");
+        assert_eq!(fmt_calendar_interval(2, 0, 0), "2 months");
+        assert_eq!(fmt_calendar_interval(0, 3, 0), "3 days");
+        assert_eq!(fmt_calendar_interval(0, 0, 14_400_000_000), "4 hours");
+        assert_eq!(fmt_calendar_interval(0, 0, 300_000_000), "5 minutes");
+        assert_eq!(fmt_calendar_interval(0, 0, 6_000_000), "6 seconds");
+        assert_eq!(fmt_calendar_interval(14, 0, 0), "1 years 2 months");
+        // All-zero, sub-second precision, and negative components.
+        assert_eq!(fmt_calendar_interval(0, 0, 0), "0 seconds");
+        assert_eq!(
+            fmt_calendar_interval(14, 1, 7_008_009),
+            "1 years 2 months 1 days 7.008009 seconds"
+        );
+        assert_eq!(fmt_interval_seconds(7_008_009), "7.008009");
+        assert_eq!(fmt_interval_seconds(6_000_000), "6");
+        assert_eq!(fmt_interval_seconds(-6_500_000), "-6.5");
+        assert_eq!(fmt_interval_seconds(39_000), "0.039");
+        assert_eq!(spark_type(&DataType::Interval(IntervalUnit::MonthDayNano)), "interval");
+    }
+
+    #[test]
     fn rows_and_nulls_and_schema() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("count(a)", DataType::Int64, true),
@@ -312,5 +473,29 @@ mod tests {
         let out = format_result(&schema, &[batch]);
         assert_eq!(out.schema, "struct<count(a):bigint,s:string>");
         assert_eq!(out.rows, vec!["1\tx".to_string(), "NULL\ty".to_string()]);
+    }
+
+    #[test]
+    fn nested_strings_are_quoted_ints_are_not_nulls_lowercase() {
+        use datafusion::arrow::array::{Int32Builder, ListBuilder, StringBuilder};
+        // array<string> with a non-participating (NULL) middle element → `["a",null,"f"]`.
+        let mut sb = ListBuilder::new(StringBuilder::new());
+        sb.values().append_value("a");
+        sb.values().append_null();
+        sb.values().append_value("f");
+        sb.append(true);
+        let str_list = sb.finish();
+        assert_eq!(fmt_value(&str_list, 0), r#"["a",null,"f"]"#);
+        // A bare top-level string stays unquoted.
+        let s = StringArray::from(vec![Some("a")]);
+        assert_eq!(fmt_value(&s, 0), "a");
+        // array<int> stays unquoted, nested NULL still lowercase → `[1,2,null]`.
+        let mut ib = ListBuilder::new(Int32Builder::new());
+        ib.values().append_value(1);
+        ib.values().append_value(2);
+        ib.values().append_null();
+        ib.append(true);
+        let int_list = ib.finish();
+        assert_eq!(fmt_value(&int_list, 0), "[1,2,null]");
     }
 }

@@ -30,6 +30,7 @@ pub fn bucket_key(b: Bucket) -> &'static str {
         Bucket::MissingError => "missing-error",
         Bucket::Correctness => "correctness",
         Bucket::Nondeterministic => "nondeterministic",
+        Bucket::RequiresUdfRegistration => "requires-udf-registration",
     }
 }
 
@@ -93,6 +94,7 @@ impl FileReport {
                     v.bucket,
                     crate::classify::Bucket::ErrorParity
                         | crate::classify::Bucket::Nondeterministic
+                        | crate::classify::Bucket::RequiresUdfRegistration
                 );
             if actionable && failures.len() < FAILURE_CAP {
                 failures.push(Failure {
