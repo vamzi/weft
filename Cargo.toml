@@ -45,6 +45,8 @@ weft-clustermgr = { path = "crates/weft-clustermgr" }
 weft-scheduler  = { path = "crates/weft-scheduler" }
 weft-ai         = { path = "crates/weft-ai" }
 weft-pyworker   = { path = "crates/weft-pyworker" }
+# Spark parity harness (golden SQL tests + scoreboard).
+weft-spark-compat = { path = "crates/weft-spark-compat" }
 
 [profile.release]
 opt-level = 3
