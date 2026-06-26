@@ -9,9 +9,28 @@ Weft is a drop-in Apache Spark replacement on DataFusion 54. We **measure** Spar
 replaying Apache Spark v4.0.0's *own* golden SQL tests through weft and diffing against Spark's
 committed `.sql.out` outputs, with a CI ratchet so parity can only rise.
 
-**Current parity (deterministic): semantic 41.9% (5,297 / 12,641), strict 4.8% (611).**
-Up from 25.5% / 2.2% at the start. To continue, the single best next move is the **session-timezone
-quick win** (§6.1); the biggest structural lever is the **column-naming pass** (§6.4).
+**Current parity (deterministic): semantic 43.0% (5,431 / 12,641), strict 5.0% (626 floor).**
+Up from 25.5% / 2.2% at the start. To continue, the highest-yield low-risk move is another
+**function wave** (§6.3, swarm pattern in §7); the biggest structural lever is the **column-naming
+pass** (§6.4). (The former "session-timezone quick win" was tested and disproven — see §6.1.)
+
+**Last wave (2026-06-25): function wave 4 + Spark binary rendering.** A 4-agent worktree swarm added
+`spark_array.rs` (array_size, sort_array, map_contains_key, try_element_at + `array`→`make_array`
+alias), `spark_datetime3.rs` (make_timestamp[_ntz], to_timestamp_ntz, try_to_timestamp, unix_*,
+date_from_unix_date, date_add), `spark_misc.rs` (hex/unhex/to_binary/try_to_binary, current_*,
+assert_true, 2-arg replace), `spark_aggregates2.rs` (try_sum, try_avg, skewness). Then `format.rs`
+learned Spark's binary rendering (`new String(bytes, UTF_8)` ≈ `from_utf8_lossy`, not Arrow hex).
+Net: function-missing 1340→1099; semantic +134, strict +15. One real wrong-answer bug found and
+fixed during integration: `map_contains_key` needed least-common-type key coercion (Spark widens
+int↔double, rejects string↔numeric). **Lessons for the next swarm:** (1) always re-run the full
+corpus and watch the `correctness` bucket — a newly-registered fn that returns a *wrong* answer is
+worse than a missing one (faithfulness); survey `correctness`/`exec-error` for the new fn names and
+fix or drop. (2) Some Spark calls are **parser-blocked**, not UDF-able: `timestampdiff(MONTH,…)`
+(bare unit keyword parses as a column ref), `percentile_disc/approx` and `listagg` (`WITHIN GROUP`),
+and **typed literal suffixes** `1L`/`1.0D`/`2Y`/`2S`/`98…BD` (parsed as identifiers — this blocks
+the try_sum/try_avg overflow goldens and many `array(2Y,…)` rows). A Spark typed-literal parser pass
+is now a clean, high-value next target. (3) JSON/CSV/XML (`from_json`/`from_csv`/`from_xml`) still
+need a Spark DDL/DataType schema-string parser (Wave F) — deferred, substantial.
 
 Reproduce in ~10s:
 ```bash
@@ -88,20 +107,20 @@ and refresh `site/public/parity.{html,json}` from the run's `parity.html`/`score
 
 | bucket | count | meaning / where the work is |
 |---|---:|---|
-| `missing-relation` | 2,726 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
-| `error-parity` | 2,463 | ✓ both engines reject (semantic pass) |
-| `schema-only` | 2,194 | ✓ right values, divergent column name — **the strict lever (§6.4)** |
-| `function-missing` | 1,340 | functions still unimplemented (§6.3) |
-| `parser-unsupported` | 1,336 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
-| `exec-error` | 1,031 | misc execution failures |
-| `pass` | 611 | ✓ strict |
-| `feature-unsupported` | 405 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
-| `correctness` | 209 | **genuine wrong answers — highest trust priority** |
-| `decimal-precision` | 137 | precision/scale/rounding |
-| `missing-error` | 111 | weft too lenient (Spark rejects, weft accepts) |
-| `null-semantics` | 41 | three-valued-logic |
-| `ordering` | 29 | ✓ counted semantic |
-| `datetime` | 4 | (most tz-blocked queries land in other buckets — §6.1) |
+| `missing-relation` | 2,747 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
+| `error-parity` | 2,453 | ✓ both engines reject (semantic pass) |
+| `schema-only` | 2,323 | ✓ right values, divergent column name — **the strict lever (§6.4)** |
+| `parser-unsupported` | 1,347 | Spark syntax DataFusion rejects (typed literals `1L`/`2Y`/`BD`, `CREATE TABLE … USING`, PIVOT, USE) |
+| `function-missing` | 1,099 | functions still unimplemented (§6.3) |
+| `exec-error` | 1,069 | misc execution failures |
+| `pass` | 626 | ✓ strict |
+| `feature-unsupported` | 406 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
+| `correctness` | 226 | **genuine wrong answers — highest trust priority** (mostly `array()`-enabled rows hitting pre-existing gaps, not new-fn bugs) |
+| `decimal-precision` | 141 | precision/scale/rounding |
+| `missing-error` | 121 | weft too lenient (Spark rejects, weft accepts) |
+| `null-semantics` | 44 | three-valued-logic |
+| `ordering` | 28 | ✓ counted semantic |
+| `datetime` | 6 | tz-naive TIMESTAMP gap — not a quick win (§6.1) |
 | `nondeterministic` | 3 | rand/uuid/shuffle — excluded from scoring by design |
 | `engine-panic` | 1 | DataFusion `panic!` on `COUNT(DISTINCT a,b)` (§6.6) |
 
@@ -123,16 +142,26 @@ Note: per-file `failures` are capped at 20; bucket *totals* are exact.
 
 ## 6. Ranked next steps
 
-### 6.1 Session timezone — BEST QUICK WIN (likely dialect-sized, low risk)
-Spark generated the datetime/timestamp goldens in **`America/Los_Angeles`**; weft's session tz is
-UTC, so faithful timestamp values render at the wrong wall-clock and fail (spread across
-`schema-only`/`correctness`/`exec-error`, not just the small `datetime` bucket). Set weft's default
-session timezone to match the golden-gen tz and re-measure.
-- Where: `Engine::new` — `config.options_mut().execution.time_zone = "America/Los_Angeles".into()`
-  (verify the exact field name in DataFusion 54's `ConfigOptions`; it governs timestamp rendering).
-- Verify it's faithful: Spark's own session tz for these tests is fixed; matching it is correct, not
-  a hack. Measure with `weft-parity file datetime.sql.out` / `timestamp.sql.out` before/after.
-- Risk: could shift other timestamp outputs — let the ratchet adjudicate net.
+### 6.1 Session timezone — DISPROVEN (2026-06-25): NOT a quick win on DataFusion 54
+Hypothesis was: Spark generated the goldens in `America/Los_Angeles`, weft renders in UTC, so
+setting the session tz would flip a batch of timestamp renders. **Tested and false.** Setting
+`opts.execution.time_zone = Some("America/Los_Angeles")` *does* take effect (verified: `now()`'s
+type flips to `Timestamp(ns, Some("America/Los_Angeles"))`), but produces **zero parity movement**
+because DataFusion 54 produces bare `TIMESTAMP` literals, `CAST(x AS timestamp)`, `to_timestamp`,
+`from_unixtime` as `Timestamp(_, None)` — **timezone-naive (NTZ)**. The session tz only governs
+`now()`/`current_*` (nondeterministic → excluded from scoring), so the deterministic corpus values
+render identically regardless of session tz. `cast(0 as timestamp)` → `1970-01-01 00:00:00` in both
+UTC and LA; Spark (LTZ) would give `1969-12-31 16:00:00`.
+
+The *actual* gap is **Spark `TIMESTAMP` ≡ timestamp-with-local-time-zone (LTZ)** vs DataFusion
+`TIMESTAMP` ≡ NTZ. Closing it is a real type-semantics feature (coerce literals/casts to
+`Timestamp(_, Some(session_tz))` on the production path; affects comparisons/joins/storage), **not** a
+config flip — and its yield is small: across `timestamp/date/interval/timestamp-ntz` the failures are
+dominated by `function-missing`/`schema-only`/`parser-unsupported`/`exec-error`, with the
+tz-sensitive `datetime` bucket only ~3 in `timestamp.sql` and ~0 elsewhere. Skip unless doing a
+dedicated LTZ-correctness pass. The real levers in these files are §6.3 (functions: `unix_seconds`,
+`unix_millis`, `make_timestamp`, `make_timestamp_ltz`, `date_add`, `convert_timezone`) and §6.4
+(column-naming).
 
 ### 6.2 `array(...)` / type-constructor function syntax (parser/alias layer)
 Spark uses `array(1,2,3)` (DataFusion: `make_array`), and cast-constructors `int(x)`/`double(x)`/

@@ -15,7 +15,8 @@
 //! Arrow and Spark disagree on spacing / delimiters / trailing zeros.
 
 use datafusion::arrow::array::{
-    Array, Float32Array, Float64Array, ListArray, MapArray, StructArray,
+    Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Float64Array,
+    LargeBinaryArray, ListArray, MapArray, StructArray,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -186,6 +187,38 @@ pub fn fmt_value(array: &dyn Array, row: usize) -> String {
                 })
                 .collect();
             format!("{{{}}}", parts.join(","))
+        }
+        // Spark's `hiveResultString` renders BinaryType as `new String(bytes, UTF_8)` — the bytes
+        // decoded as UTF-8 with U+FFFD for invalid sequences — NOT Arrow's hex dump. (e.g.
+        // `to_binary('737472696E67','hex')` prints `string`.) `from_utf8_lossy` matches Java's
+        // substitution behavior exactly.
+        DataType::Binary => {
+            let v = array.as_any().downcast_ref::<BinaryArray>().unwrap().value(row);
+            String::from_utf8_lossy(v).into_owned()
+        }
+        DataType::LargeBinary => {
+            let v = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(row);
+            String::from_utf8_lossy(v).into_owned()
+        }
+        DataType::BinaryView => {
+            let v = array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap()
+                .value(row);
+            String::from_utf8_lossy(v).into_owned()
+        }
+        DataType::FixedSizeBinary(_) => {
+            let v = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(row);
+            String::from_utf8_lossy(v).into_owned()
         }
         _ => leaf(array, row),
     }
