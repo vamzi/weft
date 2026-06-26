@@ -22,7 +22,9 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use weft_clustermgr::Phase;
-use weft_govern::{Effect, Grant, Principal, Privilege, Securable, SecurableType};
+use weft_govern::{
+    Effect, Evaluator, Grant, Identity, Ownership, Principal, Privilege, Securable, SecurableType,
+};
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
@@ -338,6 +340,18 @@ impl AppState {
             .unwrap()
             .get("admins")
             .is_some_and(|m| m.iter().any(|x| x == user))
+    }
+
+    /// Build a governance [`Evaluator`] from the current grant set. The bootstrap operator group
+    /// `admins` owns the metastore (full access on the whole tree); every other principal is governed
+    /// purely by explicit grants — i.e. fail-closed, sees nothing it wasn't granted.
+    pub(crate) fn evaluator(&self) -> Evaluator {
+        let grants = self.grants.lock().unwrap().clone();
+        let owners = vec![Ownership {
+            securable: Securable::metastore(),
+            principal: Principal::Group("admins".into()),
+        }];
+        Evaluator::with_owners(grants, owners)
     }
 
     // Durable persistence (best-effort, off the request path). Workspace → S3; clusters +
@@ -1159,14 +1173,114 @@ pub struct SqlResponse {
     pub error: Option<String>,
 }
 
-/// Run a SQL query on the embedded engine and return rows. Spark-dialect input is passed through
-/// [`weft_sql::dialect`] first. In production this routes to the target cluster's Spark Connect
-/// endpoint; here it runs in-process on the same engine — real execution, real results.
-async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Json<SqlResponse> {
+/// An error-only [`SqlResponse`] (empty result + message), used for governance denials and failures.
+fn sql_error(msg: impl Into<String>) -> SqlResponse {
+    SqlResponse {
+        columns: vec![],
+        rows: vec![],
+        row_count: 0,
+        error: Some(msg.into()),
+    }
+}
+
+/// Conservatively deny SQL that reads files directly (bypassing catalog governance) for governed
+/// (non-admin) sessions: file-scan table functions, `CREATE EXTERNAL TABLE … LOCATION`, and `COPY`.
+/// These have no securable to gate and would otherwise read raw object storage with the engine's
+/// credentials. Defense-in-depth on top of table-reference authorization; the authoritative control
+/// is engine-side (plan Step 4.5). Over-denial is acceptable (safe); the input is the translated SQL.
+fn forbidden_construct(sql: &str) -> Option<&'static str> {
+    let s = sql.to_ascii_lowercase();
+    for f in ["read_parquet", "read_csv", "read_json", "read_avro", "read_ndjson"] {
+        if s.contains(&format!("{f}(")) || s.contains(&format!("{f} (")) {
+            return Some("file-scan table functions are not permitted");
+        }
+    }
+    if s.contains("create external table") {
+        return Some("CREATE EXTERNAL TABLE is not permitted");
+    }
+    if s.contains("copy ") && (s.contains(" to ") || s.contains(" from ")) {
+        return Some("COPY is not permitted");
+    }
+    None
+}
+
+/// A stable, per-principal+cluster Spark Connect session id. Replaces a single hardcoded id shared
+/// by every user (which collided sessions / temp views / caches across principals and is a
+/// prerequisite for per-session engine-side governance). Deterministic across gateway restarts (so a
+/// user keeps their session) and distinct per (user, cluster). FNV-1a avoids a new dependency; the
+/// id is opaque to Spark Connect, formatted UUID-shaped only for familiarity.
+fn session_id_for(user: &str, cluster: &str) -> String {
+    fn fnv1a(seed: u64, data: &[u8]) -> u64 {
+        let mut h = seed;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let key = format!("{user}\u{0}{cluster}");
+    let lo = fnv1a(0xcbf2_9ce4_8422_2325, key.as_bytes());
+    let hi = fnv1a(0x8422_2325_cbf2_9ce4, key.as_bytes());
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        (hi >> 16) as u16,
+        hi as u16,
+        (lo >> 48) as u16,
+        lo & 0xffff_ffff_ffff,
+    )
+}
+
+/// Walk a resolved (optimized) logical plan and return the first table reference the `identity` may
+/// not `SELECT`. References in the session-scratch default catalog (temp views / ad-hoc registered
+/// tables) are skipped — any governed data they could expose is itself read through a governed
+/// `TableScan` elsewhere in the same plan. Using the optimized plan decorrelates subqueries so their
+/// base scans surface as plan nodes. This is gateway-side *defense-in-depth* (the authoritative
+/// per-identity enforcement is engine-side, Step 4.5); resolution oddities fail closed.
+fn first_unauthorized_table(
+    eval: &Evaluator,
+    identity: &Identity,
+    default_catalog: &str,
+    default_schema: &str,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Option<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::LogicalPlan;
+    let mut denied: Option<String> = None;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let r = scan
+                .table_name
+                .clone()
+                .resolve(default_catalog, default_schema);
+            // Govern only named catalogs; the default catalog is session scratch.
+            if r.catalog.as_ref() != default_catalog {
+                let securable =
+                    Securable::table(r.catalog.as_ref(), r.schema.as_ref(), r.table.as_ref());
+                if !eval.can(identity, Privilege::Select, &securable) {
+                    denied = Some(format!("{}.{}.{}", r.catalog, r.schema, r.table));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    denied
+}
+
+/// Run a SQL query and return rows, enforced for the caller's identity. Spark-dialect input is passed
+/// through [`weft_sql::dialect`] first. A selected RUNNING cluster routes execution to its Spark
+/// Connect endpoint (the real data-plane hop); otherwise it runs on the gateway's governed embedded
+/// engine. Governed (non-admin) sessions are authorized against the resolved plan's table scans and
+/// denied direct file reads; cluster routing is fail-closed for non-admins until engine-side
+/// enforcement lands (plan Step 4.5).
+async fn run_sql(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<SqlRequest>,
+) -> Json<SqlResponse> {
     const MAX_ROWS: usize = 1000;
-    // If a RUNNING cluster is selected, route execution to its Spark Connect endpoint (the real
-    // data-plane hop); otherwise run on the gateway's embedded engine. A non-running selection
-    // falls back to the embedded engine.
+    let is_admin = st.is_admin(&claims.sub);
     if let Some(cid) = req.cluster_id.as_deref().filter(|s| !s.is_empty()) {
         st.touch(cid); // counts as activity → resets the cluster's idle timer
         let endpoint = {
@@ -1180,35 +1294,68 @@ async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Jso
             })
         };
         if let Some(ep) = endpoint {
-            return match cluster_client::run_sql_on_cluster(&ep, &req.sql, MAX_ROWS).await {
+            // SECURITY: cluster-routed SQL bypasses the governed embedded engine and reaches a Spark
+            // Connect server that does not yet enforce per-identity governance or authenticate the
+            // gateway (plan Step 4.5). Until then, routing is restricted to admins; non-admins fall
+            // back to the governed embedded engine below.
+            if !is_admin {
+                return Json(sql_error(
+                    "cluster-routed queries are temporarily restricted to admins \
+                     (engine-side governance enforcement pending)",
+                ));
+            }
+            let session = session_id_for(&claims.sub, cid);
+            return match cluster_client::run_sql_on_cluster(&ep, &session, &req.sql, MAX_ROWS).await
+            {
                 Ok(batches) => Json(batches_to_response(&batches)),
-                Err(e) => Json(SqlResponse {
-                    columns: vec![],
-                    rows: vec![],
-                    row_count: 0,
-                    error: Some(format!("cluster `{cid}`: {e}")),
-                }),
+                Err(e) => Json(sql_error(format!("cluster `{cid}`: {e}"))),
             };
         }
     }
     let sql = weft_sql::dialect::to_datafusion_sql(&req.sql);
+    // Governed (non-admin) sessions: deny direct file reads, then authorize every table the resolved
+    // plan scans. Admins own the metastore, so they are authorized by construction and skip the walk.
+    if !is_admin {
+        if let Some(reason) = forbidden_construct(&sql) {
+            return Json(sql_error(reason));
+        }
+    }
     // Cap execution at the UI display limit so an unbounded `SELECT *` over a huge external table
     // (e.g. 100M-row ClickBench `hits`) reads only enough row groups instead of materializing the
     // whole result into memory (which previously OOMed → "load failed"). LIMIT pushes into the scan.
+    let df = match st.engine.ctx().sql(&sql).await {
+        Ok(df) => df,
+        Err(e) => return Json(sql_error(format!("{e}"))),
+    };
+    if !is_admin {
+        let plan = match df.clone().into_optimized_plan() {
+            Ok(p) => p,
+            Err(e) => return Json(sql_error(format!("{e}"))),
+        };
+        let identity = crate::authz::identity_of(&st, &claims);
+        let evaluator = st.evaluator();
+        let state = st.engine.ctx().state();
+        let cat = &state.config().options().catalog;
+        if let Some(denied) = first_unauthorized_table(
+            &evaluator,
+            &identity,
+            &cat.default_catalog,
+            &cat.default_schema,
+            &plan,
+        ) {
+            return Json(sql_error(format!(
+                "permission denied: no SELECT privilege on {denied}"
+            )));
+        }
+    }
     let result = async {
-        let df = st.engine.ctx().sql(&sql).await?;
         let df = df.limit(0, Some(MAX_ROWS))?;
         df.collect().await
     }
     .await;
     match result {
         Ok(batches) => Json(batches_to_response(&batches)),
-        Err(e) => Json(SqlResponse {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            error: Some(format!("{e}")),
-        }),
+        Err(e) => Json(sql_error(format!("{e}"))),
     }
 }
 
@@ -2656,6 +2803,85 @@ mod tests {
         assert_eq!(
             post(&st, "/api/sql", &bob, r#"{"sql":"SELECT 1"}"#).await,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_sql_is_governed() {
+        let st = state();
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        assert_eq!(
+            create_user_via_admin(&st, &admin, "carol", "passwordpassword", &[]).await,
+            StatusCode::CREATED
+        );
+        let carol = login_token(&st, "carol", "passwordpassword").await.unwrap();
+
+        let run = |token: String, sql: &str| {
+            let st = st.clone();
+            let body = format!(r#"{{"sql":{}}}"#, serde_json::to_string(sql).unwrap());
+            async move {
+                let resp = app(st)
+                    .oneshot(
+                        Request::post("/api/sql")
+                            .header("content-type", "application/json")
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                body_json(resp).await
+            }
+        };
+
+        // Without a grant, carol cannot read the seeded governed table (fail-closed).
+        let j = run(carol.clone(), "SELECT * FROM main.sales.monthly_revenue").await;
+        assert!(
+            j["error"].as_str().unwrap_or("").contains("permission denied"),
+            "expected denial, got {j:?}"
+        );
+        // File-scan TVFs are blocked for non-admins (can't read raw files with engine creds).
+        let j = run(carol.clone(), "SELECT * FROM read_parquet('/etc/shadow')").await;
+        assert!(
+            j["error"].as_str().unwrap_or("").contains("not permitted"),
+            "expected TVF denial, got {j:?}"
+        );
+        // A bare scratch query (no governed table) is always allowed.
+        assert!(run(carol.clone(), "SELECT 1 AS a").await["error"].is_null());
+
+        // Admin grants ALL PRIVILEGES on catalog `main` → carol can now read it.
+        assert_eq!(
+            post(
+                &st,
+                "/api/grants",
+                &admin,
+                r#"{"securable_type":"catalog","securable_name":"main","privilege":"ALL PRIVILEGES","principal_kind":"user","principal_id":"carol","effect":"allow"}"#
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let j = run(
+            carol.clone(),
+            "SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region",
+        )
+        .await;
+        assert!(j["error"].is_null(), "expected success after grant, got {j:?}");
+
+        // Admin is never blocked (owns the metastore) — even a file-scan TVF planning-errors rather
+        // than being governance-denied.
+        let j = run(admin.clone(), "SELECT * FROM main.sales.monthly_revenue LIMIT 1").await;
+        assert!(j["error"].is_null(), "admin query failed: {j:?}");
+    }
+
+    #[tokio::test]
+    async fn session_id_is_per_user_and_stable() {
+        assert_eq!(session_id_for("alice", "c1"), session_id_for("alice", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("bob", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("alice", "c2"));
+        // No longer the old hardcoded shared id.
+        assert_ne!(
+            session_id_for("alice", "c1"),
+            "00112233-4455-6677-8899-aabbccddeeff"
         );
     }
 
