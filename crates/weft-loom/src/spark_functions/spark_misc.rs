@@ -302,7 +302,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     // After stripping '=', no '=' may remain and length+pad must be a multiple of 4.
-    if data.iter().any(|&b| b == b'=') {
+    if data.contains(&b'=') {
         return None;
     }
     if (data.len() + pad) % 4 != 0 {
@@ -665,7 +665,7 @@ mod tests {
             .await
             .contains("69B7"));
         // case-insensitive format.
-        assert!(run("SELECT to_binary('abc', 'Hex') AS x").await.len() > 0);
+        assert!(!run("SELECT to_binary('abc', 'Hex') AS x").await.is_empty());
         // NULL inputs.
         assert!(run("SELECT to_binary('abc', NULL) AS x").await.contains("|   |"));
         assert!(run("SELECT to_binary(CAST(NULL AS STRING), 'utf-8') AS x")
