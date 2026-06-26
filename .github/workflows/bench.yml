@@ -1,0 +1,54 @@
+name: ClickBench (self-hosted)
+
+# Heavy ClickBench on the real 14.78 GB hits.parquet — needs a c6a.4xlarge-class box
+# (~26 GB spill pool), which does NOT fit on a GitHub-hosted runner. It therefore runs on a
+# self-hosted runner labelled `clickbench`. Mirrors the GitLab `clickbench-nightly` job.
+#
+# DORMANT BY DESIGN: this is workflow_dispatch-only, so it never auto-runs and costs nothing
+# until you (a) stand up + register the runner — see deploy/ci-runner/README.md — and (b)
+# manually click "Run workflow". With no `clickbench`-labelled runner registered, a manual run
+# just sits queued (self-hosted minutes are free); it cannot launch any EC2 capacity on its own.
+#
+# To make it nightly once a runner exists, uncomment the schedule block below.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 7 * * *"   # 07:00 UTC nightly — enable only after a runner is registered
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+concurrency:
+  group: clickbench
+  cancel-in-progress: false
+
+jobs:
+  clickbench:
+    name: ClickBench 43 queries vs Sail
+    # Only a runner advertising ALL these labels picks this up. Register the EC2 runner with:
+    #   ./config.sh --labels self-hosted,linux,x64,clickbench --ephemeral ...
+    runs-on: [self-hosted, linux, x64, clickbench]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version && cargo --version
+      # Builds weft, fetches hits.parquet if absent, runs all 43 queries over live gRPC.
+      - name: benchmark
+        run: ./bench/clickbench/benchmark.sh
+      # Fail if Weft's total hot time is not under Sail's published 56.3 s.
+      - name: assert Weft beats Sail
+        run: ./bench/clickbench/assert-beats-sail.sh 56.3
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickbench-results
+          path: bench/clickbench/results/
+          if-no-files-found: ignore
