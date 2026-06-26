@@ -1,0 +1,11 @@
+# Patterns to ignore when packaging the chart (`helm package`).
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.bak
+*.swp
+*.orig
+.idea/
+.vscode/
+# examples/ and README.md are intentionally packaged (operator reference material).

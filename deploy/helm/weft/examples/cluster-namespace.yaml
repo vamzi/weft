@@ -1,0 +1,405 @@
+# =====================================================================================================
+# REFERENCE: the exact object graph the weft-gateway applies for ONE compute cluster.
+#
+# This is documentation, not a Helm template — it is the rendered shape for cluster id "demo"
+# (namespace weft-cl-demo), gateway running as ServiceAccount weft-gateway in namespace weft-system,
+# and the cluster-manage ClusterRole named "weft-cluster-manage". The gateway stamps an equivalent
+# graph, per user, at runtime. Reproduce it with values via:
+#   helm template weft deploy/helm/weft --set clusterReference.render=true -s templates/cluster-reference.yaml
+#
+# Hardening invariants enforced on every cluster:
+#   - Namespace: pod-security.kubernetes.io/enforce=restricted
+#   - Pods: runAsNonRoot, readOnlyRootFilesystem, drop ALL caps, seccomp RuntimeDefault,
+#           automountServiceAccountToken=false
+#   - Network: default-deny + a narrow egress allowlist (DNS, S3, Glue, HMS)
+#   - Quotas: ResourceQuota + LimitRange
+#   - Identity: IRSA ServiceAccount; catalog creds via Secrets Store CSI mounted at mode 0400
+# =====================================================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/cluster-id: "demo"
+    # The restricted Pod Security Standard is enforced by the namespace itself, independent of RBAC.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Per-cluster workload identity (IRSA). No token is mounted into pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: weft-cluster
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/weft-cluster
+automountServiceAccountToken: false
+---
+# The gateway grants ITSELF management of THIS namespace only. Until this RoleBinding exists the
+# gateway has no standing access to the namespace's Deployments/Services/etc. — least privilege.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: weft-gateway-manage
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: weft-cluster-manage
+subjects:
+  - kind: ServiceAccount
+    name: weft-gateway
+    namespace: weft-system
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: weft-cluster-quota
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 32Gi
+    limits.cpu: "16"
+    limits.memory: 64Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: weft-cluster-limits
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 2Gi
+      defaultRequest:
+        cpu: 250m
+        memory: 512Mi
+      max:
+        cpu: "8"
+        memory: 32Gi
+---
+# Default-deny all ingress and egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# Narrow allowlist on top of default-deny.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weft-cluster-allow
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Spark Connect, only from the gateway namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: weft-system
+      ports:
+        - port: 50051
+          protocol: TCP
+    # Driver <-> worker within the namespace.
+    - from:
+        - podSelector: {}
+  egress:
+    # DNS (CoreDNS) only.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Driver <-> worker within the namespace.
+    - to:
+        - podSelector: {}
+    # S3 (object store).
+    - to:
+        - ipBlock:
+            cidr: "52.216.0.0/15"
+        - ipBlock:
+            cidr: "16.182.0.0/16"
+      ports:
+        - port: 443
+          protocol: TCP
+    # AWS Glue Data Catalog.
+    - to:
+        - ipBlock:
+            cidr: "10.0.0.0/8"
+      ports:
+        - port: 443
+          protocol: TCP
+    # Hive Metastore.
+    - to:
+        - ipBlock:
+            cidr: "10.0.0.0/8"
+      ports:
+        - port: 9083
+          protocol: TCP
+---
+# Secrets Store CSI: pull catalog credentials from AWS Secrets Manager and sync to a Secret so the
+# file can be mounted read-only at mode 0400. The CSI volume mount drives the sync.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: weft-catalog-creds
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "arn:aws:secretsmanager:us-west-2:123456789012:secret:weft/catalog-creds"
+        objectType: secretsmanager
+        objectAlias: "catalog.json"
+  secretObjects:
+    - secretName: weft-catalog-creds
+      type: Opaque
+      data:
+        - objectName: "catalog.json"
+          key: "catalog.json"
+---
+# Spark Connect driver (`weft spark server`).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weft-driver
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: driver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: weft
+      app.kubernetes.io/component: cluster
+      weft.io/role: driver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: weft
+        app.kubernetes.io/component: cluster
+        weft.io/role: driver
+    spec:
+      serviceAccountName: weft-cluster
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: connect-server
+          image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/weft/connect-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["weft"]
+          args: ["spark", "server", "--port", "50051"]
+          ports:
+            - name: spark
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: AWS_REGION
+              value: "us-west-2"
+            - name: HOME
+              value: /tmp
+            - name: WEFT_CATALOG_CONF
+              value: /etc/weft/catalog/catalog.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: spill
+              mountPath: /var/weft/spill
+            - name: catalog-creds
+              mountPath: /etc/weft/catalog
+              readOnly: true
+            - name: csi-secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: spill
+          emptyDir: {}
+        # 0400 == decimal 256.
+        - name: catalog-creds
+          secret:
+            secretName: weft-catalog-creds
+            defaultMode: 256
+        - name: csi-secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: weft-catalog-creds
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-driver
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: driver
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: driver
+  ports:
+    - name: spark
+      port: 50051
+      targetPort: spark
+      protocol: TCP
+---
+# Headless service fronting the worker StatefulSet (Arrow Flight shuffle).
+apiVersion: v1
+kind: Service
+metadata:
+  name: weft-worker
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: worker
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: worker
+  ports:
+    - name: flight
+      port: 8815
+      targetPort: flight
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: weft-worker
+  namespace: weft-cl-demo
+  labels:
+    app.kubernetes.io/part-of: weft
+    app.kubernetes.io/component: cluster
+    weft.io/role: worker
+spec:
+  serviceName: weft-worker
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: weft
+      app.kubernetes.io/component: cluster
+      weft.io/role: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: weft
+        app.kubernetes.io/component: cluster
+        weft.io/role: worker
+    spec:
+      serviceAccountName: weft-cluster
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/weft/worker:latest
+          imagePullPolicy: IfNotPresent
+          command: ["weft"]
+          args: ["worker", "--port", "8815"]
+          ports:
+            - name: flight
+              containerPort: 8815
+              protocol: TCP
+          env:
+            - name: AWS_REGION
+              value: "us-west-2"
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: spill
+              mountPath: /var/weft/spill
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: spill
+          emptyDir: {}
