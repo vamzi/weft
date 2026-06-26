@@ -774,15 +774,127 @@ fn ec2_user_data(weft_url: &str, region: &str, catalog_conf: &str) -> String {
     )
 }
 
-/// Materialize a cluster into a real Spark Connect server process and advance its state. On EKS the
-/// operator would create driver + worker pods here; on this single node it spawns a `weft spark
-/// server` on an allocated port — a genuine, connectable endpoint.
+/// Whether the Kubernetes orchestrator backend is selected (`WEFT_ORCHESTRATOR=k8s`).
+fn orchestrator_is_k8s() -> bool {
+    std::env::var("WEFT_ORCHESTRATOR").as_deref() == Ok("k8s")
+}
+
+/// Materialize a cluster into real compute and advance its state. The backend is selected at runtime:
+/// `k8s` applies hardened pod manifests via the orchestrator (no shell), otherwise a real EC2 instance
+/// (when configured) or a local `weft spark server` process for dev — same lifecycle states.
 async fn provision(st: AppState, id: String) {
     st.set_state(&id, Phase::Provisioning, None);
-    if st.ec2.as_ref().is_some() {
+    if orchestrator_is_k8s() {
+        provision_k8s(st, id).await;
+    } else if st.ec2.as_ref().is_some() {
         provision_ec2(st, id).await;
     } else {
         provision_process(st, id).await;
+    }
+}
+
+/// Map a `worker_size` class to per-pod CPU/memory.
+fn pod_resources_for(size: &str) -> (String, String) {
+    match size {
+        "small" => ("1".into(), "2Gi".into()),
+        "medium" => ("2".into(), "4Gi".into()),
+        "large" => ("4".into(), "8Gi".into()),
+        "xlarge" => ("8".into(), "16Gi".into()),
+        _ => ("1".into(), "2Gi".into()),
+    }
+}
+
+/// The attached-catalog config as typed `(key, value)` pairs (the inert form the orchestrator
+/// serializes into a ConfigMap value — never a shell token).
+fn cluster_catalog_pairs(st: &AppState, default_region: &str) -> Vec<(String, String)> {
+    let conns = st.connections.lock().unwrap();
+    let mut pairs = Vec::new();
+    for c in conns.iter() {
+        let p = format!("spark.sql.catalog.{}", c.name);
+        pairs.push((format!("{p}.type"), c.kind.clone()));
+        match c.kind.as_str() {
+            "glue" => {
+                let region = c
+                    .options
+                    .get("region")
+                    .map(String::as_str)
+                    .unwrap_or(default_region);
+                pairs.push((format!("{p}.region"), region.to_string()));
+            }
+            "hive" => {
+                if let Some(uri) = c.options.get("uri") {
+                    pairs.push((format!("{p}.uri"), uri.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// Provision a cluster as hardened Kubernetes pods via the orchestrator. The driver/worker images,
+/// region, IRSA role, egress allowlist, and CSI secret class come from operator config (env), never
+/// a request body; the catalog config is passed as inert typed pairs.
+async fn provision_k8s(st: AppState, id: String) {
+    use weft_orchestrator::{ClusterBackend, ClusterSpec, K8sBackend};
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".into());
+    let (size, worker_min, worker_max) = {
+        let clusters = st.clusters.lock().unwrap();
+        clusters
+            .get(&id)
+            .map(|c| (c.worker_size.clone(), c.worker_min, c.worker_max))
+            .unwrap_or_else(|| ("small".into(), 1, 1))
+    };
+    let (cpu, memory) = pod_resources_for(&size);
+    let image =
+        std::env::var("WEFT_CLUSTER_IMAGE").unwrap_or_else(|_| "weft/connect-server:latest".into());
+    let worker_image = std::env::var("WEFT_WORKER_IMAGE").unwrap_or_else(|_| image.clone());
+    // IRSA role ARN is derived server-side from an operator prefix + the cluster id, so a request can
+    // never bind another tenant's identity.
+    let iam_role_arn = std::env::var("WEFT_CLUSTER_IRSA_ROLE_PREFIX")
+        .ok()
+        .map(|p| format!("{p}{id}"));
+    let egress_cidrs = std::env::var("WEFT_CLUSTER_EGRESS_CIDRS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = ClusterSpec {
+        id: id.clone(),
+        image,
+        worker_image,
+        region: region.clone(),
+        port: 50051,
+        worker_min,
+        worker_max,
+        cpu,
+        memory,
+        service_account: format!("weft-cl-{id}"),
+        iam_role_arn,
+        catalog_conf: cluster_catalog_pairs(&st, &region),
+        secret_provider_class: std::env::var("WEFT_CLUSTER_SECRET_CLASS").ok(),
+        egress_cidrs,
+    };
+    st.add_event(
+        &id,
+        "Applying Kubernetes manifests (namespace, hardened pods, NetworkPolicy, IRSA)",
+    );
+    match K8sBackend::from_env().provision(&spec).await {
+        Ok(()) => {
+            // The driver's readiness probe gates real traffic; a production reconcile loop would gate
+            // the RUNNING transition on EndpointSlice readiness. The endpoint is stable Service DNS.
+            let endpoint = spec.endpoint();
+            st.set_state(&id, Phase::Running, Some(endpoint.clone()));
+            st.add_event(&id, format!("Cluster RUNNING — Spark Connect endpoint {endpoint}"));
+        }
+        Err(e) => {
+            st.set_state(&id, Phase::Error, None);
+            st.add_event(&id, format!("Kubernetes provisioning failed: {e}"));
+        }
     }
 }
 
@@ -1138,8 +1250,15 @@ async fn stop_cluster(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// Kill the OS process backing a cluster, if any.
+/// Tear down the compute backing a cluster. Under the Kubernetes backend this deletes the cluster's
+/// namespace (cascade-GCs the workload); it also removes any local process / EC2 runtime handle.
 async fn kill_runtime(st: &AppState, id: &str) {
+    if orchestrator_is_k8s() {
+        use weft_orchestrator::ClusterBackend;
+        if let Err(e) = weft_orchestrator::K8sBackend::from_env().terminate(id).await {
+            st.add_event(id, format!("Kubernetes teardown error: {e}"));
+        }
+    }
     let rt = st.runtimes.lock().await.remove(id);
     match rt {
         Some(ClusterRuntime::Process(mut child)) => {

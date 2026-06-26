@@ -15,6 +15,7 @@ path = "src/main.rs"
 weft-common = { workspace = true }
 weft-meta = { workspace = true }
 weft-govern = { workspace = true }
+weft-orchestrator = { workspace = true }
 weft-clustermgr = { workspace = true }
 weft-loom = { workspace = true }
 weft-sql = { workspace = true }
