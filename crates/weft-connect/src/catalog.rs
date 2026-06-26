@@ -71,9 +71,15 @@ pub fn build_provider(
                 .map_err(err_to_status)?;
             Ok(Arc::new(cat))
         }
-        // Future: "rest" (Iceberg REST / Unity), "glue".
+        "glue" => {
+            // Credentials come from the instance role (IMDS); `region` (default us-west-2) and an
+            // optional `aws_bin` arrive as `spark.sql.catalog.<name>.{region,aws_bin}`.
+            let cat = weft_catalog_glue::GlueCatalog::from_config(name, options);
+            Ok(Arc::new(cat))
+        }
+        // Future: "rest" (Iceberg REST / Unity).
         other => Err(Status::unimplemented(format!(
-            "catalog type `{other}` is not supported yet (have: hive)"
+            "catalog type `{other}` is not supported yet (have: hive, glue)"
         ))),
     }
 }

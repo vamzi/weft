@@ -11,8 +11,10 @@
 mod thrift;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use weft_catalog::hive_types::columns_to_schema;
 use weft_catalog::{CatalogProvider, Error, Result, TableFormat, TableMetadata};
 
 use thrift::{HiveTable, MetastoreClient};
@@ -92,10 +94,22 @@ impl CatalogProvider for HiveCatalog {
             Error::Plan(format!("hive table `{db}.{table}` has no storage location"))
         })?;
         let format = detect_format(&t)?;
-        Ok(
-            TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
-                .with_partition_columns(t.partition_columns.clone()),
-        )
+
+        // The Hive-declared schema (data columns then partition columns) is authoritative when
+        // fully mappable: the engine then reads files *against* it, casting physically-mismatched
+        // column types at scan time instead of failing schema inference's strict "merge" check.
+        // If any column has a type we can't faithfully map (or there are no columns), we leave
+        // `schema = None` and fall back to data-file inference — never a partial, position-shifting
+        // schema.
+        let schema_cols = t.columns.iter().chain(t.partition_typed.iter()).cloned();
+        let schema = columns_to_schema(schema_cols);
+
+        let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
+            .with_partition_columns(t.partition_columns.clone());
+        Ok(match schema {
+            Some(s) => md.with_schema(Arc::new(s)),
+            None => md,
+        })
     }
 }
 
