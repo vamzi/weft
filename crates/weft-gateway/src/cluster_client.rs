@@ -19,10 +19,10 @@ const MAX_MSG: usize = 256 * 1024 * 1024;
 
 /// Run `sql` on the cluster at `endpoint` (an `sc://host:port` or `http://host:port` address) over
 /// Spark Connect, returning the decoded result batches. `session_id` scopes the Spark Connect session
-/// to the calling principal (per-user, not a single shared id) so sessions, temp views, and caches
-/// are isolated across users. Stops reading once `max_rows` have been collected (dropping the stream
-/// cancels the RPC) so an unbounded `SELECT *` can't OOM the gateway. Errors surface the gRPC/engine
-/// message.
+/// so each principal gets a distinct session (temp views / caches / config are isolated across users)
+/// — replacing the single hardcoded id every caller used to share. Stops reading once `max_rows` have
+/// been collected (dropping the stream cancels the RPC) so an unbounded `SELECT *` can't OOM the
+/// gateway. Errors surface the gRPC/engine message.
 pub async fn run_sql_on_cluster(
     endpoint: &str,
     session_id: &str,

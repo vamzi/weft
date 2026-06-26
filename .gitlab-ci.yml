@@ -45,6 +45,18 @@ correctness-check:
   stage: test
   script: ["cargo run -p weft-bench -- correctness --rows 5000"]
 
+# Spark SQL parity gate: replay Apache Spark's own golden SQL tests through weft and ratchet
+# against parity/baseline.json — parity can only hold or improve, never regress. Publishes the
+# scoreboard (parity.html + parity.json) and the triage report as artifacts.
+spark-parity:
+  stage: test
+  script:
+    - cargo run --release -p weft-spark-compat --bin weft-parity -- ratchet --baseline parity/baseline.json --out-dir parity
+  artifacts:
+    when: always
+    paths: ["parity/"]
+    expire_in: 30 days
+
 # Correctness gate: run ClickBench 43 + TPC-H subset, diff results vs a Spark/DuckDB oracle.
 # (Enabled once weft-loom executes queries — Phase 0.)
 correctness:

