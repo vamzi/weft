@@ -20,15 +20,15 @@ use std::time::{Duration, Instant};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::http::StatusCode;
-use axum::Json;
+use axum::{Extension, Json};
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::server::AppState;
+use crate::server::{AppState, Claims};
 
 /// How long a pending PKCE/state entry lives before it's pruned (the user must complete the
 /// redirect dance within this window).
@@ -84,10 +84,151 @@ impl OidcConfig {
                 .unwrap_or_else(|| "SSO".into()),
         })
     }
+
+    /// Build from explicit fields (the admin runtime-config path). Optional claim/label fields fall
+    /// back to the documented defaults when empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        issuer: String,
+        client_id: String,
+        client_secret: String,
+        redirect_url: String,
+        groups_claim: Option<String>,
+        username_claim: Option<String>,
+        provider_label: Option<String>,
+    ) -> Self {
+        Self {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_url,
+            groups_claim: groups_claim
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_groups_claim),
+            username_claim: username_claim
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_username_claim),
+            provider_label: provider_label
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_provider_label),
+        }
+    }
+}
+
+fn default_groups_claim() -> String {
+    "cognito:groups".into()
+}
+fn default_username_claim() -> String {
+    "email".into()
+}
+fn default_provider_label() -> String {
+    "SSO".into()
+}
+
+/// The serializable form of [`OidcConfig`] for DynamoDB persistence. Carries **all** fields including
+/// the client secret (the persisted blob is trusted control-plane state, never returned to clients).
+/// An `enabled: false` marker (no other fields) records that SSO was explicitly disabled, so a
+/// previously-configured env seed doesn't silently re-enable it on the next restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredOidc {
+    /// Whether SSO is configured/enabled. `false` → a disabled marker; the other fields are ignored.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default)]
+    pub redirect_url: String,
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    #[serde(default = "default_username_claim")]
+    pub username_claim: String,
+    #[serde(default = "default_provider_label")]
+    pub provider_label: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl StoredOidc {
+    /// The explicit "SSO is disabled" marker persisted on `DELETE /api/admin/sso`.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_url: String::new(),
+            groups_claim: default_groups_claim(),
+            username_claim: default_username_claim(),
+            provider_label: default_provider_label(),
+        }
+    }
+}
+
+impl From<&OidcConfig> for StoredOidc {
+    fn from(c: &OidcConfig) -> Self {
+        Self {
+            enabled: true,
+            issuer: c.issuer.clone(),
+            client_id: c.client_id.clone(),
+            client_secret: c.client_secret.clone(),
+            redirect_url: c.redirect_url.clone(),
+            groups_claim: c.groups_claim.clone(),
+            username_claim: c.username_claim.clone(),
+            provider_label: c.provider_label.clone(),
+        }
+    }
+}
+
+impl StoredOidc {
+    /// Reconstruct the in-memory [`OidcConfig`] from a stored blob, or `None` for a disabled marker
+    /// (or a blob missing the required issuer/client fields).
+    pub fn into_config(self) -> Option<OidcConfig> {
+        if !self.enabled
+            || self.issuer.is_empty()
+            || self.client_id.is_empty()
+            || self.redirect_url.is_empty()
+        {
+            return None;
+        }
+        Some(OidcConfig {
+            issuer: self.issuer,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            redirect_url: self.redirect_url,
+            groups_claim: self.groups_claim,
+            username_claim: self.username_claim,
+            provider_label: self.provider_label,
+        })
+    }
 }
 
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
+}
+
+/// Derive the `/api/auth/callback` redirect URL the IdP must be configured with, from
+/// `WEFT_PUBLIC_BASE` (trailing slash trimmed). Empty base → a relative `/api/auth/callback`.
+pub(crate) fn callback_url() -> String {
+    let base = std::env::var("WEFT_PUBLIC_BASE")
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    format!("{base}/api/auth/callback")
+}
+
+/// 403 unless the principal is in the `admins` group. Used to gate the admin config surface.
+pub(crate) fn require_admin(claims: &Claims) -> Result<(), (StatusCode, String)> {
+    if claims.groups.iter().any(|g| g == "admins") {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin privileges required".into()))
+    }
 }
 
 // ───────────────────────────────── Pending-auth (PKCE/state) store ──────────────────────────────
@@ -228,7 +369,8 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// `GET /api/auth/config` (PUBLIC): whether SSO is configured + the provider label, so the SPA can
 /// render the SSO button conditionally.
 pub async fn auth_config(State(st): State<AppState>) -> Json<serde_json::Value> {
-    let (enabled, label) = match st.oidc().as_ref() {
+    let cfg = st.oidc().read().unwrap().clone();
+    let (enabled, label) = match cfg {
         Some(cfg) => (true, cfg.provider_label.clone()),
         None => (false, "SSO".to_string()),
     };
@@ -238,7 +380,7 @@ pub async fn auth_config(State(st): State<AppState>) -> Json<serde_json::Value> 
 /// `GET /api/auth/sso/login` (PUBLIC): begin the OIDC PKCE flow. 503 if SSO disabled; otherwise
 /// 302-redirect to the IdP's authorization endpoint (scopes `openid email profile`).
 pub async fn sso_login(State(st): State<AppState>) -> Response {
-    let Some(cfg) = st.oidc().as_ref().clone() else {
+    let Some(cfg) = st.oidc().read().unwrap().clone() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "SSO not configured").into_response();
     };
     let metadata = match discover_metadata(&st, &cfg).await {
@@ -312,7 +454,7 @@ async fn callback_inner(st: &AppState, q: CallbackQuery) -> Result<String, Strin
     if let Some(err) = q.error {
         return Err(sanitize_reason(&err));
     }
-    let cfg = st.oidc().as_ref().clone().ok_or("sso_disabled")?;
+    let cfg = st.oidc().read().unwrap().clone().ok_or("sso_disabled")?;
     let code = q.code.ok_or("missing_code")?;
     let state = q.state.ok_or("missing_state")?;
     // Single-use: look up + remove the pending entry (CSRF/replay protection).
@@ -356,6 +498,150 @@ async fn callback_inner(st: &AppState, q: CallbackQuery) -> Result<String, Strin
 
     st.issue_token(&identity.username, &identity.groups)
         .ok_or_else(|| "token_error".to_string())
+}
+
+// ──────────────────────────────────── Admin runtime config ─────────────────────────────────────
+
+/// `PUT /api/admin/sso` body: the admin-supplied OIDC settings. `client_secret` may be empty/omitted
+/// when editing an existing config (the stored secret is then reused). The `redirect_url` is *not*
+/// accepted from the client — it's derived from `WEFT_PUBLIC_BASE` so it always matches this origin.
+#[derive(Debug, Deserialize)]
+pub struct SsoConfigInput {
+    /// The IdP issuer URL.
+    pub issuer: String,
+    /// The registered OAuth client id.
+    pub client_id: String,
+    /// The OAuth client secret. Empty/omitted on edit → reuse the existing secret.
+    #[serde(default)]
+    pub client_secret: String,
+    /// Optional human label for the SSO button.
+    #[serde(default)]
+    pub provider_label: Option<String>,
+    /// Optional id_token claim for groups (default `cognito:groups`).
+    #[serde(default)]
+    pub groups_claim: Option<String>,
+    /// Optional id_token claim for the username (default `email`).
+    #[serde(default)]
+    pub username_claim: Option<String>,
+}
+
+/// `GET /api/admin/sso` (ADMIN): the current SSO config for the admin panel. **Never** includes the
+/// client secret — only `has_secret` signals whether one is stored. `callback_url` is the redirect
+/// URI the admin must register at the IdP.
+pub async fn get_sso(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&claims)?;
+    let cfg = st.oidc().read().unwrap().clone();
+    let body = match cfg {
+        Some(c) => serde_json::json!({
+            "enabled": true,
+            "issuer": c.issuer,
+            "client_id": c.client_id,
+            "provider_label": c.provider_label,
+            "groups_claim": c.groups_claim,
+            "username_claim": c.username_claim,
+            "has_secret": !c.client_secret.is_empty(),
+            "callback_url": callback_url(),
+        }),
+        None => serde_json::json!({
+            "enabled": false,
+            "issuer": "",
+            "client_id": "",
+            "provider_label": default_provider_label(),
+            "groups_claim": default_groups_claim(),
+            "username_claim": default_username_claim(),
+            "has_secret": false,
+            "callback_url": callback_url(),
+        }),
+    };
+    Ok(Json(body))
+}
+
+/// `PUT /api/admin/sso` (ADMIN): set/replace the SSO config. Validates the issuer by running OIDC
+/// discovery (400 on failure), reuses the stored secret if the body omits one, swaps the config into
+/// the live `RwLock`, clears the discovery cache (so the next login rediscovers the new issuer), and
+/// persists to DynamoDB.
+pub async fn put_sso(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<SsoConfigInput>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_admin(&claims)?;
+    let issuer = input.issuer.trim().to_string();
+    let client_id = input.client_id.trim().to_string();
+    if issuer.is_empty() || client_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "issuer and client_id are required".into(),
+        ));
+    }
+
+    // Secret-reuse: if the body omits a secret and a config already exists, keep the stored one.
+    let existing_secret = st
+        .oidc()
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.client_secret.clone());
+    let client_secret = if input.client_secret.trim().is_empty() {
+        existing_secret.filter(|s| !s.is_empty()).ok_or((
+            StatusCode::BAD_REQUEST,
+            "client_secret is required (no existing secret to reuse)".to_string(),
+        ))?
+    } else {
+        input.client_secret.trim().to_string()
+    };
+
+    let cfg = OidcConfig::from_parts(
+        issuer,
+        client_id,
+        client_secret,
+        callback_url(),
+        input.groups_claim,
+        input.username_claim,
+        input.provider_label,
+    );
+
+    // Validate the issuer by actually discovering it (the same path login uses), uncached.
+    discover_uncached(&cfg)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("could not discover OIDC issuer: {e}")))?;
+
+    // Swap into the live config, invalidate the cached metadata, persist.
+    *st.oidc().write().unwrap() = Some(cfg.clone());
+    *st.oidc_meta().lock().unwrap() = None;
+    st.save_sso();
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "callback_url": callback_url(),
+    })))
+}
+
+/// `DELETE /api/admin/sso` (ADMIN): disable SSO. Clears the live config + discovery cache and
+/// persists the disabled marker so it stays off across restarts (even if env vars are still set).
+pub async fn delete_sso(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&claims)?;
+    *st.oidc().write().unwrap() = None;
+    *st.oidc_meta().lock().unwrap() = None;
+    st.save_sso();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Run OIDC discovery against `cfg.issuer` **without** touching the shared cache — used to validate
+/// an admin-supplied issuer before committing it.
+async fn discover_uncached(cfg: &OidcConfig) -> Result<(), String> {
+    let http = http_client()?;
+    let issuer = IssuerUrl::new(cfg.issuer.clone()).map_err(|e| format!("issuer url: {e}"))?;
+    CoreProviderMetadata::discover_async(issuer, &http)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(())
 }
 
 /// Decode the **payload** (claims) of a compact JWT (`header.payload.signature`) into JSON, *without*
@@ -530,5 +816,71 @@ mod tests {
     fn sanitize_reason_strips_unsafe_chars() {
         assert_eq!(sanitize_reason("access_denied"), "access_denied");
         assert_eq!(sanitize_reason("Bad Request! <xss>"), "badrequestxss");
+    }
+
+    #[test]
+    fn from_parts_applies_defaults() {
+        let cfg = OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "secret".into(),
+            "https://app/api/auth/callback".into(),
+            None,
+            Some(String::new()), // empty → default
+            Some("Okta".into()),
+        );
+        assert_eq!(cfg.groups_claim, "cognito:groups");
+        assert_eq!(cfg.username_claim, "email");
+        assert_eq!(cfg.provider_label, "Okta");
+    }
+
+    #[test]
+    fn stored_oidc_round_trips() {
+        let cfg = OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "topsecret".into(),
+            "https://app/api/auth/callback".into(),
+            Some("groups".into()),
+            Some("preferred_username".into()),
+            Some("Okta".into()),
+        );
+        let stored = StoredOidc::from(&cfg);
+        let json = serde_json::to_string(&stored).unwrap();
+        // The secret is part of the persisted blob (trusted control-plane state).
+        assert!(json.contains("topsecret"));
+        let back: StoredOidc = serde_json::from_str(&json).unwrap();
+        let cfg2 = back.into_config().expect("enabled");
+        assert_eq!(cfg2.issuer, cfg.issuer);
+        assert_eq!(cfg2.client_id, cfg.client_id);
+        assert_eq!(cfg2.client_secret, "topsecret");
+        assert_eq!(cfg2.groups_claim, "groups");
+        assert_eq!(cfg2.username_claim, "preferred_username");
+        assert_eq!(cfg2.provider_label, "Okta");
+    }
+
+    #[test]
+    fn stored_oidc_disabled_marker_yields_none() {
+        let stored = StoredOidc::disabled();
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredOidc = serde_json::from_str(&json).unwrap();
+        assert!(back.into_config().is_none());
+    }
+
+    #[test]
+    fn require_admin_gates_on_group() {
+        let admin = Claims {
+            sub: "a".into(),
+            groups: vec!["admins".into()],
+            exp: 0,
+        };
+        let user = Claims {
+            sub: "u".into(),
+            groups: vec!["analysts".into()],
+            exp: 0,
+        };
+        assert!(require_admin(&admin).is_ok());
+        let err = require_admin(&user).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }

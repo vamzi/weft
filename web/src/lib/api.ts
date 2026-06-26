@@ -444,6 +444,38 @@ export interface GrantInput {
   effect: GrantEffect;
 }
 
+// Admin: SSO / OIDC configuration (LIVE) ------------------------------------
+
+/**
+ * Current SSO configuration, as `GET /api/admin/sso` returns it. The client
+ * secret is NEVER returned — `has_secret` tells the UI whether one is already
+ * stored (so the form can offer "leave blank to keep current").
+ */
+export interface SsoConfig {
+  enabled: boolean;
+  issuer: string;
+  client_id: string;
+  provider_label: string;
+  groups_claim: string;
+  username_claim: string;
+  has_secret: boolean;
+  /** The redirect URI to register at the IdP. */
+  callback_url: string;
+}
+
+/**
+ * Body for `PUT /api/admin/sso`. Leave `client_secret` blank to keep the
+ * existing secret when one is already stored.
+ */
+export interface SsoConfigInput {
+  issuer: string;
+  client_id: string;
+  client_secret: string;
+  provider_label?: string;
+  groups_claim?: string;
+  username_claim?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Transport — single chokepoint so going live is a one-line change per path.
 // ---------------------------------------------------------------------------
@@ -481,13 +513,35 @@ async function request<T>(
     throw new Error("unauthorized");
   }
   if (!res.ok) {
-    throw new Error(`${method} ${path} → ${res.status} ${res.statusText}`);
+    // Surface the gateway's error message when it sends one (JSON `{error|message}`
+    // or a plain-text body), so callers can show it verbatim (e.g. SSO discovery
+    // failures). Fall back to the status line when there's no useful body.
+    const body = await res.text().catch(() => "");
+    throw new Error(extractError(body) ?? `${method} ${path} → ${res.status} ${res.statusText}`);
   }
 
   // 204 / empty body → no JSON to parse.
   if (res.status === 204) return undefined as T;
   const text = await res.text();
   return (text ? JSON.parse(text) : undefined) as T;
+}
+
+/**
+ * Pull a human-readable message out of an error response body. Handles the
+ * gateway's `{ error }` / `{ message }` JSON shapes and plain-text bodies;
+ * returns `undefined` for an empty body so the caller can fall back.
+ */
+function extractError(body: string): string | undefined {
+  const trimmed = body.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: string; message?: string };
+    const msg = parsed.error ?? parsed.message;
+    if (msg) return msg;
+  } catch {
+    // not JSON — fall through to the raw text
+  }
+  return trimmed;
 }
 
 const delay = (ms = 250) => new Promise((r) => setTimeout(r, ms));
@@ -881,6 +935,25 @@ export const api = {
   /** POST /api/admin/groups */
   async createGroup(input: CreateGroupInput): Promise<void> {
     await request<void>("POST", "/api/admin/groups", input);
+  },
+
+  /** GET /api/admin/sso — current SSO/OIDC config (secret never returned). */
+  async getSsoConfig(): Promise<SsoConfig> {
+    return request("GET", "/api/admin/sso");
+  },
+
+  /**
+   * PUT /api/admin/sso — save & enable SSO. Returns `{ enabled, callback_url }`
+   * on success; throws (400) with the gateway's message on bad config (e.g.
+   * issuer discovery failed). Leave `client_secret` blank to keep the current one.
+   */
+  async putSsoConfig(input: SsoConfigInput): Promise<{ enabled: boolean; callback_url: string }> {
+    return request("PUT", "/api/admin/sso", input);
+  },
+
+  /** DELETE /api/admin/sso — disable SSO (204). */
+  async deleteSsoConfig(): Promise<void> {
+    await request<void>("DELETE", "/api/admin/sso");
   },
 
   /** GET /api/grants */

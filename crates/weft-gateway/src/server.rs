@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Request, State};
@@ -28,7 +28,7 @@ use weft_loom::Engine;
 
 use crate::cloud;
 use crate::cluster_client;
-use crate::oidc::{self, OidcConfig, PendingStore};
+use crate::oidc::{self, OidcConfig, PendingStore, StoredOidc};
 use crate::scim;
 use openidconnect::core::CoreProviderMetadata;
 use weft_catalog_glue::GlueCatalog;
@@ -238,8 +238,9 @@ pub struct AppState {
     last_activity: Arc<Mutex<HashMap<String, u64>>>,
     /// Seconds of inactivity before a running cluster is auto-terminated (0 = never).
     idle_secs: u64,
-    /// External-IdP OIDC SSO config (from env). `None` → SSO disabled.
-    oidc: Arc<Option<OidcConfig>>,
+    /// External-IdP OIDC SSO config. Runtime-mutable by an admin (`/api/admin/sso`); `None` → SSO
+    /// disabled. Seeded from env at startup, then overridden by the persisted DynamoDB blob if any.
+    oidc: Arc<RwLock<Option<OidcConfig>>>,
     /// In-flight OIDC PKCE/state entries (keyed by the `state` handed to the IdP).
     oidc_pending: Arc<Mutex<PendingStore>>,
     /// Discovered OIDC provider metadata, cached after the first `/.well-known` fetch.
@@ -321,7 +322,7 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
-            oidc: Arc::new(OidcConfig::from_env()),
+            oidc: Arc::new(RwLock::new(OidcConfig::from_env())),
             oidc_pending: Arc::new(Mutex::new(PendingStore::default())),
             oidc_meta: Arc::new(Mutex::new(None)),
             scim_token: Arc::new(
@@ -335,8 +336,9 @@ impl AppState {
 
     // ── SSO / SCIM accessors (let the `oidc`/`scim` modules reach private state) ──
 
-    /// The OIDC SSO config (`None` if SSO is disabled).
-    pub(crate) fn oidc(&self) -> &Arc<Option<OidcConfig>> {
+    /// The runtime-mutable OIDC SSO config (`None` if SSO is disabled). Readers take a read lock and
+    /// **clone** the config out before any `.await` (never hold the guard across an await point).
+    pub(crate) fn oidc(&self) -> &Arc<RwLock<Option<OidcConfig>>> {
         &self.oidc
     }
     /// The in-flight OIDC PKCE/state store.
@@ -397,6 +399,18 @@ impl AppState {
             "groups".into(),
             body,
         ));
+    }
+
+    /// Persist the current SSO config (DynamoDB key `sso`). Serializes the live [`OidcConfig`] as a
+    /// [`StoredOidc`] blob (secret included — trusted control-plane state), or a disabled marker when
+    /// SSO is off, so the disabled state survives restarts even with env vars still set.
+    pub(crate) fn save_sso(&self) {
+        let stored = match self.oidc.read().unwrap().as_ref() {
+            Some(cfg) => StoredOidc::from(cfg),
+            None => StoredOidc::disabled(),
+        };
+        let body = serde_json::to_string(&stored).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "sso".into(), body));
     }
 
     // ── SSO / SCIM store mutations (shared by the `oidc` + `scim` modules) ──
@@ -573,6 +587,14 @@ impl AppState {
                 }
             }
         }
+        // SSO config (DynamoDB key `sso`). If present it wins over the env seed (so an admin's
+        // runtime change — including an explicit *disable* — persists across restarts). Absent →
+        // keep whatever `from_env` seeded at construction (disabled in prod, where env is removed).
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "sso").await {
+            if let Ok(stored) = serde_json::from_str::<StoredOidc>(&body) {
+                *self.oidc.write().unwrap() = stored.into_config();
+            }
+        }
     }
 
     /// Re-adopt persisted clusters after a restart. EC2-backed clusters get their runtime handle
@@ -745,6 +767,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/admin/users", get(list_users).post(create_user))
         .route("/api/admin/groups", get(list_groups).post(create_group))
+        .route(
+            "/api/admin/sso",
+            get(oidc::get_sso).put(oidc::put_sso).delete(oidc::delete_sso),
+        )
         .route(
             "/api/grants",
             get(list_grants).post(create_grant).delete(revoke_grant),
@@ -1473,10 +1499,15 @@ async fn list_users(State(st): State<AppState>) -> Json<Vec<UserDto>> {
     Json(out)
 }
 
-async fn create_user(State(st): State<AppState>, Json(b): Json<CreateUser>) -> StatusCode {
+async fn create_user(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateUser>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     let hash = match bcrypt::hash(&b.password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => return Ok(StatusCode::INTERNAL_SERVER_ERROR),
     };
     st.users.lock().unwrap().insert(
         b.username.clone(),
@@ -1493,7 +1524,7 @@ async fn create_user(State(st): State<AppState>, Json(b): Json<CreateUser>) -> S
             .or_default()
             .push(b.username.clone());
     }
-    StatusCode::CREATED
+    Ok(StatusCode::CREATED)
 }
 
 /// A group as the admin panel lists it.
@@ -1528,9 +1559,14 @@ async fn list_groups(State(st): State<AppState>) -> Json<Vec<GroupDto>> {
     Json(out)
 }
 
-async fn create_group(State(st): State<AppState>, Json(b): Json<CreateGroup>) -> StatusCode {
+async fn create_group(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateGroup>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     st.groups.lock().unwrap().insert(b.name, b.members);
-    StatusCode::CREATED
+    Ok(StatusCode::CREATED)
 }
 
 /// A grant as the admin panel exchanges it (Unity-Catalog model, string-typed for the wire).
@@ -1556,8 +1592,10 @@ async fn list_grants(State(st): State<AppState>) -> Json<Vec<GrantDto>> {
 
 async fn create_grant(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(d): Json<GrantDto>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     let grant = dto_to_grant(&d).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mut grants = st.grants.lock().unwrap();
     if !grants.contains(&grant) {
@@ -1566,13 +1604,18 @@ async fn create_grant(
     Ok(StatusCode::CREATED)
 }
 
-async fn revoke_grant(State(st): State<AppState>, Json(d): Json<GrantDto>) -> StatusCode {
+async fn revoke_grant(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(d): Json<GrantDto>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     match dto_to_grant(&d) {
         Ok(g) => {
             st.grants.lock().unwrap().retain(|x| x != &g);
-            StatusCode::NO_CONTENT
+            Ok(StatusCode::NO_CONTENT)
         }
-        Err(_) => StatusCode::BAD_REQUEST,
+        Err(_) => Ok(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -2600,5 +2643,203 @@ mod tests {
             .map(|m| m["value"].as_str().unwrap())
             .collect();
         assert!(members.contains(&"alice") && members.contains(&"bob"));
+    }
+
+    // ── Admin-gated SSO runtime config ──
+
+    /// A session token for a non-admin principal (group `analysts`, not `admins`).
+    fn non_admin_token(st: &AppState) -> String {
+        st.issue_token("alice", &["analysts".to_string()]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_non_admins() {
+        let st = state();
+        let token = non_admin_token(&st);
+        let auth = format!("Bearer {token}");
+
+        // GET /api/admin/sso → 403 for a non-admin.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // A mutating grant from a non-admin → 403 (gating the existing routes too).
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/api/grants")
+                    .header("authorization", &auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"securable_type":"table","securable_name":"main.s.t","privilege":"SELECT","principal_kind":"group","principal_id":"x","effect":"allow"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sso_config_default_disabled_and_put_bogus_issuer_400() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        std::env::remove_var("WEFT_PUBLIC_BASE");
+        let st = state();
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let auth = format!("Bearer {token}");
+
+        // Fresh state → SSO disabled, public config agrees.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["enabled"], false);
+        assert_eq!(j["has_secret"], false);
+        assert!(j["callback_url"].as_str().unwrap().ends_with("/api/auth/callback"));
+
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], false);
+
+        // PUT with an undiscoverable issuer → 400 with the documented message.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::put("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"issuer":"https://invalid.invalid","client_id":"cid","client_secret":"sec"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let msg = String::from_utf8_lossy(&bytes);
+        assert!(msg.contains("could not discover OIDC issuer"), "got: {msg}");
+
+        // Still disabled after the failed PUT.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn sso_delete_disables_runtime_config() {
+        // Seed a live config directly (bypass discovery) so DELETE has something to turn off.
+        let st = state();
+        *st.oidc().write().unwrap() = Some(crate::oidc::OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "sec".into(),
+            "https://app/api/auth/callback".into(),
+            None,
+            None,
+            Some("Okta".into()),
+        ));
+        // Public config reports it enabled.
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], true);
+
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let auth = format!("Bearer {token}");
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete("/api/admin/sso")
+                    .header("authorization", &auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Now disabled both at the live RwLock and the public config endpoint.
+        assert!(st.oidc().read().unwrap().is_none());
+        let resp = app(st.clone())
+            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["sso_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn get_sso_never_returns_secret() {
+        let st = state();
+        *st.oidc().write().unwrap() = Some(crate::oidc::OidcConfig::from_parts(
+            "https://issuer.example".into(),
+            "cid".into(),
+            "topsecret".into(),
+            "https://app/api/auth/callback".into(),
+            None,
+            None,
+            None,
+        ));
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/sso")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("topsecret"), "secret leaked: {body}");
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(j["has_secret"], true);
+        assert_eq!(j["client_id"], "cid");
+    }
+
+    #[tokio::test]
+    async fn put_sso_empty_secret_no_existing_config_400() {
+        // With no existing config and an omitted secret, the secret-reuse path has nothing to reuse,
+        // so it 400s *before* attempting discovery (a clear message for the admin).
+        let st = state();
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::put("/api/admin/sso")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"issuer":"https://issuer.example","client_id":"cid"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("client_secret is required"));
     }
 }
