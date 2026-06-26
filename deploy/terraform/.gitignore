@@ -1,0 +1,9 @@
+# Terraform local state, provider plugins, and crash logs — never commit these.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+override.tf
+override.tf.json
