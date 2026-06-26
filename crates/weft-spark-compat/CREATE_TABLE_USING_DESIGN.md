@@ -1,4 +1,12 @@
-# CREATE TABLE … USING — faithful lowering design (next iteration's W1)
+# CREATE TABLE … USING — faithful lowering design
+
+> **STATUS (2026-06-26, iteration 2): the non-CTAS subset LANDED** in
+> `crates/weft-loom/src/spark_create_table.rs` (`CREATE TABLE [IF NOT EXISTS] name (cols) USING
+> {parquet|orc|csv|json}` → real `CREATE EXTERNAL TABLE … STORED AS <fmt> LOCATION '<warehouse>/name/'`;
+> INSERT returns empty for Spark's `struct<>`). missing-relation 2,572→900. **Still deferred** (the
+> remaining work this doc specifies): CTAS (`USING fmt AS SELECT`), `PARTITIONED BY`, `OPTIONS`/`LOCATION`,
+> `IDENTIFIER(...)` names, exotic column types (varchar(n)/timestamp_ntz/nested struct) — each returns
+> `None`, keeping the statement failing as before (no regression).
 
 > Produced by the parity coordinator swarm (design agent, 2026-06-26). This is the **biggest
 > remaining cascade lever**: ~922 `missing-relation` rows are downstream of failed
