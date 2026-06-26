@@ -25,7 +25,9 @@ mod spark_datetime;
 mod spark_datetime2;
 mod spark_datetime3;
 mod spark_encoding;
+mod spark_if;
 mod spark_json;
+mod spark_math;
 mod spark_misc;
 mod spark_regex_misc;
 mod spark_strings;
@@ -43,6 +45,8 @@ pub fn register(ctx: &SessionContext) {
     spark_datetime2::register(ctx);
     spark_datetime3::register(ctx);
     spark_json::register(ctx);
+    spark_if::register(ctx);
+    spark_math::register(ctx);
     spark_misc::register(ctx);
     spark_array::register(ctx);
     spark_aggregates::register(ctx);

@@ -31,6 +31,10 @@ pub mod spark_functions;
 /// parity). See [`spark_names::project_spark_names`].
 mod spark_names;
 
+/// Spark-compatible integer-literal typing (`INT` vs `BIGINT` default). See
+/// [`spark_int_literals::downcast_int_literals`].
+mod spark_int_literals;
+
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
@@ -364,6 +368,119 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
     }
 }
 
+/// A custom [`ExprPlanner`] that lowers Spark's `/` operator to true (double-precision) division
+/// whenever both operands are integral, matching Spark's documented `Divide` contract.
+///
+/// Spark's `/` always evaluates in `DOUBLE` for non-decimal operands — `cast(1 as int) / cast(1 as
+/// int)` is the double `1.0`, `7 / 2` is `3.5`. DataFusion's default [`Operator::Divide`], by
+/// contrast, performs *truncating integer* division and yields an integer type when both operands
+/// are integral (`7 / 2` → `3`, `5 / 2` → `2`). Relative to Spark that is genuine data corruption
+/// of both the value and the result type, not a formatting nit.
+///
+/// This is a faithful, EQUIVALENT-plan lowering (explicitly allowed by the parity contract:
+/// "lowering Spark syntax to an equivalent DataFusion plan" matching Spark's documented `/`
+/// contract), never a lossy rewrite: when both operand types are integral we rebuild the binary op
+/// as `CAST(left AS DOUBLE) / CAST(right AS DOUBLE)`, so DataFusion evaluates it in double
+/// precision and returns the Spark value/type. The output column name is unaffected — Spark (and
+/// `spark_names::render`) omit coercion casts from a column's name, so the operands still render as
+/// before.
+///
+/// Scope is deliberately narrow so no sibling row (in `division.sql` or elsewhere) regresses:
+/// - only `Operator::Divide` (`/`); Spark integer division (`DIV`) is `Operator::IntegerDivide`,
+///   a different operator, and is never matched;
+/// - only when *both* operands are integral (signed/unsigned `Int*`). `DECIMAL` operands keep
+///   Spark's decimal-division precision rules; `FLOAT`/`DOUBLE` operands are already double;
+///   string/binary/boolean/date/timestamp/interval/null operands aren't integral, so the existing
+///   error / exec parity for those rows is untouched;
+/// - a *literal-zero* divisor is left to DataFusion's integer divide, which raises `DIVIDE_BY_ZERO`
+///   exactly as Spark's ANSI `/` does. Lowering it to IEEE double division would instead yield a
+///   non-erroring `Infinity` and silently drop a Spark error (`SELECT 5 / 0`), so we don't.
+#[derive(Debug)]
+struct SparkDividePlanner;
+
+impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
+    fn plan_binary_op(
+        &self,
+        expr: datafusion::logical_expr::planner::RawBinaryExpr,
+        schema: &datafusion::common::DFSchema,
+    ) -> datafusion::common::Result<
+        datafusion::logical_expr::planner::PlannerResult<
+            datafusion::logical_expr::planner::RawBinaryExpr,
+        >,
+    > {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::planner::PlannerResult;
+        use datafusion::logical_expr::{cast, BinaryExpr, Expr, ExprSchemable, Operator};
+        use datafusion::sql::sqlparser::ast::BinaryOperator;
+
+        // Spark `/` only. (Spark integer division `DIV` is `Operator::IntegerDivide`, never `/`.)
+        if !matches!(expr.op, BinaryOperator::Divide) {
+            return Ok(PlannerResult::Original(expr));
+        }
+        // Resolve operand types against the input schema; if either is unresolvable (e.g. a bare
+        // placeholder), defer to the default planner unchanged.
+        let (Ok(left_ty), Ok(right_ty)) =
+            (expr.left.get_type(schema), expr.right.get_type(schema))
+        else {
+            return Ok(PlannerResult::Original(expr));
+        };
+        // Both operands must be integral. Anything else is left exactly as DataFusion/Spark handle
+        // it (decimal precision, already-double float, string/binary/bool/date/timestamp errors).
+        if !is_integral(&left_ty) || !is_integral(&right_ty) {
+            return Ok(PlannerResult::Original(expr));
+        }
+        // Preserve Spark's ANSI divide-by-zero error: a literal-zero divisor stays integer division
+        // (DataFusion raises DIVIDE_BY_ZERO); double division would yield Infinity and drop the error.
+        if is_literal_zero(&expr.right) {
+            return Ok(PlannerResult::Original(expr));
+        }
+
+        let planned = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(cast(expr.left, DataType::Float64)),
+            Operator::Divide,
+            Box::new(cast(expr.right, DataType::Float64)),
+        ));
+        Ok(PlannerResult::Planned(planned))
+    }
+}
+
+/// Whether `t` is one of Spark's integral types (the signed/unsigned fixed-width integers). Decimal,
+/// float, and double are intentionally excluded — only these need Spark's true-division lowering.
+fn is_integral(t: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType::{
+        Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
+    };
+    matches!(
+        t,
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+    )
+}
+
+/// Whether `e` is (a cast wrapper around) an integer literal `0`. Used to keep a literal-zero
+/// divisor on DataFusion's integer-divide path, which raises `DIVIDE_BY_ZERO` like Spark ANSI `/`.
+fn is_literal_zero(e: &datafusion::logical_expr::Expr) -> bool {
+    use datafusion::common::ScalarValue::{
+        Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
+    };
+    use datafusion::logical_expr::Expr;
+    match e {
+        Expr::Cast(c) => is_literal_zero(&c.expr),
+        Expr::TryCast(c) => is_literal_zero(&c.expr),
+        Expr::Literal(v, _) => matches!(
+            v,
+            Int8(Some(0))
+                | Int16(Some(0))
+                | Int32(Some(0))
+                | Int64(Some(0))
+                | UInt8(Some(0))
+                | UInt16(Some(0))
+                | UInt32(Some(0))
+                | UInt64(Some(0))
+        ),
+        _ => false,
+    }
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -419,7 +536,7 @@ impl Engine {
             }
         }
 
-        let ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
+        let mut ctx = match std::env::var("WEFT_MEMORY_LIMIT_BYTES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
         {
@@ -437,6 +554,14 @@ impl Engine {
         };
         register_spark_function_aliases(&ctx);
         spark_functions::register(&ctx);
+        // Spark's `/` is true (double) division for non-decimal operands; lower integral `/` to a
+        // double divide so it returns Spark's value/type instead of DataFusion's truncating integer
+        // division. Additive: only Divide between two integral operands is rewritten (see
+        // `SparkDividePlanner`); registration only appends a planner and cannot fail.
+        {
+            use datafusion::execution::FunctionRegistry;
+            let _ = ctx.register_expr_planner(Arc::new(SparkDividePlanner));
+        }
         Self { ctx: Arc::new(ctx) }
     }
 
@@ -463,14 +588,32 @@ impl Engine {
     /// [`Engine::sql`] and [`Engine::schema`] so the two never disagree.
     async fn plan_spark(&self, query: &str) -> Result<datafusion::dataframe::DataFrame> {
         let query = normalize_spark_sql(query);
-        let df = self
+        // Plan WITHOUT executing. `ctx.sql()` eagerly runs DDL (e.g. `CREATE VIEW`) inside its
+        // call, registering the view *before* we could retype its body — so we go one level down:
+        // `create_logical_plan` returns the raw, un-analyzed plan, we (1) retype in-range integer
+        // literals to Int32 (Spark's `INT` default vs DataFusion's `BIGINT`) and (2) apply Spark
+        // output column names, then hand the rewritten plan to `execute_logical_plan` (which runs
+        // any DDL / builds the lazy DataFrame). Under the default `SQLOptions` `ctx.sql()` uses,
+        // all statement kinds are allowed, so this is behavior-equivalent plus the two rewrites.
+        let plan = self
             .ctx
-            .sql(query.as_ref())
+            .state()
+            .create_logical_plan(query.as_ref())
             .await
             .map_err(|e| Error::Plan(e.to_string()))?;
-        let (state, plan) = df.into_parts();
+        // Order is load-bearing. `project_spark_names` runs FIRST, on the raw plan, so it sees the
+        // bare (un-aliased) anonymous literal columns and renames them to their Spark names — its
+        // outer projection then references the inner columns by their original DataFusion names.
+        // `downcast_int_literals` runs SECOND and *preserves* exactly those names while retyping
+        // Int64→Int32, so the Spark-name projection (and every other by-name reference) keeps
+        // resolving. Reversing the order would hide the literals behind name-preserving aliases and
+        // defeat the Spark-name pass.
         let plan = spark_names::project_spark_names(plan);
-        Ok(datafusion::dataframe::DataFrame::new(state, plan))
+        let plan = spark_int_literals::downcast_int_literals(plan);
+        self.ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))
     }
 
     /// Build the optimized DataFusion physical plan for `query`. The driver side of

@@ -140,6 +140,14 @@ fn render(e: &Expr) -> String {
 /// Render a scalar function call Spark-style: `prettyName(arg, arg, …)` with comma-**space**
 /// separators (DataFusion uses no space) and the `make_array`→`array` constructor rename.
 fn render_scalar_fn(sf: &ScalarFunction) -> String {
+    // Spark's `If` expression prints as `(IF(predicate, trueValue, falseValue))` — uppercased and
+    // wrapped in an outer pair of parens (unlike an ordinary function). weft lowers `if` to a
+    // `CASE` for execution, but the un-optimized projection still carries the `if` ScalarFunction
+    // at naming time, so this is where the Spark column name is produced.
+    if sf.func.name() == "if" && sf.args.len() == 3 {
+        let args = sf.args.iter().map(render).collect::<Vec<_>>().join(", ");
+        return format!("(IF({args}))");
+    }
     let name = match sf.func.name() {
         "make_array" => "array",
         other => other,
