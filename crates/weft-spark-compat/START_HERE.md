@@ -3,7 +3,8 @@
 > Read this first. It is the launchpad: current state, how to run, the next moves, the orchestration
 > recipe, and the gotchas that will bite you. For depth, follow the **Doc map** at the bottom.
 > Everything is on branch `feat/spark-parity-harness` (pushed to `github.com/vamzi/weft`, remote name
-> `github`). Last commit at this handoff: `b72afd3`.
+> `github`). Last parity commit at this handoff: `5570287` (aggregate output names, +126 strict). The
+> GitHub CI parity gate (`.github/workflows/ci.yml`) was merged to `main` separately via PR #4.
 
 ---
 
@@ -22,22 +23,28 @@ right answer / right rejection, crediting benign column-name / error-text / tie-
 
 ## 2. Current state (deterministic)
 
-**strict 22.1% (2,793 / 12,641) · semantic 58.5% (7,397 / 12,641).** Up from 2.2% / 25.5% at the start.
+**strict 23.1% (2,919 / 12,641) · semantic 58.5% (7,397 / 12,641).** Up from 2.2% / 25.5% at the start.
 
 | bucket | n | | bucket | n |
 |---|--:|---|---|--:|
-| **pass** (strict) | 2,793 | | exec-error | 1,093 |
+| **pass** (strict) | 2,919 | | exec-error | 1,093 |
 | error-parity (sem) | 2,406 | | missing-relation | 900 |
-| schema-only (sem*) | 2,147 | | function-missing | 721 |
+| schema-only (sem*) | 2,021 | | function-missing | 721 |
 | parser-unsupported | 1,238 | | feature-unsupported | 482 |
 | correctness | 277 | | missing-error | 166 |
 | decimal-precision | 189 | | requires-udf-registration (excluded) | 87 |
-| null-semantics | 71 | | ordering (sem) | 51 |
+| null-semantics | 71 | | ordering (sem) | 48 |
 | datetime | 13 | | engine-panic | 3 |
 | nondeterministic (excluded) | 4 | | | |
 
 Trajectory: column-naming-w1 (7.8/44.3) → iter-1 six levers (10.5/45.6) → iter-2 CREATE TABLE USING +
-cast-constructors (**22.1/58.5**). See `HANDOFF.md` for the per-iteration changelog.
+cast-constructors (22.1/58.5) → iter-3 aggregate output names (**23.1/58.5**, +126 strict). See
+`HANDOFF.md` for the per-iteration changelog.
+
+> **CI gate is now live on GitHub.** `.github/workflows/ci.yml` (merged to `main`, PR #4) runs the
+> parity ratchet on every PR and fails it if strict/semantic parity drops below `parity/baseline.json`
+> — so the work here is protected. (Its `fmt`/`build-test` jobs are currently red on pre-existing
+> `weft-bench`/`weft-gateway` debt, surfaced not introduced; the `parity` job is green.)
 
 ## 3. How to run (≈10s build incremental, golden ≈30–40s now that CTU writes real files)
 
@@ -78,18 +85,26 @@ Full recipe + the faithfulness contract every agent inherits: **`PARITY_SWARM_PL
 
 The iter-2 cascade surfaced its own backlog. Highest leverage first:
 
-1. **Decimal-precision pass (189).** Spark types unsuffixed `1.5` as `decimal(2,1)` (not double) and has
-   exact decimal-arithmetic precision/scale rules (DataFusion 54 *copies* them — `avg→Decimal(min(38,p+4),
-   min(38,s+4))`, `sum→Decimal(min(38,p+10),s)`). Iter-2 had TWO agents do this (`decimalArithmeticOperations`
-   3/3-verified, narrow; `window_part4` higher-yield but corpus-wide) — **they conflict in
-   `lib.rs::rewrite_spark_typed_literals`.** Reconcile into ONE gated literal-typing pass. Their verified
-   artifacts are described in the iter-2 workflow output (transcript dir under `subagents/workflows/`).
-2. **Column-naming wave 2 — aggregate output names (chunk of schema-only 2,147).** `count(*)`→`count(1)`,
-   `count(testdata.a)`→`count(a)`, `max(t.c)`→`max(c)`. Blocked in w1 because `SELECT k, count(*) … GROUP BY k`
-   plans as `Projection → Aggregate` and the projection references the aggregate as a bare `Column`. Fix in
-   `spark_names.rs`: when a top-projection output is a bare `Column` resolving to an `Aggregate` output,
-   look up that aggregate's expr in the child `Aggregate` node and render *it* Spark-style. (Iter-2's agent
-   for this **died on an API stall** — re-queue it.) Pure output-shaping: semantic flat, strict up.
+1. **✅ DONE (iter-3) — Column-naming wave 2: aggregate output names.** `count(*)`→`count(1)`,
+   `count(testdata.a)`→`count(a)`, `sum(t.power)`→`sum(power)`, DISTINCT/FILTER preserved, nested in
+   binary ops. Landed in `spark_names.rs` (commit `5570287`): builds an output-name→expr map from the
+   `Aggregate` feeding the top projection (descend Filter/Sort/Limit/Distinct/SubqueryAlias) and renders
+   such bare `Column`s as the aggregate expr. **strict 2,793→2,919 (+126); semantic held; per-file audit
+   = no file lost a strict pass.** Pure output-shaping. (DataFusion builds `count(*)` as `count(Int64(1))`
+   aliased `"count(*)"`, so its arg renders `1`.)
+2. **⛔ BLOCKED (iter-3, investigated + reverted) — Decimal-precision pass (189).** Typing unsuffixed `1.5`
+   as `decimal(2,1)` IS faithful and the rewrite is a 1-branch add in `lib.rs::rewrite_spark_typed_literals`
+   (reuse `decimal_ps`; gate on `num.contains('.') && !has_exp` so `2.35E10` stays double, matching Spark).
+   Measured: **strict +15 / semantic +17, decimal-precision −22, correctness −4, missing-error −12** — BUT
+   it regressed **2 files (6 byte-correct strict passes): `predicate-functions.sql` −5, `inline-table.sql`
+   −1**, and raised exec-error +24. Root cause = **DataFusion 54 coercion/overflow gaps the decimal type
+   exposes**, NOT the literal typing: (a) **no `Utf8`↔`Decimal128` comparison coercion** — `'1.5' > 0.5`
+   fails `simplify_expressions` where string-vs-`double` worked (Spark coerces; golden `(1.5 > 0.5):boolean`);
+   (b) **decimal-multiply overflow errors** (Arrow "Arithmetic overflow") where Spark returns NULL with
+   `allowPrecisionLoss`; (c) **decimal in window-frame bounds** → "Invalid window frame". This is a real
+   needs-feature (the three coercion/overflow fixes), not a quick win — per the faithfulness rule it was
+   reverted rather than shipped as a 6-pass regression. Unblock = add those coercions (an analyzer/`ExprPlanner`
+   string→numeric rule + Spark-style decimal overflow→NULL), THEN re-apply the 1-branch literal typing.
 3. **Unmasked correctness (277) + missing-error (166) + null-semantics (71).** Now-visible pre-existing
    gaps, concentrated in `collations.sql`, `postgreSQL/numeric.sql`, `window.sql`, `charvarchar.sql`,
    `postgreSQL/int4/int8.sql`. Diagnose→fix→**adversarially refute** (the highest-trust swarm; only ship
