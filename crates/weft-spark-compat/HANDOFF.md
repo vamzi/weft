@@ -282,8 +282,11 @@ agents may add deps (`regex`, `serde_json`) — declare them in `weft-loom/Cargo
   confirm all errors are outside your files (the compiler lists every error) before worrying.
 
 ## 9. Pointers
-- **`crates/weft-spark-compat/COLUMN_NAMING_PASS.md` — the next pass (output column-naming, the
-  biggest strict lever). Start here.**
+- **`crates/weft-spark-compat/PARITY_SWARM_PLAYBOOK.md` — coordinator playbook to drive parity to
+  its faithful ceiling in one multi-swarm campaign (dependency-ordered waves, the faithfulness
+  contract every agent inherits, the ratchet loop). Start here to run the whole push.**
+- **`crates/weft-spark-compat/COLUMN_NAMING_PASS.md` — output column-naming deep-dive; wave 1 landed,
+  two follow-ons (int/bigint type, aggregate names) remain.**
 - `crates/weft-spark-compat/ROADMAP.md` — the per-cluster verdicts + dialect-layer architecture.
 - `crates/weft-spark-compat/README.md` — harness internals + how to run.
 - Memory: `~/.claude/.../memory/spark-parity-harness.md`.
