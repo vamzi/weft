@@ -214,6 +214,12 @@ impl Engine {
         // Title, Referer) — decisive for the string/scan-heavy queries (Q20–Q28, Q34/Q35).
         {
             let opts = config.options_mut();
+            // Parse SQL the Spark way: the Databricks dialect (Databricks SQL *is* Spark SQL) uses
+            // backticks for identifiers and treats `"..."` as a STRING LITERAL — Spark's default
+            // (`spark.sql.ansi.double_quoted_identifiers=false`). DataFusion's Generic dialect treats
+            // `"..."` as an identifier, which mis-parses Spark string literals like
+            // `next_day("2015-07-23", "Mon")`.
+            opts.sql_parser.dialect = datafusion::common::config::Dialect::Databricks;
             opts.execution.parquet.pushdown_filters = true;
             opts.execution.parquet.reorder_filters = true;
             opts.execution.parquet.binary_as_string = true;
