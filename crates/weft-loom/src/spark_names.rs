@@ -148,6 +148,34 @@ fn render_scalar_fn(sf: &ScalarFunction) -> String {
         let args = sf.args.iter().map(render).collect::<Vec<_>>().join(", ");
         return format!("(IF({args}))");
     }
+    // weft lowers a Spark literal-zero integral `/` (e.g. `1/0`) to the internal `spark_divide`
+    // UDF so the column is statically DOUBLE while still raising DIVIDE_BY_ZERO on an actual zero
+    // divisor. Spark names it as the ordinary `(left / right)` division it was written as, so
+    // render it that way — the operand coercion casts are stripped by `render`, exactly as for a
+    // plain `BinaryExpr` divide.
+    if sf.func.name() == "spark_divide" && sf.args.len() == 2 {
+        return format!("({} / {})", render(&sf.args[0]), render(&sf.args[1]));
+    }
+    // Spark names `from_json`'s output column with *only* the JSON argument — the schema string and
+    // the optional options map are dropped (`JsonToStructs.prettyName`): `from_json({"a":1})`.
+    if sf.func.name() == "from_json" && !sf.args.is_empty() {
+        return format!("from_json({})", render(&sf.args[0]));
+    }
+    // Spark's cast-alias constructors (`int(x)`, `double(x)`, `decimal(x)`, …) name their column
+    // after the *child*, exactly like an explicit `CAST(x AS T)` (Spark omits the cast from the
+    // name): `SELECT int(1)` → column `1`. weft lowers these to a `Cast` for execution, but the
+    // un-optimized projection still carries the constructor `ScalarFunction` at naming time, so the
+    // Spark column name is produced here.
+    if sf.args.len() == 1
+        && crate::spark_functions::spark_cast_constructors::CAST_ALIAS_NAMES
+            .contains(&sf.func.name())
+    {
+        return render(&sf.args[0]);
+    }
+    // Spark `positive(x)` (`UnaryPositive`) prints as `(+ x)`.
+    if sf.func.name() == "positive" && sf.args.len() == 1 {
+        return format!("(+ {})", render(&sf.args[0]));
+    }
     let name = match sf.func.name() {
         "make_array" => "array",
         other => other,
