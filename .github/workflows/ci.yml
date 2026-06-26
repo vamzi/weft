@@ -1,0 +1,115 @@
+name: CI
+
+# Rust CI for Weft on free GitHub-hosted runners (public repo = unlimited minutes).
+# Mirrors the gates from .gitlab-ci.yml that fit a hosted runner (4 vCPU / 16 GB):
+# rustfmt, clippy, workspace tests, the ClickBench/TPC-H/correctness coverage gates, and the
+# Spark-SQL parity ratchet (the `parity` job — fails any PR that drops Spark golden-SQL parity
+# below the committed parity/baseline.json floor). One heavier gate lives elsewhere:
+#   - ClickBench on real 14.78 GB data -> bench.yml, self-hosted c6a.4xlarge (see deploy/ci-runner/)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+# A newer push to the same ref cancels the in-progress run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt
+          rustc --version && cargo --version
+      - run: cargo fmt --all -- --check
+
+  build-test:
+    name: clippy + test + coverage gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add clippy
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test (workspace)
+        run: cargo test --workspace
+      # Coverage gates — same as GitLab, on small synthetic data so they fit on a hosted runner.
+      - name: ClickBench coverage (43 queries, engine-direct)
+        run: cargo run -p weft-bench -- clickbench --rows 20000
+      - name: ClickBench coverage (43 queries, live Spark Connect over gRPC)
+        run: cargo run -p weft-bench -- clickbench-grpc --rows 20000
+      - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
+        run: cargo run -p weft-bench -- tpch
+      - name: correctness (gRPC/Arrow-IPC vs engine-direct + ground truth)
+        run: cargo run -p weft-bench -- correctness --rows 5000
+
+  # Spark-SQL parity ratchet: replays Apache Spark v4.0.0's own golden SQL corpus through weft and
+  # fails the PR if strict OR semantic parity drops below the committed parity/baseline.json floor
+  # (or the corpus size changes). This is the gate that protects the Spark-compatibility work — a PR
+  # can only hold or improve parity. To LAND a gain, re-baseline (see PARITY_SWARM_PLAYBOOK.md §6).
+  # Runs as its own job (separate cache) because the weft-parity binary depends only on weft-loom
+  # (+ datafusion), not the gateway — so it builds fast and stays green independent of platform code.
+  parity:
+    name: Spark SQL parity ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: spark-parity # keep this cache separate from build-test's
+          cache-on-failure: "true"
+      - name: Build weft-parity
+        run: cargo build -p weft-spark-compat --bin weft-parity
+      - name: Ratchet against parity/baseline.json
+        run: |
+          set -o pipefail
+          ./target/debug/weft-parity ratchet --baseline parity/baseline.json --out-dir parity | tee parity-run.log
+      - name: Publish parity headline to job summary
+        if: always()
+        run: |
+          {
+            echo "## Spark parity gate"
+            echo ""
+            echo '```'
+            grep -E '^(parity:|✓|✗)' parity-run.log 2>/dev/null || echo "(no headline — see logs)"
+            echo '```'
+            echo ""
+            echo "Baseline: \`parity/baseline.json\`. Parity may only hold or improve."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload parity scoreboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-scoreboard
+          path: |
+            parity/parity.json
+            parity/report.md
+            parity/parity.html
+            parity/scoreboard.json
+          retention-days: 30
+          if-no-files-found: ignore
