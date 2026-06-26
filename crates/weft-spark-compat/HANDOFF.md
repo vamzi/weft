@@ -9,10 +9,20 @@ Weft is a drop-in Apache Spark replacement on DataFusion 54. We **measure** Spar
 replaying Apache Spark v4.0.0's *own* golden SQL tests through weft and diffing against Spark's
 committed `.sql.out` outputs, with a CI ratchet so parity can only rise.
 
-**Current parity (deterministic): semantic 43.0% (5,431 / 12,641), strict 5.0% (626 floor).**
-Up from 25.5% / 2.2% at the start. To continue, the highest-yield low-risk move is another
-**function wave** (§6.3, swarm pattern in §7); the biggest structural lever is the **column-naming
-pass** (§6.4). (The former "session-timezone quick win" was tested and disproven — see §6.1.)
+**Current parity (deterministic): semantic 44.3% (5,599 / 12,641), strict 5.3% (669 floor).**
+Up from 25.5% / 2.2% at the start. To continue, the biggest structural lever is the **column-naming
+pass** (§6.4) — `schema-only` is now 2,456, all semantic-passing but strict-failing; another
+**function wave** (§6.3) is the steady low-risk option. (The "session-timezone quick win" was tested
+and disproven — see §6.1.)
+
+**Wave 4b (2026-06-25): Spark typed-literal parser.** `normalize_spark_sql` now rewrites Spark's
+suffixed numeric literals — `1L`/`2Y`/`3S`/`1.0F`/`1.0D`/`1.0BD` — into `CAST(<n> AS <type>)`
+(`lib.rs::rewrite_spark_typed_literals` + `decimal_ps` for BigDecimal precision/scale). DataFusion's
+lexer read the suffixed forms as identifiers (`No field named "1l"`); the cast is exactly Spark's
+semantics, so it's faithful. The scanner is string-/identifier-/comment-aware (never touches `'…'`,
+`"…"`, `` `…` ``, `--`/`/* */`, `col1`, `0x1F`, `1e5`). Net: exec-error 1069→955, semantic +168,
+strict +44, zero new wrong answers (verified: no typed-literal query is in `correctness`; the small
+`correctness` rise is cascade — setup statements that now parse expose pre-existing downstream gaps).
 
 **Last wave (2026-06-25): function wave 4 + Spark binary rendering.** A 4-agent worktree swarm added
 `spark_array.rs` (array_size, sort_array, map_contains_key, try_element_at + `array`→`make_array`
@@ -107,19 +117,19 @@ and refresh `site/public/parity.{html,json}` from the run's `parity.html`/`score
 
 | bucket | count | meaning / where the work is |
 |---|---:|---|
-| `missing-relation` | 2,747 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
-| `error-parity` | 2,453 | ✓ both engines reject (semantic pass) |
-| `schema-only` | 2,323 | ✓ right values, divergent column name — **the strict lever (§6.4)** |
-| `parser-unsupported` | 1,347 | Spark syntax DataFusion rejects (typed literals `1L`/`2Y`/`BD`, `CREATE TABLE … USING`, PIVOT, USE) |
-| `function-missing` | 1,099 | functions still unimplemented (§6.3) |
-| `exec-error` | 1,069 | misc execution failures |
-| `pass` | 626 | ✓ strict |
-| `feature-unsupported` | 406 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
-| `correctness` | 226 | **genuine wrong answers — highest trust priority** (mostly `array()`-enabled rows hitting pre-existing gaps, not new-fn bugs) |
-| `decimal-precision` | 141 | precision/scale/rounding |
-| `missing-error` | 121 | weft too lenient (Spark rejects, weft accepts) |
-| `null-semantics` | 44 | three-valued-logic |
-| `ordering` | 28 | ✓ counted semantic |
+| `missing-relation` | 2,572 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
+| `schema-only` | 2,456 | ✓ right values, divergent column name — **the strict lever (§6.4)** |
+| `error-parity` | 2,443 | ✓ both engines reject (semantic pass) |
+| `parser-unsupported` | 1,348 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
+| `function-missing` | 1,133 | functions still unimplemented (§6.3) |
+| `exec-error` | 955 | misc execution failures |
+| `pass` | 669 | ✓ strict |
+| `feature-unsupported` | 459 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
+| `correctness` | 244 | **genuine wrong answers — highest trust priority** (mostly cascade-unblocked rows hitting pre-existing gaps, not new-code bugs) |
+| `decimal-precision` | 143 | precision/scale/rounding |
+| `missing-error` | 131 | weft too lenient (Spark rejects, weft accepts) |
+| `null-semantics` | 47 | three-valued-logic |
+| `ordering` | 31 | ✓ counted semantic |
 | `datetime` | 6 | tz-naive TIMESTAMP gap — not a quick win (§6.1) |
 | `nondeterministic` | 3 | rand/uuid/shuffle — excluded from scoring by design |
 | `engine-panic` | 1 | DataFusion `panic!` on `COUNT(DISTINCT a,b)` (§6.6) |

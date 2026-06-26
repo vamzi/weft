@@ -74,10 +74,191 @@ fn env_bool(key: &str) -> Option<bool> {
 /// This is a stopgap living in the engine; it will migrate into the `weft-sql` Spark-dialect
 /// front end when that lands.
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
-    match strip_temporary_view(query) {
+    // First the leading-keyword DDL rewrite, then the typed-literal rewrite over the result.
+    let stripped = strip_temporary_view(query);
+    let base = stripped.as_deref().unwrap_or(query);
+    match rewrite_spark_typed_literals(base) {
         Some(rewritten) => std::borrow::Cow::Owned(rewritten),
-        None => std::borrow::Cow::Borrowed(query),
+        None => match stripped {
+            Some(s) => std::borrow::Cow::Owned(s),
+            None => std::borrow::Cow::Borrowed(query),
+        },
     }
+}
+
+/// Byte length of the UTF-8 char starting with leading byte `lead`.
+fn utf8_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Derive Spark's `DECIMAL(precision, scale)` for a `…BD` literal from its digit text (no sign, no
+/// exponent), matching `java.math.BigDecimal`: scale = fractional digits; precision = significant
+/// digits (leading zeros stripped, min 1), widened so `precision >= scale`. Returns `None` if it
+/// would exceed Spark's 38-digit decimal range (leave the literal untouched).
+fn decimal_ps(num: &str) -> Option<(u8, u8)> {
+    let (int_part, frac_part) = num.split_once('.').unwrap_or((num, ""));
+    let scale = frac_part.len();
+    let sig_digits: String = format!("{int_part}{frac_part}");
+    let trimmed = sig_digits.trim_start_matches('0');
+    let sig = if trimmed.is_empty() { 1 } else { trimmed.len() };
+    let precision = sig.max(scale).max(1);
+    if precision > 38 {
+        return None;
+    }
+    Some((precision as u8, scale as u8))
+}
+
+/// Rewrite Spark's typed numeric literals — `1L`, `2Y`, `3S`, `1.0F`, `1.0D`, `1.0BD` — into the
+/// equivalent `CAST(<num> AS <type>)`. DataFusion's lexer reads the suffixed forms as identifiers
+/// (failing with `No field named "1l"`), so Spark SQL that uses typed literals — pervasive in the
+/// corpus — won't plan. The cast is exactly Spark's semantics (`1L` *is* a bigint `1`), so the
+/// rewrite is faithful, not lossy.
+///
+/// The scan is string-/identifier-/comment-aware: single- and double-quoted strings (`"…"` is a
+/// string literal under the Databricks dialect), backtick-quoted identifiers, and `--`/`/* */`
+/// comments are copied through verbatim, so a literal like `'1L'` or a column `` `2Y` `` is never
+/// touched. A numeric token is only rewritten when it sits in code position (the preceding char is
+/// not an identifier char or `.`) and the suffix is followed by a non-identifier boundary, so
+/// `col1`, `0x1F`, `1e5`, and `3.14desc` are all left intact. Returns `None` when nothing changed
+/// (so the caller keeps the borrowed fast-path).
+fn rewrite_spark_typed_literals(sql: &str) -> Option<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n + 16);
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < n {
+        let c = b[i];
+
+        // Quoted string ('…', "…") or identifier (`…`) — copy verbatim, honoring doubled quotes.
+        if c == b'\'' || c == b'"' || c == b'`' {
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == c {
+                    if i + 1 < n && b[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Line comment.
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            let start = i;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Block comment.
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i < n && !(b[i] == b'*' && i + 1 < n && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Numeric literal candidate: a digit in code position (not part of an identifier or a
+        // fractional tail).
+        let prev = if i == 0 { 0 } else { b[i - 1] };
+        let prev_blocks = prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.';
+        if c.is_ascii_digit() && !prev_blocks {
+            let num_start = i;
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Fraction (only when a digit follows the dot — otherwise the dot isn't ours).
+            if i + 1 < n && b[i] == b'.' && b[i + 1].is_ascii_digit() {
+                i += 1;
+                while i < n && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            // Exponent.
+            let mut has_exp = false;
+            if i < n && (b[i] == b'e' || b[i] == b'E') {
+                let mut j = i + 1;
+                if j < n && (b[j] == b'+' || b[j] == b'-') {
+                    j += 1;
+                }
+                if j < n && b[j].is_ascii_digit() {
+                    i = j;
+                    while i < n && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    has_exp = true;
+                }
+            }
+            let num = &sql[num_start..i];
+            let after_ok =
+                |k: usize| k >= n || !(b[k].is_ascii_alphanumeric() || b[k] == b'_');
+
+            // `BD` → DECIMAL (only without an exponent, where precision/scale are well-defined).
+            if i + 1 < n
+                && (b[i] == b'b' || b[i] == b'B')
+                && (b[i + 1] == b'd' || b[i + 1] == b'D')
+                && after_ok(i + 2)
+            {
+                if !has_exp {
+                    if let Some((p, s)) = decimal_ps(num) {
+                        out.push_str(&format!("CAST({num} AS DECIMAL({p},{s}))"));
+                        i += 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+                out.push_str(num);
+                continue;
+            }
+            // Single-letter type suffix.
+            if i < n && after_ok(i + 1) {
+                let ty = match b[i] {
+                    b'y' | b'Y' => Some("TINYINT"),
+                    b's' | b'S' => Some("SMALLINT"),
+                    b'l' | b'L' => Some("BIGINT"),
+                    b'f' | b'F' => Some("FLOAT"),
+                    b'd' | b'D' => Some("DOUBLE"),
+                    _ => None,
+                };
+                if let Some(ty) = ty {
+                    out.push_str(&format!("CAST({num} AS {ty})"));
+                    i += 1;
+                    changed = true;
+                    continue;
+                }
+            }
+            // A plain number with no type suffix — copy as-is.
+            out.push_str(num);
+            continue;
+        }
+
+        // Any other char — copy one UTF-8 char.
+        let len = utf8_len(c).min(n - i);
+        out.push_str(&sql[i..i + len]);
+        i += len;
+    }
+
+    changed.then_some(out)
 }
 
 /// Read the next whitespace-delimited token from `s` starting at `*cur`, returning its byte span
@@ -608,6 +789,57 @@ mod tests {
         ] {
             assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
         }
+    }
+
+    #[test]
+    fn normalize_rewrites_typed_literals() {
+        // Each Spark suffix maps to the matching CAST.
+        assert_eq!(
+            normalize_spark_sql("SELECT 1Y, 2S, 3L, 4F, 5D"),
+            "SELECT CAST(1 AS TINYINT), CAST(2 AS SMALLINT), CAST(3 AS BIGINT), \
+             CAST(4 AS FLOAT), CAST(5 AS DOUBLE)"
+        );
+        // Fractions and exponents are part of the number; case-insensitive suffix.
+        assert_eq!(
+            normalize_spark_sql("VALUES (1.0d), (2.5e3D)"),
+            "VALUES (CAST(1.0 AS DOUBLE)), (CAST(2.5e3 AS DOUBLE))"
+        );
+        // BD → DECIMAL with BigDecimal precision/scale.
+        assert_eq!(
+            normalize_spark_sql("SELECT 1.0BD, 0.1BD, 123BD, 0.001BD"),
+            "SELECT CAST(1.0 AS DECIMAL(2,1)), CAST(0.1 AS DECIMAL(1,1)), \
+             CAST(123 AS DECIMAL(3,0)), CAST(0.001 AS DECIMAL(3,3))"
+        );
+        // Protected contexts: string literals ('…' and Databricks "…"), backtick identifiers,
+        // comments, ordinary identifiers, hex, and plain numbers are all left untouched.
+        for q in [
+            "SELECT '1L' AS s",
+            "SELECT \"2Y\" AS s",
+            "SELECT `3S` FROM t",
+            "SELECT 1 -- a 4L comment\n",
+            "SELECT /* 5D */ 1",
+            "SELECT col1, a2d, x1L FROM t",
+            "SELECT 0x1F, 1e5, 3.14, 42",
+        ] {
+            assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_literals_plan_and_eval() {
+        let engine = Engine::new();
+        // bigint literal resolves and computes (would otherwise be `No field named "3l"`).
+        let b = engine.sql("SELECT 3L + 4L AS x").await.unwrap();
+        let got = crate::arrow::util::pretty::pretty_format_batches(&b)
+            .unwrap()
+            .to_string();
+        assert!(got.contains("7"), "got: {got}");
+        // decimal literal keeps scale.
+        let b = engine.sql("SELECT 1.0BD AS x").await.unwrap();
+        let got = crate::arrow::util::pretty::pretty_format_batches(&b)
+            .unwrap()
+            .to_string();
+        assert!(got.contains("1.0"), "got: {got}");
     }
 
     #[tokio::test]
