@@ -17,7 +17,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
+mod spark_convert;
+mod spark_datetime;
 mod spark_encoding;
+mod spark_regex_misc;
 mod spark_strings;
 mod try_arithmetic;
 
@@ -27,6 +30,9 @@ pub fn register(ctx: &SessionContext) {
     try_arithmetic::register(ctx);
     spark_strings::register(ctx);
     spark_encoding::register(ctx);
+    spark_datetime::register(ctx);
+    spark_convert::register(ctx);
+    spark_regex_misc::register(ctx);
 }
 
 /// `typeof(expr)` — Spark returns the *type name* of the argument (e.g. `int`, `string`,

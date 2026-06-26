@@ -29,6 +29,7 @@ pub fn bucket_key(b: Bucket) -> &'static str {
         Bucket::ExecError => "exec-error",
         Bucket::MissingError => "missing-error",
         Bucket::Correctness => "correctness",
+        Bucket::Nondeterministic => "nondeterministic",
     }
 }
 
@@ -88,7 +89,11 @@ impl FileReport {
             // `error-parity` (both engines reject — nothing to fix) but keep `schema-only` /
             // `ordering` (semantic passes that still block strict parity).
             let actionable = !v.bucket.is_strict_pass()
-                && !matches!(v.bucket, crate::classify::Bucket::ErrorParity);
+                && !matches!(
+                    v.bucket,
+                    crate::classify::Bucket::ErrorParity
+                        | crate::classify::Bucket::Nondeterministic
+                );
             if actionable && failures.len() < FAILURE_CAP {
                 failures.push(Failure {
                     bucket: bucket_key(v.bucket).to_string(),
