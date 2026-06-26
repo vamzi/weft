@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "weft.gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "weft.gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "weft.gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "weft.gateway.labels" . | nindent 8 }}
+      annotations:
+        kubectl.kubernetes.io/default-container: gateway
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "weft.gateway.serviceAccountName" . }}
+      # The gateway needs its token to call the API server (kubectl), so it stays mounted.
+      automountServiceAccountToken: true
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.gateway.podSecurityContext | nindent 8 }}
+      {{- if .Values.gateway.kubectl.enabled }}
+      initContainers:
+        # Stage the kubectl binary into a shared volume so the gateway image stays minimal and the
+        # root filesystem can remain read-only.
+        - name: install-kubectl
+          image: {{ include "weft.gateway.kubectlImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - cp "$(command -v kubectl)" /opt/weft/bin/kubectl && chmod 0555 /opt/weft/bin/kubectl
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: kubectl-bin
+              mountPath: /opt/weft/bin
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "weft.gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: []
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.containerPort }}
+              protocol: TCP
+          env:
+            - name: WEFT_GATEWAY_ADDR
+              value: "0.0.0.0:{{ .Values.gateway.containerPort }}"
+            - name: AWS_REGION
+              value: {{ .Values.region | quote }}
+            - name: HOME
+              value: /home/weft
+            - name: PATH
+              value: /opt/weft/bin:/usr/local/bin:/usr/bin:/bin
+            - name: KUBECACHEDIR
+              value: /home/weft/.kube/cache
+            - name: WEFT_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "weft.gateway.jwtSecretName" . }}
+                  key: {{ .Values.gateway.jwt.secretKey }}
+            - name: WEFT_ADMIN_USER
+              value: {{ .Values.gateway.admin.user | quote }}
+            {{- if .Values.gateway.admin.passwordSecretKey }}
+            - name: WEFT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "weft.gateway.jwtSecretName" . }}
+                  key: {{ .Values.gateway.admin.passwordSecretKey }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.gateway.config.workspaceS3 }}
+            - name: WEFT_WORKSPACE_S3
+              value: {{ .Values.gateway.config.workspaceS3 | quote }}
+            {{- end }}
+            {{- if .Values.gateway.config.ddbTable }}
+            - name: WEFT_DDB_TABLE
+              value: {{ .Values.gateway.config.ddbTable | quote }}
+            {{- end }}
+            - name: WEFT_CLUSTER_NAMESPACE_PREFIX
+              value: {{ .Values.gateway.config.clusterNamespacePrefix | quote }}
+            - name: WEFT_CLUSTER_IDLE_SECS
+              value: {{ .Values.gateway.config.clusterIdleSecs | quote }}
+            {{- with .Values.gateway.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.gateway.securityContext | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: kubectl-bin
+              mountPath: /opt/weft/bin
+              readOnly: true
+            - name: home
+              mountPath: /home/weft
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # emptyDir volumes keep the root filesystem read-only while giving kubectl a writable HOME/cache.
+        - name: kubectl-bin
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

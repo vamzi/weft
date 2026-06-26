@@ -5216,6 +5216,7 @@ dependencies = [
  "weft-govern",
  "weft-loom",
  "weft-meta",
+ "weft-orchestrator",
  "weft-proto",
  "weft-sql",
 ]
@@ -5271,6 +5272,16 @@ version = "0.0.0"
 dependencies = [
  "weft-common",
  "weft-plan",
+]
+
+[[package]]
+name = "weft-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

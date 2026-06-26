@@ -18,11 +18,14 @@ use sc::spark_connect_service_client::SparkConnectServiceClient;
 const MAX_MSG: usize = 256 * 1024 * 1024;
 
 /// Run `sql` on the cluster at `endpoint` (an `sc://host:port` or `http://host:port` address) over
-/// Spark Connect, returning the decoded result batches. Stops reading once `max_rows` have been
-/// collected (dropping the stream cancels the RPC) so an unbounded `SELECT *` can't OOM the gateway.
-/// Errors surface the gRPC/engine message.
+/// Spark Connect, returning the decoded result batches. `session_id` scopes the Spark Connect session
+/// so each principal gets a distinct session (temp views / caches / config are isolated across users)
+/// — replacing the single hardcoded id every caller used to share. Stops reading once `max_rows` have
+/// been collected (dropping the stream cancels the RPC) so an unbounded `SELECT *` can't OOM the
+/// gateway. Errors surface the gRPC/engine message.
 pub async fn run_sql_on_cluster(
     endpoint: &str,
+    session_id: &str,
     sql: &str,
     max_rows: usize,
 ) -> Result<Vec<RecordBatch>, String> {
@@ -37,7 +40,7 @@ pub async fn run_sql_on_cluster(
         .max_encoding_message_size(MAX_MSG);
 
     let request = sc::ExecutePlanRequest {
-        session_id: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+        session_id: session_id.to_string(),
         plan: Some(sc::Plan {
             op_type: Some(sc::plan::OpType::Root(sc::Relation {
                 common: None,
