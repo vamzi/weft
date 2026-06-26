@@ -32,12 +32,19 @@
 //! This runs on the production `Engine::sql` / `Engine::schema` path (not a comparison-time hack),
 //! so the Spark-parity gain is a real drop-in-compatibility improvement, not a measurement artifact.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{Distinct, Expr, LogicalPlan, Projection};
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
+use datafusion::logical_expr::{Aggregate, Distinct, Expr, LogicalPlan, Projection};
+
+/// Map from an `Aggregate` node's output field name (DataFusion's `schema_name`, e.g. `count(*)`,
+/// `sum(t.x)`) to the aggregate expression that produced it. Built for the aggregate that feeds the
+/// top result projection so a bare `Column` referencing an aggregate output can be re-rendered with
+/// Spark's name (`count(1)`, `sum(x)`) instead of DataFusion's. Empty when the projection isn't fed
+/// by an aggregate (the common non-grouped case), which makes every lookup a safe miss.
+type AggMap<'a> = HashMap<String, &'a Expr>;
 
 /// Wrap `plan` in an outer projection that renames anonymous output columns to their Spark names.
 /// Returns the plan unchanged when there's nothing to rename, when the root isn't a recognized
@@ -53,6 +60,12 @@ pub fn project_spark_names(plan: LogicalPlan) -> LogicalPlan {
         return plan;
     }
 
+    // When the projection is fed by an aggregate (`SELECT k, count(*) … GROUP BY k` plans as
+    // `Projection → … → Aggregate`), the projection references each aggregate as a *bare* `Column`
+    // named `count(*)`/`sum(t.x)`; the real `AggregateFunction` lives in the child `Aggregate` node.
+    // Map those output names to their exprs so `render` can produce Spark's `count(1)`/`sum(x)`.
+    let agg = aggregate_output_map(&proj.input);
+
     let mut outer: Vec<Expr> = Vec::with_capacity(proj.expr.len());
     let mut seen: HashSet<String> = HashSet::with_capacity(proj.expr.len());
     let mut changed = false;
@@ -64,7 +77,7 @@ pub fn project_spark_names(plan: LogicalPlan) -> LogicalPlan {
         let out_name = if matches!(pe, Expr::Alias(_)) {
             field.name().to_string()
         } else {
-            let spark = spark_expr_name(pe);
+            let spark = render(pe, &agg);
             if spark != *field.name() {
                 changed = true;
             }
@@ -107,45 +120,129 @@ fn top_projection(plan: &LogicalPlan) -> Option<&Projection> {
     }
 }
 
-/// Spark's auto-generated output name for a top-projection expression. Pure function over an `Expr`.
-pub fn spark_expr_name(e: &Expr) -> String {
-    render(e)
+/// Build the [`AggMap`] for the `Aggregate` that feeds `plan` (the top projection's input), if any.
+/// Each aggregate expression is keyed by the field name it produces in the aggregate's output schema
+/// (DataFusion's `schema_name`), which is exactly the name the top projection references it by.
+fn aggregate_output_map(plan: &LogicalPlan) -> AggMap<'_> {
+    let mut map = AggMap::new();
+    if let Some(aggr) = find_aggregate(plan) {
+        for e in &aggr.aggr_expr {
+            map.insert(e.schema_name().to_string(), e);
+        }
+    }
+    map
+}
+
+/// The `Aggregate` node directly feeding the top projection, reached by descending only through
+/// single-input column-preserving wrappers (`Filter` = HAVING, plus `Sort`/`Limit`/`Distinct`/
+/// `SubqueryAlias`). Stops at anything else (another `Projection`, a join, a union, a bare scan) so
+/// we never resolve a projection column against an aggregate it doesn't actually read from.
+fn find_aggregate(plan: &LogicalPlan) -> Option<&Aggregate> {
+    match plan {
+        LogicalPlan::Aggregate(a) => Some(a),
+        LogicalPlan::Filter(f) => find_aggregate(&f.input),
+        LogicalPlan::Sort(s) => find_aggregate(&s.input),
+        LogicalPlan::Limit(l) => find_aggregate(&l.input),
+        LogicalPlan::Distinct(Distinct::All(input)) => find_aggregate(input),
+        LogicalPlan::SubqueryAlias(s) => find_aggregate(&s.input),
+        _ => None,
+    }
+}
+
+/// Spark's auto-generated output name for a top-projection expression, with no aggregate context.
+/// A test-only convenience over [`render`]; production naming goes through [`render`] directly with
+/// the real aggregate map (see [`project_spark_names`]).
+#[cfg(test)]
+fn spark_expr_name(e: &Expr) -> String {
+    render(e, &AggMap::new())
 }
 
 /// Recursive Spark-`prettyName` renderer. Variants we model explicitly are rendered Spark-style;
 /// anything else falls back to DataFusion's own schema name (safe — that column simply keeps its
 /// current name and stays in the `schema-only` bucket rather than regressing).
-fn render(e: &Expr) -> String {
+fn render(e: &Expr, agg: &AggMap) -> String {
     match e {
         // An `Alias` reached *inside* an expression is an internal artifact (e.g. the
         // `array`→`make_array` alias wraps its call), never a user alias — render the inner expr.
-        Expr::Alias(a) => render(&a.expr),
-        // Spark prints the unqualified column name.
-        Expr::Column(c) => c.name.clone(),
+        Expr::Alias(a) => render(&a.expr, agg),
+        // A bare column that names an aggregate output (`count(*)`, `sum(t.x)`) is re-rendered as the
+        // aggregate expression itself so it gets Spark's name (`count(1)`, `sum(x)`); otherwise it's
+        // an ordinary (group-by / scan) column, printed unqualified as Spark does.
+        Expr::Column(c) => agg
+            .get(c.name.as_str())
+            .and_then(|ae| render_aggregate_ref(ae, agg))
+            .unwrap_or_else(|| c.name.clone()),
         Expr::Literal(v, _) => render_literal(v),
         // Spark fully parenthesizes binary operations, including nested ones.
-        Expr::BinaryExpr(b) => format!("({} {} {})", render(&b.left), b.op, render(&b.right)),
+        Expr::BinaryExpr(b) => {
+            format!("({} {} {})", render(&b.left, agg), b.op, render(&b.right, agg))
+        }
         // Spark (like Postgres) omits coercion casts from the column name.
-        Expr::Cast(c) => render(&c.expr),
-        Expr::TryCast(c) => render(&c.expr),
-        Expr::Negative(x) => format!("(- {})", render(x)),
-        Expr::Not(x) => format!("NOT {}", render(x)),
-        Expr::IsNull(x) => format!("{} IS NULL", render(x)),
-        Expr::IsNotNull(x) => format!("{} IS NOT NULL", render(x)),
-        Expr::ScalarFunction(sf) => render_scalar_fn(sf),
+        Expr::Cast(c) => render(&c.expr, agg),
+        Expr::TryCast(c) => render(&c.expr, agg),
+        Expr::Negative(x) => format!("(- {})", render(x, agg)),
+        Expr::Not(x) => format!("NOT {}", render(x, agg)),
+        Expr::IsNull(x) => format!("{} IS NULL", render(x, agg)),
+        Expr::IsNotNull(x) => format!("{} IS NOT NULL", render(x, agg)),
+        Expr::ScalarFunction(sf) => render_scalar_fn(sf, agg),
+        // An aggregate reached directly (rare — projections normally reference it by column) renders
+        // the same way; fall back to the DataFusion name if it's an unsupported aggregate shape.
+        Expr::AggregateFunction(af) => {
+            render_aggregate(af, agg).unwrap_or_else(|| e.schema_name().to_string())
+        }
         _ => e.schema_name().to_string(),
     }
 }
 
+/// Render an aggregate expression (possibly wrapped in the synthetic alias DataFusion attaches to
+/// `count(*)`) Spark-style. `None` for any non-aggregate or unsupported shape, so the caller falls
+/// back to the bare column / DataFusion name and the column just stays in `schema-only`.
+fn render_aggregate_ref(ae: &Expr, agg: &AggMap) -> Option<String> {
+    match ae {
+        Expr::AggregateFunction(af) => render_aggregate(af, agg),
+        Expr::Alias(a) => render_aggregate_ref(&a.expr, agg),
+        _ => None,
+    }
+}
+
+/// Render an [`AggregateFunction`] as Spark names it: `prettyName([DISTINCT ]arg, …)` with the
+/// arguments rendered Spark-style (so `count(*)`'s `Int64(1)` arg prints as `1` → `count(1)`,
+/// `count(t.a)` → `count(a)`), then an optional `FILTER (WHERE …)`. Bails (`None`) on ordered-set
+/// (`WITHIN GROUP`) and null-treatment (`IGNORE NULLS`) shapes whose Spark spelling we don't model,
+/// so those keep DataFusion's name rather than risk a wrong one.
+fn render_aggregate(af: &AggregateFunction, agg: &AggMap) -> Option<String> {
+    let p = &af.params;
+    if !p.order_by.is_empty() || p.null_treatment.is_some() {
+        return None;
+    }
+    let distinct = if p.distinct { "DISTINCT " } else { "" };
+    let args = p
+        .args
+        .iter()
+        .map(|a| render(a, agg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut s = format!("{}({distinct}{args})", af.func.name());
+    if let Some(filter) = &p.filter {
+        s.push_str(&format!(" FILTER (WHERE {})", render(filter, agg)));
+    }
+    Some(s)
+}
+
 /// Render a scalar function call Spark-style: `prettyName(arg, arg, …)` with comma-**space**
 /// separators (DataFusion uses no space) and the `make_array`→`array` constructor rename.
-fn render_scalar_fn(sf: &ScalarFunction) -> String {
+fn render_scalar_fn(sf: &ScalarFunction, agg: &AggMap) -> String {
     // Spark's `If` expression prints as `(IF(predicate, trueValue, falseValue))` — uppercased and
     // wrapped in an outer pair of parens (unlike an ordinary function). weft lowers `if` to a
     // `CASE` for execution, but the un-optimized projection still carries the `if` ScalarFunction
     // at naming time, so this is where the Spark column name is produced.
     if sf.func.name() == "if" && sf.args.len() == 3 {
-        let args = sf.args.iter().map(render).collect::<Vec<_>>().join(", ");
+        let args = sf
+            .args
+            .iter()
+            .map(|a| render(a, agg))
+            .collect::<Vec<_>>()
+            .join(", ");
         return format!("(IF({args}))");
     }
     // weft lowers a Spark literal-zero integral `/` (e.g. `1/0`) to the internal `spark_divide`
@@ -154,12 +251,12 @@ fn render_scalar_fn(sf: &ScalarFunction) -> String {
     // render it that way — the operand coercion casts are stripped by `render`, exactly as for a
     // plain `BinaryExpr` divide.
     if sf.func.name() == "spark_divide" && sf.args.len() == 2 {
-        return format!("({} / {})", render(&sf.args[0]), render(&sf.args[1]));
+        return format!("({} / {})", render(&sf.args[0], agg), render(&sf.args[1], agg));
     }
     // Spark names `from_json`'s output column with *only* the JSON argument — the schema string and
     // the optional options map are dropped (`JsonToStructs.prettyName`): `from_json({"a":1})`.
     if sf.func.name() == "from_json" && !sf.args.is_empty() {
-        return format!("from_json({})", render(&sf.args[0]));
+        return format!("from_json({})", render(&sf.args[0], agg));
     }
     // Spark's cast-alias constructors (`int(x)`, `double(x)`, `decimal(x)`, …) name their column
     // after the *child*, exactly like an explicit `CAST(x AS T)` (Spark omits the cast from the
@@ -170,11 +267,11 @@ fn render_scalar_fn(sf: &ScalarFunction) -> String {
         && crate::spark_functions::spark_cast_constructors::CAST_ALIAS_NAMES
             .contains(&sf.func.name())
     {
-        return render(&sf.args[0]);
+        return render(&sf.args[0], agg);
     }
     // Spark `positive(x)` (`UnaryPositive`) prints as `(+ x)`.
     if sf.func.name() == "positive" && sf.args.len() == 1 {
-        return format!("(+ {})", render(&sf.args[0]));
+        return format!("(+ {})", render(&sf.args[0], agg));
     }
     let name = match sf.func.name() {
         "make_array" => "array",
@@ -183,7 +280,7 @@ fn render_scalar_fn(sf: &ScalarFunction) -> String {
     let args = sf
         .args
         .iter()
-        .map(render)
+        .map(|a| render(a, agg))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({args})")
@@ -266,5 +363,65 @@ mod tests {
     fn renders_binary_literal_full_hex() {
         let v = ScalarValue::Binary(Some(vec![0x45, 0x61, 0x00, 0xFF]));
         assert_eq!(render_literal(&v), "X'456100FF'");
+    }
+
+    use datafusion::functions_aggregate::count::count_udaf;
+    use datafusion::functions_aggregate::sum::sum_udaf;
+    use datafusion::logical_expr::expr::AggregateFunctionParams;
+
+    fn agg(name: &str, args: Vec<Expr>, distinct: bool, filter: Option<Expr>) -> Expr {
+        let func = match name {
+            "count" => count_udaf(),
+            "sum" => sum_udaf(),
+            _ => unreachable!(),
+        };
+        Expr::AggregateFunction(AggregateFunction {
+            func,
+            params: AggregateFunctionParams {
+                args,
+                distinct,
+                filter: filter.map(Box::new),
+                order_by: vec![],
+                null_treatment: None,
+            },
+        })
+    }
+
+    #[test]
+    fn renders_aggregate_columns_spark_style() {
+        // `count(*)` is built by DataFusion as `count(Int64(1))` aliased to "count(*)"; Spark names
+        // both `count(*)` and `count(1)` as `count(1)`.
+        let count_star = agg("count", vec![lit(1i64)], false, None).alias("count(*)");
+        // `count(testdata.b)` → Spark `count(b)` (unqualified).
+        let count_col = agg("count", vec![col("testdata.b")], false, None);
+        // `count(DISTINCT 1)` keeps the keyword.
+        let count_distinct = agg("count", vec![lit(1i64)], true, None);
+        // `sum(t.power)` → `sum(power)`.
+        let sum_col = agg("sum", vec![col("t.power")], false, None);
+
+        let map: AggMap = [
+            ("count(*)".to_string(), &count_star),
+            (count_col.schema_name().to_string(), &count_col),
+            (count_distinct.schema_name().to_string(), &count_distinct),
+            (sum_col.schema_name().to_string(), &sum_col),
+        ]
+        .into_iter()
+        .collect();
+
+        let render_ref = |name: &str| render(&col(name), &map);
+        assert_eq!(render_ref("count(*)"), "count(1)");
+        assert_eq!(render_ref(&count_col.schema_name().to_string()), "count(b)");
+        assert_eq!(
+            render_ref(&count_distinct.schema_name().to_string()),
+            "count(DISTINCT 1)"
+        );
+        assert_eq!(render_ref(&sum_col.schema_name().to_string()), "sum(power)");
+
+        // A column not in the aggregate map keeps its (already-unqualified) bare name.
+        assert_eq!(render(&col("k"), &map), "k");
+        // An aggregate nested inside a binary op resolves through the map too: `(count(b) * 3)`.
+        let count_name = count_col.schema_name().to_string();
+        let expr = binary(col(count_name), Operator::Multiply, lit(3i64));
+        assert_eq!(render(&expr, &map), "(count(b) * 3)");
     }
 }

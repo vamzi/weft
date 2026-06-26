@@ -1,10 +1,5 @@
 {
-  "spark_version": "v4.0.0",
-  "files_total": 303,
-  "files_skipped": 63,
   "blocks_total": 12641,
-  "strict_pass": 2793,
-  "semantic_pass": 7397,
   "buckets": {
     "correctness": 277,
     "datetime": 13,
@@ -20,8 +15,13 @@
     "null-semantics": 71,
     "ordering": 51,
     "parser-unsupported": 1238,
-    "pass": 2793,
+    "pass": 2919,
     "requires-udf-registration": 87,
-    "schema-only": 2147
-  }
+    "schema-only": 2021
+  },
+  "files_skipped": 63,
+  "files_total": 303,
+  "semantic_pass": 7397,
+  "spark_version": "v4.0.0",
+  "strict_pass": 2919
 }
