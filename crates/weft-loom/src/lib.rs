@@ -21,6 +21,9 @@ use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
 
+/// Case-insensitive file→table column matching for catalog-declared schemas (Glue/Hive parity).
+mod schema_adapt;
+
 /// Spark-only scalar functions (DataFusion `ScalarUDF`s) registered into every [`Engine`].
 pub mod spark_functions;
 
@@ -513,7 +516,13 @@ pub(crate) async fn build_listing_table(
 
     let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
     let config = match schema {
-        Some(s) => config.with_schema(s),
+        // Declared-schema path: read files *against* the catalog schema. Install a
+        // case-insensitive physical-expression adapter so a lowercase catalog column (Glue's
+        // `vendorid`) binds to a mixed-case file column (`VendorID`) — then DataFusion's default
+        // adapter casts types as usual. Inference path (below) is left untouched.
+        Some(s) => config
+            .with_schema(s)
+            .with_expr_adapter_factory(Arc::new(schema_adapt::CaseInsensitiveExprAdapterFactory)),
         None => config
             .infer_schema(state)
             .await

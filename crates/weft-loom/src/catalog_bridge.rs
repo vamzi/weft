@@ -556,4 +556,95 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Write two Parquet files whose column is named `VendorID` (mixed case) — Int32 in one, Int64
+    /// in the other — mimicking real NYC-taxi monthly dumps. Glue would declare this column as the
+    /// lowercase `vendorid`, so the file→table name match must be case-insensitive.
+    fn write_mixedcase_int_parquet_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weft-mixedcase-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let schema32 = Arc::new(Schema::new(vec![Field::new(
+            "VendorID",
+            DataType::Int32,
+            true,
+        )]));
+        let batch32 = RecordBatch::try_new(
+            schema32.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-a.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema32, None).unwrap();
+        w.write(&batch32).unwrap();
+        w.close().unwrap();
+
+        let schema64 = Arc::new(Schema::new(vec![Field::new(
+            "VendorID",
+            DataType::Int64,
+            true,
+        )]));
+        let batch64 = RecordBatch::try_new(
+            schema64.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-b.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema64, None).unwrap();
+        w.write(&batch64).unwrap();
+        w.close().unwrap();
+
+        dir
+    }
+
+    /// Databricks/Athena parity: a lowercase catalog column (`vendorid`) binds to the mixed-case
+    /// file column (`VendorID`) case-insensitively, *and* the Int32 file is cast to the declared
+    /// Int64 — so `SUM(vendorid)` returns the correct non-null total instead of NULL.
+    #[tokio::test]
+    async fn declared_schema_matches_columns_case_insensitively() {
+        let dir = write_mixedcase_int_parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+        // Glue-style lowercase declared name, widened to Int64.
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "vendorid",
+            DataType::Int64,
+            true,
+        )]));
+
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location,
+                schema: Some(declared),
+            }),
+        );
+
+        let batches = engine
+            .sql("SELECT COUNT(vendorid) AS c, SUM(vendorid) AS s FROM fake.ns.mixed")
+            .await
+            .expect("case-insensitive declared-schema query should succeed");
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        // All 5 rows resolved (not NULL) and summed across both physical types.
+        assert_eq!((c, s), (5, 36)); // 1+2+3+10+20
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
