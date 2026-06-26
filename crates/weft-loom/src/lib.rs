@@ -21,6 +21,9 @@ use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
 
+/// Spark-only scalar functions (DataFusion `ScalarUDF`s) registered into every [`Engine`].
+pub mod spark_functions;
+
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
 pub use datafusion::arrow;
@@ -237,6 +240,7 @@ impl Engine {
             None => SessionContext::new_with_config(config),
         };
         register_spark_function_aliases(&ctx);
+        spark_functions::register(&ctx);
         Self { ctx: Arc::new(ctx) }
     }
 

@@ -4,22 +4,22 @@
   "files_skipped": 63,
   "blocks_total": 12641,
   "strict_pass": 538,
-  "semantic_pass": 5000,
+  "semantic_pass": 5003,
   "buckets": {
-    "correctness": 185,
+    "correctness": 186,
     "datetime": 1,
     "decimal-precision": 136,
     "engine-panic": 1,
     "error-parity": 2464,
-    "exec-error": 943,
+    "exec-error": 951,
     "feature-unsupported": 378,
-    "function-missing": 1624,
+    "function-missing": 1611,
     "missing-error": 110,
     "missing-relation": 2916,
     "null-semantics": 23,
-    "ordering": 20,
+    "ordering": 21,
     "parser-unsupported": 1304,
     "pass": 538,
-    "schema-only": 1998
+    "schema-only": 2001
   }
 }
