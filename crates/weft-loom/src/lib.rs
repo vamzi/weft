@@ -128,6 +128,49 @@ fn strip_temporary_view(query: &str) -> Option<String> {
     Some(format!("{ws}{head}{}", &rest[cur..]))
 }
 
+/// Register Spark function names that DataFusion already implements under a *different* name, as
+/// faithful aliases — same implementation, extra invocation name. Purely additive and zero-risk:
+/// it can only make more Spark SQL resolve, never change an existing result (DataFusion's
+/// `with_aliases` merges, so no built-in alias is dropped). This is "Wave A" of the Spark function
+/// backlog (aliases for functions with identical semantics under another name); real UDF
+/// implementations for Spark-only functions are a separate, larger effort.
+fn register_spark_function_aliases(ctx: &SessionContext) {
+    use datafusion::execution::FunctionRegistry;
+
+    // (Spark name, DataFusion builtin with identical semantics).
+    const SCALAR_ALIASES: &[(&str, &str)] = &[
+        ("startswith", "starts_with"),
+        ("endswith", "ends_with"),
+        ("len", "length"),
+        ("ucase", "upper"),
+        ("lcase", "lower"),
+        ("sign", "signum"),
+        ("char", "chr"),
+    ];
+    const AGG_ALIASES: &[(&str, &str)] = &[
+        ("variance", "var_samp"),
+        ("approx_count_distinct", "approx_distinct"),
+        ("any", "bool_or"),
+        ("some", "bool_or"),
+        ("every", "bool_and"),
+    ];
+
+    let state = ctx.state();
+    for (alias, target) in SCALAR_ALIASES {
+        // If the target isn't registered (name drift across DataFusion versions), skip silently —
+        // never panic the engine over an alias.
+        if let Ok(udf) = state.udf(target) {
+            // `(*udf).clone()` (not `Arc::unwrap_or_clone`, which needs Rust 1.76 > our 1.72 MSRV).
+            ctx.register_udf((*udf).clone().with_aliases([*alias]));
+        }
+    }
+    for (alias, target) in AGG_ALIASES {
+        if let Ok(udaf) = state.udaf(target) {
+            ctx.register_udaf((*udaf).clone().with_aliases([*alias]));
+        }
+    }
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -193,6 +236,7 @@ impl Engine {
             }
             None => SessionContext::new_with_config(config),
         };
+        register_spark_function_aliases(&ctx);
         Self { ctx: Arc::new(ctx) }
     }
 
@@ -542,6 +586,35 @@ mod tests {
             "INSERT INTO t VALUES (1)",
         ] {
             assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spark_function_aliases_resolve() {
+        let engine = Engine::new();
+        // Scalar aliases delegate to the DataFusion builtin with identical semantics.
+        for (q, want) in [
+            ("SELECT startswith('hello', 'he') AS x", "true"),
+            ("SELECT endswith('hello', 'lo') AS x", "true"),
+            ("SELECT len('hello') AS x", "5"),
+            ("SELECT ucase('abc') AS x", "ABC"),
+            ("SELECT lcase('ABC') AS x", "abc"),
+            ("SELECT sign(-3) AS x", "-1"),
+        ] {
+            let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+            let got = crate::arrow::util::pretty::pretty_format_batches(&batches)
+                .unwrap()
+                .to_string();
+            assert!(got.contains(want), "{q} -> expected {want}, got:\n{got}");
+        }
+        // Aggregate aliases too.
+        for q in [
+            "SELECT variance(c) FROM (VALUES (1.0),(2.0),(3.0)) AS t(c)",
+            "SELECT any(c) FROM (VALUES (true),(false)) AS t(c)",
+            "SELECT every(c) FROM (VALUES (true),(false)) AS t(c)",
+            "SELECT approx_count_distinct(c) FROM (VALUES (1),(2),(2)) AS t(c)",
+        ] {
+            engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
         }
     }
 
