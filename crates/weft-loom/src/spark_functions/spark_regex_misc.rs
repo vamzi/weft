@@ -63,33 +63,16 @@ fn to_i32_array(cv: &ColumnarValue, n: usize) -> Result<ArrayRef> {
     Ok(datafusion::arrow::compute::cast(&a, &DataType::Int32)?)
 }
 
-/// Collapse the doubled backslashes that Spark's SQL string-literal parser would have already
-/// removed before the function ever saw the pattern. DataFusion's parser keeps a SQL literal
-/// `'\\d+'` as the four chars `\`,`\`,`d`,`+`, whereas Spark hands the regex engine `\`,`d`,`+`.
-/// We mirror Spark by turning every `\\` into a single `\` (a lone trailing `\` is left as-is, so
-/// the regex engine reports it as an invalid pattern, matching Spark's `PATTERN` error).
-fn spark_unescape_pattern(pat: &str) -> String {
-    let bytes = pat.as_bytes();
-    let mut out = String::with_capacity(pat.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-            out.push('\\');
-            i += 2;
-        } else {
-            // Push the full UTF-8 char starting at `i`.
-            let ch = pat[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
 /// Compile a Spark regex, mapping a compile failure onto Spark's `PATTERN` error wording.
+///
+/// The pattern arrives already decoded: Spark unescapes string literals at parse time, which weft
+/// reproduces in `normalize_spark_sql`'s `unescape_spark_string_literals` (so a SQL literal `'\\d+'`
+/// reaches here as `\d+`, exactly what Spark's regex engine sees). A pattern sourced from a column is
+/// runtime data that Spark does *not* unescape, so it is likewise used verbatim. We therefore do
+/// **no** backslash collapsing here: doing it a second time would corrupt a pattern that
+/// legitimately contains an escaped backslash (`\\`, i.e. a literal backslash).
 fn compile_pattern(func: &str, pat: &str) -> Result<Regex> {
-    let unescaped = spark_unescape_pattern(pat);
-    Regex::new(&unescaped).map_err(|_| {
+    Regex::new(pat).map_err(|_| {
         datafusion::common::DataFusionError::Execution(format!(
             "[INVALID_PARAMETER_VALUE.PATTERN] The value of parameter(s) `regexp` in `{func}` is \
              invalid: '{pat}'"

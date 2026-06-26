@@ -179,12 +179,24 @@ fn fmt_cell(array: &dyn Array, row: usize, nested: bool) -> String {
                 None => leaf(array, row),
             }
         }
-        DataType::Struct(_) => {
+        DataType::Struct(fields) => {
+            // Spark 4.0's `HiveResult.toHiveString` renders a struct value as a JSON-style object
+            // `{"field":value,...}`: every field is emitted (including NULL fields, as
+            // `"field":null`), in schema order, with the value rendered in nested mode (string
+            // leaves quoted, containers recursed). This is harness display only — it never runs on
+            // the engine path; it just aligns weft's rendering with the Spark golden, which quotes
+            // the field name and prefixes each value.
             let s = array.as_any().downcast_ref::<StructArray>().unwrap();
-            let parts: Vec<String> = s
-                .columns()
+            let parts: Vec<String> = fields
                 .iter()
-                .map(|c| fmt_cell(c.as_ref(), row, true))
+                .zip(s.columns().iter())
+                .map(|(f, c)| {
+                    let mut p = String::new();
+                    push_json_field_name(f.name(), &mut p);
+                    p.push(':');
+                    p.push_str(&fmt_cell(c.as_ref(), row, true));
+                    p
+                })
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
@@ -349,6 +361,21 @@ fn fmt_interval_seconds(micros: i64) -> String {
         s.push_str(&format!("{whole}.{}", frac_str.trim_end_matches('0')));
     }
     s
+}
+
+/// Append a struct field name as a JSON-quoted key (matching Spark's `{"name":...}` rendering).
+/// Field names in the corpus are plain identifiers, but quote-escape defensively so an odd name
+/// can never break the surrounding JSON shape.
+fn push_json_field_name(name: &str, out: &mut String) {
+    out.push('"');
+    for c in name.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Leaf rendering via Arrow's display (with `NULL` for nulls) — used for the scalar types

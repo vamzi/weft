@@ -20,11 +20,17 @@ use datafusion::prelude::SessionContext;
 mod spark_aggregates;
 mod spark_aggregates2;
 mod spark_array;
+// `pub(crate)` so `crate::spark_names` can reuse the cast-alias name list for column naming.
+pub(crate) mod spark_cast_constructors;
 mod spark_convert;
 mod spark_datetime;
+// `pub(crate)` (unlike the other internal submodules): `SparkDividePlanner` in `lib.rs` embeds the
+// `spark_divide` UDF directly via `spark_divide::udf()` when lowering a literal-zero integral `/`.
+pub(crate) mod spark_divide;
 mod spark_datetime2;
 mod spark_datetime3;
 mod spark_encoding;
+mod spark_from_json;
 mod spark_if;
 mod spark_json;
 mod spark_math;
@@ -36,6 +42,7 @@ mod try_arithmetic;
 /// Register all Spark-only scalar functions into `ctx`.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(SparkTypeof::new()));
+    spark_cast_constructors::register(ctx);
     try_arithmetic::register(ctx);
     spark_strings::register(ctx);
     spark_encoding::register(ctx);
@@ -45,7 +52,9 @@ pub fn register(ctx: &SessionContext) {
     spark_datetime2::register(ctx);
     spark_datetime3::register(ctx);
     spark_json::register(ctx);
+    spark_from_json::register(ctx);
     spark_if::register(ctx);
+    spark_divide::register(ctx);
     spark_math::register(ctx);
     spark_misc::register(ctx);
     spark_array::register(ctx);
