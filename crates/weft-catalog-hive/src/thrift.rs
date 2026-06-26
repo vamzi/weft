@@ -47,7 +47,13 @@ pub struct HiveTable {
     /// `parameters` — table properties; `table_type=ICEBERG` / `spark.sql.sources.provider=delta`
     /// here are the most reliable format signals.
     pub parameters: Vec<(String, String)>,
-    /// `partitionKeys` column names.
+    /// `sd.cols` — the data columns as `(name, hive_type_string)`, in declaration order. The
+    /// catalog-declared schema the engine coerces files to.
+    pub columns: Vec<(String, String)>,
+    /// `partitionKeys` as `(name, hive_type_string)`, in declaration order. The schema appends
+    /// these after the data columns (matching how Hive lays partitioned tables out on disk).
+    pub partition_typed: Vec<(String, String)>,
+    /// `partitionKeys` column *names* (kept for `TableMetadata::with_partition_columns`).
     pub partition_columns: Vec<String>,
 }
 
@@ -212,8 +218,12 @@ impl MetastoreClient {
             match (fid, ftype) {
                 // 7: StorageDescriptor sd
                 (7, T_STRUCT) => self.read_storage_descriptor(&mut t).await?,
-                // 8: list<FieldSchema> partitionKeys
-                (8, T_LIST) => t.partition_columns = self.read_field_schema_names().await?,
+                // 8: list<FieldSchema> partitionKeys — keep both typed pairs and bare names.
+                (8, T_LIST) => {
+                    let parts = self.read_field_schemas().await?;
+                    t.partition_columns = parts.iter().map(|(n, _)| n.clone()).collect();
+                    t.partition_typed = parts;
+                }
                 // 9: map<string,string> parameters
                 (9, T_MAP) => t.parameters = self.read_string_map().await?,
                 // 12: string tableType
@@ -232,6 +242,8 @@ impl MetastoreClient {
                 break;
             }
             match (fid, ftype) {
+                // 1: list<FieldSchema> cols — the data columns (name + type).
+                (1, T_LIST) => t.columns = self.read_field_schemas().await?,
                 // 2: string location
                 (2, T_STRING) => t.location = Some(self.r_string().await?),
                 // 3: string inputFormat
@@ -260,16 +272,19 @@ impl MetastoreClient {
         Ok(lib)
     }
 
-    /// Read `list<FieldSchema>` and return each schema's `name` (field 1).
-    async fn read_field_schema_names(&mut self) -> Result<Vec<String>> {
+    /// Read `list<FieldSchema>` and return each schema's `(name, type)` — FieldSchema field 1
+    /// (`name`, T_STRING) and field 2 (`type`, the Hive type string, T_STRING). Other FieldSchema
+    /// fields (e.g. field 3 `comment`) are skipped.
+    async fn read_field_schemas(&mut self) -> Result<Vec<(String, String)>> {
         let (elem_type, size) = self.read_list_header().await?;
-        let mut names = Vec::with_capacity(size.max(0) as usize);
+        let mut cols = Vec::with_capacity(size.max(0) as usize);
         for _ in 0..size.max(0) {
             if elem_type != T_STRUCT {
                 self.skip(elem_type).await?;
                 continue;
             }
             let mut name = String::new();
+            let mut ty = String::new();
             loop {
                 let (ftype, fid) = self.read_field_header().await?;
                 if ftype == T_STOP {
@@ -277,12 +292,13 @@ impl MetastoreClient {
                 }
                 match (fid, ftype) {
                     (1, T_STRING) => name = self.r_string().await?,
+                    (2, T_STRING) => ty = self.r_string().await?,
                     _ => self.skip(ftype).await?,
                 }
             }
-            names.push(name);
+            cols.push((name, ty));
         }
-        Ok(names)
+        Ok(cols)
     }
 
     /// Read the first string field of a struct (e.g. an exception's `message`), skipping the rest.
@@ -481,7 +497,10 @@ mod tests {
         // serdeInfo (struct) with serializationLib (field 2)
         write_field(&mut sd, T_STRUCT, 7);
         write_field(&mut sd, T_STRING, 2);
-        write_string(&mut sd, "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe");
+        write_string(
+            &mut sd,
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+        );
         write_stop(&mut sd);
         write_stop(&mut sd);
 
@@ -549,6 +568,100 @@ mod tests {
             .contains("ParquetInputFormat"));
         assert!(t.serde_lib.as_deref().unwrap().contains("ParquetHiveSerDe"));
         assert_eq!(t.table_type.as_deref(), Some("EXTERNAL_TABLE"));
+    }
+
+    /// Encode one `FieldSchema` struct: name (field 1) + type (field 2).
+    fn write_field_schema(buf: &mut Vec<u8>, name: &str, ty: &str) {
+        write_field(buf, T_STRING, 1);
+        write_string(buf, name);
+        write_field(buf, T_STRING, 2);
+        write_string(buf, ty);
+        // A comment field (3) we don't read — proves field-skipping still works.
+        write_field(buf, T_STRING, 3);
+        write_string(buf, "a comment");
+        write_stop(buf);
+    }
+
+    /// Encode a `Table` reply whose sd carries a `cols` list (field 1) of FieldSchemas, plus
+    /// partitionKeys (Table field 8). Exercises the column/type capture path.
+    fn encode_table_with_columns(seq: i32) -> Vec<u8> {
+        let mut sd = Vec::new();
+        // field 1: list<FieldSchema> cols
+        write_field(&mut sd, T_LIST, 1);
+        sd.push(T_STRUCT);
+        write_i32(&mut sd, 2); // two data columns
+        write_field_schema(&mut sd, "vendor_id", "int");
+        write_field_schema(&mut sd, "fare", "bigint");
+        // field 2: location
+        write_field(&mut sd, T_STRING, 2);
+        write_string(&mut sd, "file:///wh/db.db/trips");
+        write_field(&mut sd, T_STRING, 3); // inputFormat
+        write_string(
+            &mut sd,
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        );
+        write_stop(&mut sd);
+
+        let mut table = Vec::new();
+        write_field(&mut table, T_STRING, 1); // tableName
+        write_string(&mut table, "trips");
+        write_field(&mut table, T_STRUCT, 7); // sd
+        table.extend_from_slice(&sd);
+        // field 8: list<FieldSchema> partitionKeys (one column)
+        write_field(&mut table, T_LIST, 8);
+        table.push(T_STRUCT);
+        write_i32(&mut table, 1);
+        write_field_schema(&mut table, "month", "string");
+        write_field(&mut table, T_STRING, 12); // tableType
+        write_string(&mut table, "EXTERNAL_TABLE");
+        write_stop(&mut table);
+
+        let mut result = Vec::new();
+        write_field(&mut result, T_STRUCT, 0); // success
+        result.extend_from_slice(&table);
+        write_stop(&mut result);
+
+        let mut msg = Vec::new();
+        write_i32(&mut msg, (VERSION_1 | 2u32) as i32); // REPLY
+        write_string(&mut msg, "get_table");
+        write_i32(&mut msg, seq);
+        msg.extend_from_slice(&result);
+        msg
+    }
+
+    #[tokio::test]
+    async fn parses_columns_with_types() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reply = encode_table_with_columns(1);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(&reply).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let mut client = MetastoreClient::connect(&addr.ip().to_string(), addr.port())
+            .await
+            .unwrap();
+        let t = client.get_table("db", "trips").await.unwrap();
+        // Data columns captured in order, with types.
+        assert_eq!(
+            t.columns,
+            vec![
+                ("vendor_id".to_string(), "int".to_string()),
+                ("fare".to_string(), "bigint".to_string()),
+            ]
+        );
+        // Partition key captured both typed and as a bare name (the latter preserved for
+        // `with_partition_columns`).
+        assert_eq!(
+            t.partition_typed,
+            vec![("month".to_string(), "string".to_string())]
+        );
+        assert_eq!(t.partition_columns, vec!["month".to_string()]);
+        assert_eq!(t.location.as_deref(), Some("file:///wh/db.db/trips"));
     }
 
     #[tokio::test]
