@@ -17,9 +17,16 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
+mod spark_encoding;
+mod spark_strings;
+mod try_arithmetic;
+
 /// Register all Spark-only scalar functions into `ctx`.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(SparkTypeof::new()));
+    try_arithmetic::register(ctx);
+    spark_strings::register(ctx);
+    spark_encoding::register(ctx);
 }
 
 /// `typeof(expr)` — Spark returns the *type name* of the argument (e.g. `int`, `string`,

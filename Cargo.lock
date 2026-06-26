@@ -4646,6 +4646,7 @@ dependencies = [
  "datafusion",
  "object_store",
  "rayon",
+ "regex",
  "tokio",
  "weft-catalog",
  "weft-common",
