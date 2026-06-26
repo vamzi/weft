@@ -186,13 +186,16 @@ Remaining backlog (`ROADMAP.md` → function-registration notes, Waves B–F): U
 coverage; `mask` variants; `regexp_replace`/`regexp_substr`; `from_csv`/`to_csv`. Per-wave yield is
 now ~+30–60 semantic — worthwhile but no longer the dominant lever.
 
-### 6.4 Column-naming pass — THE biggest STRICT lever (large, structural)
-`schema-only` (2,194) = right rows, wrong output column NAME. DataFusion emits `Utf8("hello")`,
-`count(testdata.a)`, unparenthesized `a = 1`; Spark emits `hello`, `count(a)`, `(a = 1)`. Converting
-these to strict passes requires reproducing Spark's `Expression.sql`/`prettyName` output-naming
-algorithm as a **plan-output naming pass** (walk the analyzed projection list, rename columns) — NOT
-a string hack, and correctness-sensitive (column resolution depends on names). See ROADMAP §1d/§2
-(stage-3 "project_spark_names"). Build it incrementally; each naming rule flips a sub-bucket.
+### 6.4 Column-naming pass — THE biggest STRICT lever (large, structural)  ·  **see `COLUMN_NAMING_PASS.md`**
+`schema-only` (now **2,456**) = right rows, wrong output column NAME. DataFusion emits `Utf8("hello")`,
+`count(testdata.a)`, `make_array(…)`, unparenthesized `a = 1`; Spark emits `hello`, `count(a)`,
+`array(…)`, `(a = 1)`. Converting these to strict passes requires reproducing Spark's
+`Expression.sql`/`prettyName` output-naming as a **plan-output naming pass** (re-alias the top output
+projection only) — NOT a harness/string hack, and correctness-sensitive (column resolution depends on
+names). **A full, data-grounded plan for this pass — the prioritized naming rules with measured
+frequencies, the engine hook points, the hard correctness constraints, and an implementation sketch —
+is in `crates/weft-spark-compat/COLUMN_NAMING_PASS.md`. Start there.** See also ROADMAP §1d/§2
+(stage-3 "project_spark_names").
 
 ### 6.5 `CREATE TABLE … USING <format>` — biggest cascade (needs a real feature)
 ~120 direct `parser-unsupported` + thousands of downstream `missing-relation`. **Do NOT** shim by
@@ -251,8 +254,11 @@ agents may add deps (`regex`, `serde_json`) — declare them in `weft-loom/Cargo
   confirm all errors are outside your files (the compiler lists every error) before worrying.
 
 ## 9. Pointers
+- **`crates/weft-spark-compat/COLUMN_NAMING_PASS.md` — the next pass (output column-naming, the
+  biggest strict lever). Start here.**
 - `crates/weft-spark-compat/ROADMAP.md` — the per-cluster verdicts + dialect-layer architecture.
 - `crates/weft-spark-compat/README.md` — harness internals + how to run.
 - Memory: `~/.claude/.../memory/spark-parity-harness.md`.
 - My parity commits: `c9a6dd6`, `1c4694f`, `f927cbe`, `cb81580`, `f0c1947`, `55b4c54`, `8458824`,
-  `070429b` (interleaved with the concurrent platform commits).
+  `070429b`, `e8057e3` (UDF wave 4 + binary rendering), `57e7aa5` (typed literals) — interleaved
+  with the concurrent platform commits.
