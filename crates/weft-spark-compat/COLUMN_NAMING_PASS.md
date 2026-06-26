@@ -1,8 +1,49 @@
-# Next pass — Spark output column-naming (the strict-parity lever)
+# Spark output column-naming (the strict-parity lever)
 
-> Hand this file to the next session. Read `HANDOFF.md` first for the overall mission, how to run
-> the harness, and the faithfulness rule; this doc is the deep dive for the single biggest remaining
-> **strict** lever. Everything is on branch `feat/spark-parity-harness`.
+> Read `HANDOFF.md` first for the overall mission, how to run the harness, and the faithfulness rule;
+> this doc is the deep dive for the biggest **strict** lever. Everything is on branch
+> `feat/spark-parity-harness`.
+
+## DONE so far — wave 1 (commit `74f36a2`, 2026-06-25): strict 669→988 (+319), semantic held
+
+Implemented in **`crates/weft-loom/src/spark_names.rs`**, wired into `Engine::sql`/`Engine::schema`
+through the new `Engine::plan_spark` helper. The design diverged from the original sketch below in
+one load-bearing way — read this before continuing:
+
+- **Outer projection, NOT in-place rename.** The original plan (§"Where to hook it") was to descend
+  to the top `Projection` and re-alias its expressions in place. **That is unsafe and was measured to
+  cost +57 exec-errors:** a `Sort`/`Filter`/CTE/window *above* the projection references its output
+  columns *by name*, so renaming them in place breaks `ORDER BY 1`, `GROUP BY ALL`, window plans, etc.
+  The shipped approach instead reads the top projection's exprs (to know the Spark names) but wraps
+  the **whole** plan in one new *outer* `Projection` (`SELECT col0 AS spark0, … FROM (orig plan)`).
+  The inner plan stays byte-identical, so nothing internal can break. Duplicate output names
+  (`SELECT 1, 1`) → bail to the original plan (DataFusion projections forbid dup names; Spark allows).
+- **Rules shipped:** literal type-wrappers stripped (Rule 1), table qualifiers stripped (Rule 2),
+  `make_array`→`array` (Rule 3), binary ops parenthesized (Rule 4), comma-space arg lists, `Cast`
+  unwrap, `Negative`/`Not`/`IS [NOT] NULL`, full-length `X'…'` binary + `DATE '…'` (Rule 6). Anything
+  not modelled falls back to DataFusion's own name (safe — stays `schema-only`, never regresses).
+- **Verified faithful & regression-free:** semantic held at 5,599 exactly, no `correctness`/
+  `exec-error`/etc. bucket rose. Ratchet re-based to the 3-run strict floor (987; 988/987/987).
+
+### What's left (two follow-ons) — and why wave 1 stopped here
+The remaining `schema-only` (2,138) is **no longer dominated by name divergences**:
+
+- **int-vs-bigint type spelling (~228 + array-nested)** — the biggest remaining chunk, and **not a
+  name problem** (`k:int` vs `k:bigint`). Out of scope for a *naming* pass; it's a literal-default-type
+  change (Spark `INT` vs DataFusion `Int64`) that touches arithmetic/overflow → its own investigation.
+- **Aggregate output names** (`count(*)`→`count(1)`, `count(t.a)`→`count(a)`, `max(t.c)`→`max(c)`) —
+  a `render_aggregate` path was prototyped and **reverted (moved ≈0)**: in `Projection → Aggregate`
+  the projection references the aggregate as a bare `Column` named `count(*)`, and the
+  `AggregateFunction` expr lives in the child `Aggregate` node, which the outer-projection renamer
+  never enters. The fix is to special-case a top-projection `Column` that resolves to an `Aggregate`
+  output: find that aggregate's expr in the child node and render *it*. **Most aggregate rows are also
+  int/bigint-double-blocked**, so do this *together with* the int/bigint fix or it won't move the
+  number. The reverted prototype (count-star→`count(1)`, unqualified agg args, FILTER rendering,
+  `Negative(literal)`→`-1`) is in this session's history if useful.
+
+Everything below is the original plan; the rules are now mostly shipped (§ DONE), kept for reference.
+
+---
 
 ## TL;DR
 

@@ -9,11 +9,24 @@ Weft is a drop-in Apache Spark replacement on DataFusion 54. We **measure** Spar
 replaying Apache Spark v4.0.0's *own* golden SQL tests through weft and diffing against Spark's
 committed `.sql.out` outputs, with a CI ratchet so parity can only rise.
 
-**Current parity (deterministic): semantic 44.3% (5,599 / 12,641), strict 5.3% (669 floor).**
-Up from 25.5% / 2.2% at the start. To continue, the biggest structural lever is the **column-naming
-pass** (§6.4) — `schema-only` is now 2,456, all semantic-passing but strict-failing; another
-**function wave** (§6.3) is the steady low-risk option. (The "session-timezone quick win" was tested
-and disproven — see §6.1.)
+**Current parity (deterministic): semantic 44.3% (5,599 / 12,641), strict 7.8% (987 floor).**
+Up from 25.5% / 2.2% at the start. The **column-naming pass** (§6.4) just landed its first wave —
+strict jumped 669→988 (5.3%→7.8%) with semantic held exactly and zero bad-bucket regressions (see
+`COLUMN_NAMING_PASS.md` "DONE so far"). `schema-only` fell 2,456→2,138; the remaining bucket is now
+dominated by the **int-vs-bigint literal-default-type** divergence (~228+, out of scope — separate
+risky type fix) and **aggregate output names** (blocked — aggregates are referenced as `Column`s in
+`Projection→Aggregate`, so the outer-projection renamer can't reach them; see §6.4). The steady
+low-risk option remains another **function wave** (§6.3). (The "session-timezone quick win" was
+tested and disproven — see §6.1.)
+
+**Column-naming wave 1 (2026-06-25).** New `crates/weft-loom/src/spark_names.rs`: wraps the top
+result projection in an outer renaming projection emitting Spark's `Expression.sql`/`prettyName`
+output names (bare literals, unqualified columns, `make_array`→`array`, parenthesized binary ops,
+comma-space arg lists, `X'…'`/`DATE '…'` literals). Wired into `Engine::sql`/`Engine::schema` via
+`plan_spark`. The *outer*-projection design (not in-place rename of the inner projection) is the
+load-bearing correctness choice — a `Sort`/`Filter`/CTE/window above the projection references its
+columns by name, so an in-place rename breaks `ORDER BY 1`/`GROUP BY ALL`/window plans (measured:
++57 exec-errors before the redesign). Commit `74f36a2`.
 
 **Wave 4b (2026-06-25): Spark typed-literal parser.** `normalize_spark_sql` now rewrites Spark's
 suffixed numeric literals — `1L`/`2Y`/`3S`/`1.0F`/`1.0D`/`1.0BD` — into `CAST(<n> AS <type>)`
@@ -118,12 +131,12 @@ and refresh `site/public/parity.{html,json}` from the run's `parity.html`/`score
 | bucket | count | meaning / where the work is |
 |---|---:|---|
 | `missing-relation` | 2,572 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
-| `schema-only` | 2,456 | ✓ right values, divergent column name — **the strict lever (§6.4)** |
+| `schema-only` | 2,138 | ✓ right values, divergent column name — wave 1 landed; remainder is mostly int/bigint type + aggregate names (§6.4) |
 | `error-parity` | 2,443 | ✓ both engines reject (semantic pass) |
 | `parser-unsupported` | 1,348 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
 | `function-missing` | 1,133 | functions still unimplemented (§6.3) |
 | `exec-error` | 955 | misc execution failures |
-| `pass` | 669 | ✓ strict |
+| `pass` | 988 | ✓ strict (was 669 before column-naming wave 1; floor 987) |
 | `feature-unsupported` | 459 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
 | `correctness` | 244 | **genuine wrong answers — highest trust priority** (mostly cascade-unblocked rows hitting pre-existing gaps, not new-code bugs) |
 | `decimal-precision` | 143 | precision/scale/rounding |
@@ -186,16 +199,31 @@ Remaining backlog (`ROADMAP.md` → function-registration notes, Waves B–F): U
 coverage; `mask` variants; `regexp_replace`/`regexp_substr`; `from_csv`/`to_csv`. Per-wave yield is
 now ~+30–60 semantic — worthwhile but no longer the dominant lever.
 
-### 6.4 Column-naming pass — THE biggest STRICT lever (large, structural)  ·  **see `COLUMN_NAMING_PASS.md`**
-`schema-only` (now **2,456**) = right rows, wrong output column NAME. DataFusion emits `Utf8("hello")`,
-`count(testdata.a)`, `make_array(…)`, unparenthesized `a = 1`; Spark emits `hello`, `count(a)`,
-`array(…)`, `(a = 1)`. Converting these to strict passes requires reproducing Spark's
-`Expression.sql`/`prettyName` output-naming as a **plan-output naming pass** (re-alias the top output
-projection only) — NOT a harness/string hack, and correctness-sensitive (column resolution depends on
-names). **A full, data-grounded plan for this pass — the prioritized naming rules with measured
-frequencies, the engine hook points, the hard correctness constraints, and an implementation sketch —
-is in `crates/weft-spark-compat/COLUMN_NAMING_PASS.md`. Start there.** See also ROADMAP §1d/§2
-(stage-3 "project_spark_names").
+### 6.4 Column-naming pass — wave 1 LANDED (`spark_names.rs`); two follow-ons remain
+Wave 1 (commit `74f36a2`) converted **+319** schema-only→strict via `crates/weft-loom/src/spark_names.rs`
+(scalar literals/columns/functions/binary-ops/casts). The remaining `schema-only` (2,138) splits into:
+
+1. **int-vs-bigint literal-default-type** (~228 + nested-in-array cases): Spark integer literals
+   default to `INT`, DataFusion to `Int64`/`BIGINT`, so `k:int`/`array<int>` (golden) shows as
+   `k:bigint`/`array<bigint>` (weft). This is **not a name issue** — it's a type-spelling divergence
+   and the *single biggest* remaining schema-only chunk. Fixing it (coerce integer literal default to
+   Int32) is risky: it affects arithmetic/overflow semantics and could move the `correctness` bucket.
+   Own investigation, own ratchet. Many aggregate rows are *double-blocked* (name **and** type), so
+   this must land for aggregate-naming to pay off.
+2. **Aggregate output names** (`count(testdata.a)`→`count(a)`, `count(*)`→`count(1)`, `max(t.c)`→`max(c)`):
+   I prototyped a `render_aggregate` path (count(*)→count(1), unqualified args, FILTER) but it moved
+   **≈0** and was reverted, because in `SELECT k, count(*) … GROUP BY k` the plan is
+   `Projection → Aggregate` — the projection references the aggregate by a bare **`Column`** named
+   `count(*)`, while the `AggregateFunction` expr lives in the `Aggregate` node, which the
+   outer-projection renamer deliberately never enters. To fix: when a top-projection column is a bare
+   `Column` resolving to an `Aggregate` output, look up that aggregate's expr in the child `Aggregate`
+   node and render *it* (Spark-style) for the output name. Combine with (1) since most are double-blocked.
+
+Also deferred from wave 1 (low yield, listed in `COLUMN_NAMING_PASS.md`): typed-null `CAST(NULL AS T)`
+spelling, explicit-cast retention (`bit_count(CAST(1 AS TINYINT))` — Spark keeps *user* casts in the
+name but strips coercion casts; hard to distinguish from the plan), Spark-name reverse-aliases
+(`var_samp`→`variance`). **Full data-grounded plan + the implemented rules: `COLUMN_NAMING_PASS.md`.**
+See also ROADMAP §1d/§2 (stage-3 "project_spark_names").
 
 ### 6.5 `CREATE TABLE … USING <format>` — biggest cascade (needs a real feature)
 ~120 direct `parser-unsupported` + thousands of downstream `missing-relation`. **Do NOT** shim by
