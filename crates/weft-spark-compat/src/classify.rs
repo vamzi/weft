@@ -48,6 +48,10 @@ pub enum Bucket {
     MissingError,
     /// Both produced rows of the same shape but the values are wrong. Highest-signal failure.
     Correctness,
+    /// The query uses a per-run-nondeterministic function (`rand`/`random`/`uuid`/`shuffle`), so it
+    /// can never byte-match a fixed golden and its verdict would otherwise flip run-to-run. Scored
+    /// as neither pass nor fail so the parity numbers (and the CI ratchet) stay deterministic.
+    Nondeterministic,
 }
 
 impl Bucket {
@@ -73,8 +77,27 @@ pub struct Verdict {
     pub detail: String,
 }
 
+/// Per-run-nondeterministic SQL functions: a query calling one of these produces different output
+/// every run, so it can never byte-match a fixed golden and must not be allowed to flip the score.
+fn is_nondeterministic(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    ["rand(", "rand ", "random(", "randn(", "uuid(", "shuffle("]
+        .iter()
+        .any(|f| lower.contains(f))
+}
+
 /// Classify one replayed block against its golden expectation.
 pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
+    // A nondeterministic query is unscoreable against a fixed golden — bucket it stably (excluded
+    // from both pass scores) so the corpus totals and the ratchet are reproducible. Errors are
+    // exempt: if the query errors on both sides it is still a deterministic outcome.
+    if is_nondeterministic(&golden.sql) && matches!(actual, Outcome::Ok { .. }) {
+        return Verdict {
+            bucket: Bucket::Nondeterministic,
+            detail: "uses rand/uuid/shuffle — unscoreable vs fixed golden".into(),
+        };
+    }
+
     let expects_error = golden.expects_error();
 
     match actual {
