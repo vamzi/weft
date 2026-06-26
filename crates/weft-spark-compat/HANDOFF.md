@@ -9,15 +9,39 @@ Weft is a drop-in Apache Spark replacement on DataFusion 54. We **measure** Spar
 replaying Apache Spark v4.0.0's *own* golden SQL tests through weft and diffing against Spark's
 committed `.sql.out` outputs, with a CI ratchet so parity can only rise.
 
-**Current parity (deterministic): semantic 44.3% (5,599 / 12,641), strict 7.8% (987 floor).**
-Up from 25.5% / 2.2% at the start. The **column-naming pass** (§6.4) just landed its first wave —
-strict jumped 669→988 (5.3%→7.8%) with semantic held exactly and zero bad-bucket regressions (see
-`COLUMN_NAMING_PASS.md` "DONE so far"). `schema-only` fell 2,456→2,138; the remaining bucket is now
-dominated by the **int-vs-bigint literal-default-type** divergence (~228+, out of scope — separate
-risky type fix) and **aggregate output names** (blocked — aggregates are referenced as `Column`s in
-`Projection→Aggregate`, so the outer-projection renamer can't reach them; see §6.4). The steady
-low-risk option remains another **function wave** (§6.3). (The "session-timezone quick win" was
-tested and disproven — see §6.1.)
+**Current parity (deterministic): semantic 45.6% (5,767 / 12,641), strict 10.5% (1,322 floor).**
+Up from 25.5% / 2.2% at the start.
+
+**Coordinator iteration (2026-06-26)** — a multi-swarm pass landed six faithful levers (strict
+988→1,322 (+334), semantic 5,599→5,767 (+168), correctness 244→169 (−75), function-missing 1,133→959):
+1. **int-vs-bigint literal-default-type** (`spark_int_literals.rs`, the +278-strict lever): integer
+   literals now plan as `Int32` when in 32-bit range (Spark's `IntegerType`), `Int64` otherwise; the
+   retype runs on the **raw pre-analysis plan** so DataFusion's `TypeCoercion` re-derives all
+   downstream types exactly as Spark does. A `NamePreserver` keeps `HAVING`/`EXCEPT`/`INTERSECT`/
+   lateral by-name references resolvable; any node that can't re-validate aborts the whole rewrite to
+   the original plan. `schema-only` 2,138→1,966; zero bad-bucket movement.
+2. **`if(c,a,b)`** (`spark_functions/spark_if.rs`): a `ScalarUDF` whose `simplify()` rewrites to
+   `Expr::Case`, so Spark's short-circuit + `CASE` branch-coercion come for free (a 3-arg UDF could
+   not — it would eagerly evaluate both branches). function-missing −67.
+3. **Spark `/` true-division** (`SparkDividePlanner` `ExprPlanner` in `lib.rs`): integral `/` lowers
+   to `CAST(.. AS DOUBLE) / CAST(.. AS DOUBLE)` (Spark's `Divide` contract; `7/2`=`3.5` not `3`).
+   Literal-zero divisor stays on the integer path to preserve Spark ANSI `DIVIDE_BY_ZERO`. (Residual:
+   a runtime *column*-valued zero divisor yields `Inf` rather than Spark's error — narrow, untested,
+   strictly less corrupting than the integer truncation it replaces; follow-up.)
+4. **Spark `round`/`bround`** (`spark_functions/spark_math.rs`): integral-typed, `HALF_UP`/`HALF_EVEN`
+   in exact i128, ANSI overflow — overrides DataFusion's float-coercing `round`. correctness −20.
+5. **regexp** (`spark_regex_misc.rs` + harness `format.rs`): `regexp_extract_all` Hive-style render +
+   engine fixes. correctness −29.
+6. **interval** (harness `format.rs`): render Arrow intervals as Spark's `CalendarInterval.toString`.
+   correctness −9.
+Plus a **denominator-honesty** classifier fix (`classify.rs`/`report.rs`): 87 Scala/JVM/Python
+test-fixture functions (`udaf(`/`udtf`/`mydoubleavg(` in `udaf/*.sql`, `udtf/udtf.sql`) move from
+`function-missing` to the excluded `requires-udf-registration` bucket (0 pass change — these are
+harness scaffolding, not weft SQL gaps). **The `cast-constructors` lever (`float()`/`double()`/… →
+CAST, ~110 rows) did NOT land — its swarm agent died on the account spend limit; it is the top
+queued lever for the next iteration, alongside the designed `CREATE TABLE … USING` front-end (§6.5,
+biggest remaining cascade, ~+600–1000 strict).** (The "session-timezone quick win" was tested and
+disproven — see §6.1.)
 
 **Column-naming wave 1 (2026-06-25).** New `crates/weft-loom/src/spark_names.rs`: wraps the top
 result projection in an outer renaming projection emitting Spark's `Expression.sql`/`prettyName`
@@ -131,16 +155,17 @@ and refresh `site/public/parity.{html,json}` from the run's `parity.html`/`score
 | bucket | count | meaning / where the work is |
 |---|---:|---|
 | `missing-relation` | 2,572 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
-| `schema-only` | 2,138 | ✓ right values, divergent column name — wave 1 landed; remainder is mostly int/bigint type + aggregate names (§6.4) |
-| `error-parity` | 2,443 | ✓ both engines reject (semantic pass) |
-| `parser-unsupported` | 1,348 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
-| `function-missing` | 1,133 | functions still unimplemented (§6.3) |
-| `exec-error` | 955 | misc execution failures |
-| `pass` | 988 | ✓ strict (was 669 before column-naming wave 1; floor 987) |
+| `error-parity` | 2,448 | ✓ both engines reject (semantic pass) |
+| `schema-only` | 1,966 | ✓ right values, divergent column name — int-literal pass cut this 2,138→1,966; remainder is aggregate names + decimal/typed-null display (§6.4) |
+| `parser-unsupported` | 1,345 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
+| `pass` | 1,322 | ✓ strict (floor 1,322; was 988 pre-iteration; ±1 union.sql tie) |
+| `function-missing` | 959 | functions still unimplemented — next: cast-constructors (~110), §6.3 |
+| `exec-error` | 957 | misc execution failures (+2: ifCoercion rows now plan deeper) |
 | `feature-unsupported` | 459 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
-| `correctness` | 244 | **genuine wrong answers — highest trust priority** (mostly cascade-unblocked rows hitting pre-existing gaps, not new-code bugs) |
+| `correctness` | 169 | **genuine wrong answers — highest trust priority** (down 244→169 via round/division/regexp/interval) |
 | `decimal-precision` | 143 | precision/scale/rounding |
-| `missing-error` | 131 | weft too lenient (Spark rejects, weft accepts) |
+| `missing-error` | 126 | weft too lenient (Spark rejects, weft accepts) |
+| `requires-udf-registration` | 87 | excluded: Scala/JVM/Python test fixtures (`udaf`/`udtf`/`mydoubleavg`) — not weft gaps |
 | `null-semantics` | 47 | three-valued-logic |
 | `ordering` | 31 | ✓ counted semantic |
 | `datetime` | 6 | tz-naive TIMESTAMP gap — not a quick win (§6.1) |
