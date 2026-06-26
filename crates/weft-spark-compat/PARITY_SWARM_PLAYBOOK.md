@@ -29,7 +29,8 @@ agents can take it. Be decisive about the ceiling rather than chasing a number t
   residual as an explicit, itemized, opt-in list* — don't inflate the number with lossy rewrites.
   A faithful 70% strict beats a lossy 95%. (Memory: [[user-prefers-decisive-research-grounded-pushback]].)
 
-The current floor (post column-naming wave 1): **strict 7.8% (987), semantic 44.3% (5,599).**
+The current floor (post coordinator iteration 2026-06-26): **strict 10.5% (1,322), semantic 45.6% (5,767).**
+(Was strict 7.8% (987) / semantic 44.3% (5,599) after column-naming wave 1.)
 
 ---
 
