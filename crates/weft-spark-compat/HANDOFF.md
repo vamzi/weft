@@ -9,8 +9,34 @@ Weft is a drop-in Apache Spark replacement on DataFusion 54. We **measure** Spar
 replaying Apache Spark v4.0.0's *own* golden SQL tests through weft and diffing against Spark's
 committed `.sql.out` outputs, with a CI ratchet so parity can only rise.
 
-**Current parity (deterministic): semantic 45.6% (5,767 / 12,641), strict 10.5% (1,322 floor).**
+**Current parity (deterministic): semantic 58.5% (7,397 / 12,641), strict 22.1% (2,793 floor).**
 Up from 25.5% / 2.2% at the start.
+
+**Coordinator iteration 2 (2026-06-26)** — landed the two biggest cascade levers (strict 1,322→2,793
+(+1,471), semantic 5,767→7,397 (+1,630)):
+1. **CREATE TABLE … USING** (`spark_create_table.rs`): lowers `CREATE TABLE [IF NOT EXISTS] name (cols)
+   USING {parquet|orc|csv|json}` to a REAL format-backed `CREATE EXTERNAL TABLE … STORED AS <fmt>
+   LOCATION '<per-engine warehouse>/name/'` (genuine durable storage, NOT the forbidden MemTable strip;
+   round-trip proven by unit tests incl. the CSV NULL-vs-empty trap). INSERT returns `vec![]` so DML
+   renders Spark's empty `struct<>`. Falls through to the original parse error for anything it can't
+   faithfully lower (CTAS, PARTITIONED BY, OPTIONS, exotic types) — never a regression. **missing-relation
+   2,572→900 (−1,672).** Deferred follow-ons: CTAS, PARTITIONED BY, OPTIONS/LOCATION (see
+   `CREATE_TABLE_USING_DESIGN.md`).
+2. **cast-constructors** (`spark_functions/spark_cast_constructors.rs`): `float()/double()/string()/
+   boolean()/binary()/date()/int()/…(x)` → faithful Spark CAST + `positive(x)`. **function-missing −238.**
+3. **LIKE ALL/ANY/SOME** (lib.rs): quantified `expr [I]LIKE {ALL|ANY} (p1,…)` → AND/OR chains.
+4. **from_json family** (`spark_functions/spark_from_json.rs`): a Spark DDL/DataType schema-string parser +
+   `from_json` scalar (partial — highest-value subset).
+5. **Correctness:** `spark_divide.rs` (literal-zero integral `/` carries DOUBLE type + ANSI error) and a
+   Spark `unescapeSQLString` pass over single-quoted literals (ilike) — correctness fixes, refutation-checked.
+
+> **Cascade unmasking (read this before reacting to the bucket table).** Unblocking ~1,900 rows that
+> *could not run* before (missing-relation/function-missing) exposed pre-existing downstream gaps, so
+> several "bad" buckets ROSE (correctness 169→277, exec-error 957→1,093, decimal 143→189, missing-error
+> 126→166, null-semantics 47→71, datetime 6→13, engine-panic 1→3). A per-file audit confirmed **NO file
+> lost a strict (byte-correct) pass** — these are honest now-visible backlog, not regressions. Next
+> iterations target exactly this surfaced backlog (decimal-precision, the typeCoercion correctness rows,
+> aggregate output names — the column-naming-wave-2 agent died on an API stall and is re-queued).
 
 **Coordinator iteration (2026-06-26)** — a multi-swarm pass landed six faithful levers (strict
 988→1,322 (+334), semantic 5,599→5,767 (+168), correctness 244→169 (−75), function-missing 1,133→959):
@@ -154,23 +180,23 @@ and refresh `site/public/parity.{html,json}` from the run's `parity.html`/`score
 
 | bucket | count | meaning / where the work is |
 |---|---:|---|
-| `missing-relation` | 2,572 | cascade from a failed setup stmt (mostly `CREATE TABLE … USING` — §6.5) |
-| `error-parity` | 2,448 | ✓ both engines reject (semantic pass) |
-| `schema-only` | 1,966 | ✓ right values, divergent column name — int-literal pass cut this 2,138→1,966; remainder is aggregate names + decimal/typed-null display (§6.4) |
-| `parser-unsupported` | 1,345 | Spark syntax DataFusion rejects (`CREATE TABLE … USING`, PIVOT, USE) |
-| `pass` | 1,322 | ✓ strict (floor 1,322; was 988 pre-iteration; ±1 union.sql tie) |
-| `function-missing` | 959 | functions still unimplemented — next: cast-constructors (~110), §6.3 |
-| `exec-error` | 957 | misc execution failures (+2: ifCoercion rows now plan deeper) |
-| `feature-unsupported` | 459 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
-| `correctness` | 169 | **genuine wrong answers — highest trust priority** (down 244→169 via round/division/regexp/interval) |
-| `decimal-precision` | 143 | precision/scale/rounding |
-| `missing-error` | 126 | weft too lenient (Spark rejects, weft accepts) |
+| `pass` | 2,793 | ✓ strict (floor 2,793; was 1,322 pre-iteration-2; ±1 union.sql tie) |
+| `error-parity` | 2,406 | ✓ both engines reject (semantic pass) |
+| `schema-only` | 2,147 | ✓ right values, divergent column name — aggregate names (column-naming wave 2, agent died) + decimal/typed-null display + the unmasked CREATE/INSERT rows (§6.4) |
+| `parser-unsupported` | 1,238 | Spark syntax DataFusion rejects (PIVOT, USE, CTAS/PARTITIONED-BY CREATE TABLE) |
+| `exec-error` | 1,093 | misc execution failures (rose +136 — unmasked rows from numeric/float8/timestamp now plan deeper) |
+| `missing-relation` | 900 | cascade from a failed setup stmt (was 2,572; CREATE TABLE USING landed — remaining are CTAS/exotic-type CREATEs) |
+| `function-missing` | 721 | functions still unimplemented — listagg, from_xml/csv, percentile_disc, grouping_id (§6.3) |
+| `feature-unsupported` | 482 | PIVOT, `USE db`, SHOW CREATE TABLE, … |
+| `correctness` | 277 | **genuine wrong answers — highest trust** (rose 169→277 via cascade unmasking; pre-existing gaps in collations/numeric/window now visible) |
+| `decimal-precision` | 189 | precision/scale/rounding (rose +46 unmasked — next target, the decimalArith/window-literal pass was deferred) |
+| `missing-error` | 166 | weft too lenient (rose +40 unmasked: tables now exist, weft accepts queries Spark rejects) |
 | `requires-udf-registration` | 87 | excluded: Scala/JVM/Python test fixtures (`udaf`/`udtf`/`mydoubleavg`) — not weft gaps |
-| `null-semantics` | 47 | three-valued-logic |
-| `ordering` | 31 | ✓ counted semantic |
-| `datetime` | 6 | tz-naive TIMESTAMP gap — not a quick win (§6.1) |
-| `nondeterministic` | 3 | rand/uuid/shuffle — excluded from scoring by design |
-| `engine-panic` | 1 | DataFusion `panic!` on `COUNT(DISTINCT a,b)` (§6.6) |
+| `null-semantics` | 71 | three-valued-logic (rose +24 unmasked) |
+| `ordering` | 51 | ✓ counted semantic |
+| `datetime` | 13 | tz-naive TIMESTAMP gap (rose +7 unmasked in postgreSQL/timestamp) — §6.1 |
+| `nondeterministic` | 4 | rand/uuid/shuffle — excluded from scoring by design |
+| `engine-panic` | 3 | DataFusion `panic!` (rose +2 unmasked in view-schema-binding/compensation; panic-isolated per block) — §6.6 |
 
 ## 5. Mine the backlog (how to pick the next target)
 ```bash

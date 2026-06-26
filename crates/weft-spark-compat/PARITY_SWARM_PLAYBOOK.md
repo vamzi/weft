@@ -29,8 +29,16 @@ agents can take it. Be decisive about the ceiling rather than chasing a number t
   residual as an explicit, itemized, opt-in list* — don't inflate the number with lossy rewrites.
   A faithful 70% strict beats a lossy 95%. (Memory: [[user-prefers-decisive-research-grounded-pushback]].)
 
-The current floor (post coordinator iteration 2026-06-26): **strict 10.5% (1,322), semantic 45.6% (5,767).**
-(Was strict 7.8% (987) / semantic 44.3% (5,599) after column-naming wave 1.)
+The current floor (post coordinator iteration 2, 2026-06-26): **strict 22.1% (2,793), semantic 58.5% (7,397).**
+(Iteration 1 floor was strict 10.5% (1,322) / semantic 45.6% (5,767); column-naming wave 1 was 7.8% / 44.3%.)
+
+> **Iteration 2 note — cascade unmasking.** Landing `CREATE TABLE … USING` (missing-relation 2,572→900,
+> −1,672) and cast-constructors (function-missing −238) unblocked ~1,900 rows that *could not run* before.
+> Most became passes (strict +1,471, semantic +1,630), but ~360 now hit **pre-existing** downstream gaps,
+> so several "bad" buckets rose (correctness 169→277, exec-error 957→1,093, decimal-precision 143→189,
+> missing-error 126→166, null-semantics 47→71, datetime 6→13, engine-panic 1→3). These are honest
+> unmaskings, NOT regressions: a per-file check confirmed **no file lost a strict (byte-correct) pass**.
+> The rises are now-visible backlog (the next iterations' correctness/decimal/null targets), not new bugs.
 
 ---
 
