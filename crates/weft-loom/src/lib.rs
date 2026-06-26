@@ -152,6 +152,8 @@ fn register_spark_function_aliases(ctx: &SessionContext) {
         ("lcase", "lower"),
         ("sign", "signum"),
         ("char", "chr"),
+        // Spark `array(e1, …)` constructs an array — identical to DataFusion's `make_array`.
+        ("array", "make_array"),
     ];
     const AGG_ALIASES: &[(&str, &str)] = &[
         ("variance", "var_samp"),
