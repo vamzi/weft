@@ -28,6 +28,7 @@ weft-sql        = { path = "crates/weft-sql" }
 weft-analyzer   = { path = "crates/weft-analyzer" }
 weft-catalog    = { path = "crates/weft-catalog" }
 weft-catalog-hive = { path = "crates/weft-catalog-hive" }
+weft-catalog-glue = { path = "crates/weft-catalog-glue" }
 weft-optimizer  = { path = "crates/weft-optimizer" }
 weft-physical   = { path = "crates/weft-physical" }
 weft-datasource = { path = "crates/weft-datasource" }
@@ -43,6 +44,8 @@ weft-clustermgr = { path = "crates/weft-clustermgr" }
 weft-scheduler  = { path = "crates/weft-scheduler" }
 weft-ai         = { path = "crates/weft-ai" }
 weft-pyworker   = { path = "crates/weft-pyworker" }
+# Spark parity harness (golden SQL tests + scoreboard).
+weft-spark-compat = { path = "crates/weft-spark-compat" }
 
 [profile.release]
 opt-level = 3

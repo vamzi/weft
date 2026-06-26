@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import Editor, { loader, type Monaco, type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
@@ -22,6 +23,7 @@ import {
   api,
   type CellKind,
   type CellResult,
+  type Cluster,
   type Notebook,
   type NotebookCell,
   type NotebookDoc,
@@ -43,50 +45,118 @@ const newCell = (kind: CellKind, source = ""): NotebookCell => ({
 });
 
 export function NotebooksPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
+  const [loading, setLoading] = useState(true);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function refresh() {
+    setLoading(true);
+    return api.listNotebooks().then((nbs) => {
+      setNotebooks(nbs);
+      setLoading(false);
+    });
+  }
 
   useEffect(() => {
-    api.listNotebooks().then(setNotebooks);
+    refresh();
   }, []);
 
+  // Deep-link: ?open=<id> opens that notebook's editor on mount.
+  useEffect(() => {
+    const open = searchParams.get("open");
+    if (open) setOpenId(open);
+  }, [searchParams]);
+
+  function closeEditor() {
+    setOpenId(null);
+    if (searchParams.has("open")) {
+      searchParams.delete("open");
+      setSearchParams(searchParams, { replace: true });
+    }
+    refresh();
+  }
+
+  async function newNotebook() {
+    const name = window.prompt("Notebook name", "Untitled notebook");
+    if (!name?.trim() || busy) return;
+    setBusy(true);
+    try {
+      const doc = await api.createNotebook(name.trim());
+      setOpenId(doc.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteNotebook(id: string, name: string) {
+    if (!window.confirm(`Delete "${name}"?`)) return;
+    await api.deleteNotebook(id);
+    await refresh();
+  }
+
   if (openId) {
-    return <NotebookEditor id={openId} onClose={() => setOpenId(null)} />;
+    return <NotebookEditor id={openId} onClose={closeEditor} />;
   }
 
   return (
     <Page
       title="Notebooks"
       subtitle="Multi-language notebooks with per-cell output (SQL, Python, Markdown)."
+      actions={
+        <button type="button" className="weft-btn-primary" onClick={newNotebook} disabled={busy}>
+          <PlusIcon width={16} height={16} />
+          New notebook
+        </button>
+      }
     >
-      <DemoNote text="Notebook list & autosave are demo data — live wiring pending. SQL cells, however, execute live on the engine." />
-      {notebooks.length === 0 ? (
+      <DemoNote text="SQL cells execute live on the engine; Python & Markdown cells are demo-only for now." />
+      {loading ? (
         <p className="text-sm text-muted">Loading notebooks…</p>
+      ) : notebooks.length === 0 ? (
+        <div className="weft-card px-6 py-12 text-center">
+          <p className="text-sm font-medium text-body">No notebooks yet</p>
+          <p className="mt-1 text-sm text-muted">Create one to get started.</p>
+        </div>
       ) : (
         <div className="flex flex-col gap-3">
           {notebooks.map((nb) => (
-            <button
+            <div
               key={nb.id}
-              type="button"
-              onClick={() => setOpenId(nb.id)}
-              className="weft-card flex items-center gap-4 px-5 py-4 text-left transition-colors hover:bg-bg-subtle"
+              className="weft-card flex items-center gap-4 px-5 py-4 transition-colors hover:bg-bg-subtle"
             >
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-3">
-                  <span className="truncate text-sm font-semibold text-body">{nb.name}</span>
-                  <span className="rounded-full bg-bg-subtle px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted">
-                    {nb.language}
-                  </span>
+              <button
+                type="button"
+                onClick={() => setOpenId(nb.id)}
+                className="flex min-w-0 flex-1 items-center gap-4 text-left"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-3">
+                    <span className="truncate text-sm font-semibold text-body">{nb.name}</span>
+                    <span className="rounded-full bg-bg-subtle px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted">
+                      {nb.language}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+                    <span className="font-mono">{nb.id}</span>
+                    <span>{nb.cells} cells</span>
+                    <span>by {nb.owner}</span>
+                    <span>updated {new Date(nb.updatedAt).toLocaleDateString()}</span>
+                  </div>
                 </div>
-                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
-                  <span className="font-mono">{nb.id}</span>
-                  <span>{nb.cells} cells</span>
-                  <span>by {nb.owner}</span>
-                  <span>updated {new Date(nb.updatedAt).toLocaleDateString()}</span>
-                </div>
-              </div>
-              <ChevronRightIcon width={16} height={16} className="shrink-0 text-muted" />
-            </button>
+                <ChevronRightIcon width={16} height={16} className="shrink-0 text-muted" />
+              </button>
+              <button
+                type="button"
+                className="weft-btn-ghost px-2 py-1"
+                style={{ color: "var(--weft-danger)" }}
+                onClick={() => deleteNotebook(nb.id, nb.name)}
+                aria-label={`Delete ${nb.name}`}
+              >
+                <TrashIcon width={15} height={15} />
+              </button>
+            </div>
           ))}
         </div>
       )}
@@ -102,12 +172,24 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
   const [running, setRunning] = useState<Record<string, boolean>>({});
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [addKind, setAddKind] = useState<CellKind>("sql");
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [clusterId, setClusterId] = useState("");
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firstLoad = useRef(true);
 
   useEffect(() => {
     api.getNotebook(id).then(setDoc);
   }, [id]);
+
+  // Cluster picker (same model as the SQL editor): all cells in a notebook run on the chosen
+  // cluster; default to a RUNNING one, else the embedded control-plane engine.
+  useEffect(() => {
+    api.listClusters().then((cs) => {
+      setClusters(cs);
+      const running = cs.find((c) => c.state === "running");
+      setClusterId(running?.id ?? "");
+    });
+  }, []);
 
   // Autosave (debounced) whenever the doc changes after the initial load.
   useEffect(() => {
@@ -171,7 +253,7 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
       if (cell.kind === "sql") {
         // LIVE: SQL cells execute on the engine via POST /api/sql.
         const startedAt = performance.now();
-        const r = await api.runSql(cell.source);
+        const r = await api.runSql(cell.source, clusterId || undefined);
         const durationMs = Math.round(performance.now() - startedAt);
         if (r.error) {
           result = { kind: "sql", text: r.error, durationMs };
@@ -215,6 +297,19 @@ function NotebookEditor({ id, onClose }: { id: string; onClose: () => void }) {
       subtitle="SQL cells run live on the engine; Python & Markdown cells are demo-only for now."
       actions={
         <div className="flex items-center gap-2">
+          <select
+            aria-label="Cluster"
+            className="weft-input w-auto"
+            value={clusterId}
+            onChange={(e) => setClusterId(e.target.value)}
+          >
+            <option value="">embedded engine</option>
+            {clusters.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name} ({c.state})
+              </option>
+            ))}
+          </select>
           <SaveIndicator state={saveState} />
           <button type="button" className="weft-btn-ghost" onClick={onClose}>
             Back to notebooks

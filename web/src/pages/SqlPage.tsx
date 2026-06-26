@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import Editor, { loader, type Monaco, type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import type { editor } from "monaco-editor";
@@ -16,7 +17,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { PlayIcon, SparklesIcon } from "../components/icons";
 import { useTheme } from "../lib/theme";
 import { setupMonacoSql, WEFT_DARK, WEFT_LIGHT } from "../lib/monaco";
-import { api, type Cluster, type Query } from "../lib/api";
+import { api, type Cluster, type Query, type SavedQuery } from "../lib/api";
 
 /** Live result for the grid: the gateway's columns/rows plus a client-side timing. */
 interface LiveResult {
@@ -38,6 +39,7 @@ const STATUS_TONE: Record<Query["status"], "success" | "warning" | "danger" | "m
 
 export function SqlPage() {
   const { theme } = useTheme();
+  const [searchParams] = useSearchParams();
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [clusterId, setClusterId] = useState("");
   const [sql, setSql] = useState(STARTER_SQL);
@@ -45,6 +47,8 @@ export function SqlPage() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Query[]>([]);
+  const [saved, setSaved] = useState<SavedQuery | null>(null);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved">("idle");
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
 
@@ -55,6 +59,41 @@ export function SqlPage() {
       setClusterId(running?.id ?? cs[0]?.id ?? "");
     });
   }, []);
+
+  // Deep-link: ?query=<id> prefills the editor with a saved query.
+  const queryId = searchParams.get("query");
+  useEffect(() => {
+    if (!queryId) return;
+    api.getSavedQuery(queryId).then((q) => {
+      setSaved(q);
+      setSql(q.sql);
+      editorRef.current?.setValue(q.sql);
+      setSaveState("saved");
+    });
+  }, [queryId]);
+
+  async function save() {
+    if (saveState === "saving") return;
+    setSaveState("saving");
+    try {
+      if (saved) {
+        const updated: SavedQuery = { ...saved, sql, updatedAt: new Date().toISOString() };
+        await api.updateSavedQuery(updated);
+        setSaved(updated);
+      } else {
+        const name = window.prompt("Query name", "Untitled query");
+        if (!name?.trim()) {
+          setSaveState("idle");
+          return;
+        }
+        const created = await api.createSavedQuery(name.trim(), sql);
+        setSaved(created);
+      }
+      setSaveState("saved");
+    } catch {
+      setSaveState("idle");
+    }
+  }
 
   // Keep Monaco theme in sync with the app theme toggle.
   useEffect(() => {
@@ -109,16 +148,18 @@ export function SqlPage() {
 
   function applyGenerated(generated: string) {
     setSql(generated);
+    setSaveState((s) => (s === "saved" ? "idle" : s));
     editorRef.current?.setValue(generated);
     editorRef.current?.focus();
   }
 
   return (
     <Page
-      title="SQL editor"
+      title={saved ? saved.name : "SQL editor"}
       subtitle="Write catalog-aware SQL, run it on a cluster, and inspect results."
       actions={
         <div className="flex items-center gap-2">
+          {saveState === "saved" && <span className="text-xs text-muted">Saved</span>}
           <select
             aria-label="Cluster"
             className="weft-input w-auto"
@@ -132,6 +173,14 @@ export function SqlPage() {
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            className="weft-btn-ghost"
+            onClick={save}
+            disabled={saveState === "saving"}
+          >
+            {saveState === "saving" ? "Saving…" : "Save"}
+          </button>
           <button
             type="button"
             className="weft-btn-primary"
@@ -151,7 +200,10 @@ export function SqlPage() {
               height="320px"
               language="sql"
               value={sql}
-              onChange={(v) => setSql(v ?? "")}
+              onChange={(v) => {
+                setSql(v ?? "");
+                setSaveState((s) => (s === "saved" ? "idle" : s));
+              }}
               onMount={onMount}
               theme={theme === "dark" ? WEFT_DARK : WEFT_LIGHT}
               options={{

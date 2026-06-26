@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Page } from "../components/Layout";
 import {
   ChevronRightIcon,
@@ -8,10 +8,11 @@ import {
 } from "../components/icons";
 import {
   api,
-  type AttachCatalogInput,
   type CatalogNamespace,
   type CatalogTable,
-  type ExternalCatalogType,
+  type Connection,
+  type ConnectionKind,
+  type ConnectionOptions,
 } from "../lib/api";
 
 /** A flattened tree node built from the live catalog (catalog → schema → table). */
@@ -27,21 +28,29 @@ export function CatalogPage() {
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [showConnect, setShowConnect] = useState(false);
 
-  useEffect(() => {
-    api
-      .getCatalog()
-      .then((cat) => {
-        setCatalog(cat);
-        // Open the first catalog + its first schema by default.
+  const reloadCatalog = useCallback(async () => {
+    try {
+      const cat = await api.getCatalog();
+      setCatalog(cat);
+      setError(null);
+      // Open the first catalog + its first schema by default.
+      setExpanded((prev) => {
+        if (prev.size > 0) return prev; // keep the user's expansion on refetch
         const first = cat[0];
         const firstSchema = first?.schemas[0];
         const init = new Set<string>();
         if (first) init.add(first.name);
         if (first && firstSchema) init.add(`${first.name}.${firstSchema.name}`);
-        setExpanded(init);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load catalog"));
+        return init;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load catalog");
+    }
   }, []);
+
+  useEffect(() => {
+    void reloadCatalog();
+  }, [reloadCatalog]);
 
   // Map each parent fqn to its child nodes for tree rendering.
   const childrenOf = useMemo(() => {
@@ -152,7 +161,12 @@ export function CatalogPage() {
         <DetailPanel node={selected} />
       </div>
 
-      {showConnect && <ConnectModal onClose={() => setShowConnect(false)} />}
+      {showConnect && (
+        <ConnectModal
+          onClose={() => setShowConnect(false)}
+          onAttached={reloadCatalog}
+        />
+      )}
     </Page>
   );
 }
@@ -215,37 +229,78 @@ function DetailPanel({ node }: { node: TreeNode | null }) {
   );
 }
 
-const CONNECTOR_TYPES: { value: ExternalCatalogType; label: string; uriHint: string }[] = [
-  { value: "hms", label: "Hive Metastore (HMS)", uriHint: "thrift://metastore:9083" },
-  { value: "glue", label: "AWS Glue", uriHint: "glue://us-east-1/123456789012" },
-  { value: "unity", label: "Unity Catalog", uriHint: "https://dbc-xxxx.cloud.databricks.com" },
-  { value: "local", label: "Local filesystem", uriHint: "file:///data/warehouse" },
+const CONNECTION_KINDS: { value: ConnectionKind; label: string }[] = [
+  { value: "glue", label: "AWS Glue" },
+  { value: "hive", label: "Hive Metastore" },
 ];
 
-function ConnectModal({ onClose }: { onClose: () => void }) {
-  const [name, setName] = useState("");
-  const [type, setType] = useState<ExternalCatalogType>("hms");
-  const [uri, setUri] = useState("");
-  const [comment, setComment] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [done, setDone] = useState<string | null>(null);
+const DEFAULT_GLUE_REGION = "us-west-2";
 
-  const hint = CONNECTOR_TYPES.find((c) => c.value === type)?.uriHint ?? "";
-  const valid = name.trim().length > 0 && uri.trim().length > 0;
+/**
+ * Attach an external catalog (AWS Glue or Hive Metastore) via the live gateway,
+ * and show the catalogs already attached. On success it refetches the catalog
+ * tree (via `onAttached`) so the new catalog appears.
+ */
+function ConnectModal({
+  onClose,
+  onAttached,
+}: {
+  onClose: () => void;
+  onAttached: () => Promise<void> | void;
+}) {
+  const [connections, setConnections] = useState<Connection[] | null>(null);
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<ConnectionKind>("glue");
+  const [region, setRegion] = useState(DEFAULT_GLUE_REGION);
+  const [uri, setUri] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadConnections = useCallback(async () => {
+    try {
+      setConnections(await api.getConnections());
+    } catch {
+      // Non-fatal: the list is informational. Show an empty list.
+      setConnections([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadConnections();
+  }, [loadConnections]);
+
+  async function removeConnection(connName: string) {
+    setError(null);
+    try {
+      await api.deleteConnection(connName);
+      await loadConnections();
+      // The detached catalog disappears from the tree.
+      await onAttached();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to detach connection");
+    }
+  }
+
+  const valid =
+    name.trim().length > 0 &&
+    (kind === "glue" ? region.trim().length > 0 : uri.trim().length > 0);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!valid || submitting) return;
     setSubmitting(true);
+    setError(null);
     try {
-      const input: AttachCatalogInput = {
-        name: name.trim(),
-        type,
-        uri: uri.trim(),
-        comment: comment.trim() || undefined,
-      };
-      const res = await api.attachCatalog(input);
-      setDone(res.name);
+      const options: ConnectionOptions =
+        kind === "glue"
+          ? { region: region.trim() || DEFAULT_GLUE_REGION }
+          : { uri: uri.trim() };
+      await api.createConnection(name.trim(), kind, options);
+      // Refetch the catalog tree (new catalog appears) before closing.
+      await onAttached();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to attach connection");
     } finally {
       setSubmitting(false);
     }
@@ -264,90 +319,127 @@ function ConnectModal({ onClose }: { onClose: () => void }) {
         aria-modal="true"
         aria-label="Attach external catalog"
       >
-        {done ? (
-          <div className="text-center">
-            <h2 className="text-sm font-semibold text-body">Connection attached</h2>
-            <p className="mt-2 text-sm text-muted">
-              External catalog <span className="font-mono text-body">{done}</span> is now mounted and
-              its objects will appear in the tree.
-            </p>
-            <button type="button" className="weft-btn-primary mt-5" onClick={onClose}>
-              Done
-            </button>
-          </div>
-        ) : (
-          <form onSubmit={submit}>
-            <h2 className="mb-1 text-sm font-semibold text-body">Attach external catalog</h2>
-            <p className="mb-4 text-xs text-muted">
-              Demo only — not wired to the gateway yet. Mount a Hive Metastore, AWS Glue, Unity
-              Catalog, or local warehouse as a governed catalog.
-            </p>
-            <div className="flex flex-col gap-4">
-              <div>
-                <label className="weft-label" htmlFor="conn-type">
-                  Type
-                </label>
-                <select
-                  id="conn-type"
-                  className="weft-input"
-                  value={type}
-                  onChange={(e) => setType(e.target.value as ExternalCatalogType)}
+        <h2 className="mb-1 text-sm font-semibold text-body">Connections</h2>
+        <p className="mb-4 text-xs text-muted">
+          Mount an AWS Glue Data Catalog or a Hive Metastore as a governed catalog. Its databases
+          and tables are introspected live and appear in the tree.
+        </p>
+
+        {/* Already-attached connections */}
+        <div className="mb-4">
+          <div className="weft-label mb-1.5">Attached</div>
+          {connections === null ? (
+            <p className="text-xs text-muted">Loading…</p>
+          ) : connections.length === 0 ? (
+            <p className="text-xs text-muted">No external catalogs attached yet.</p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {connections.map((c) => (
+                <li
+                  key={c.name}
+                  className="flex items-center gap-2 rounded-weft-sm bg-bg-subtle px-2.5 py-1.5 text-sm"
                 >
-                  {CONNECTOR_TYPES.map((c) => (
-                    <option key={c.value} value={c.value}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+                  <PlugIcon width={13} height={13} className="shrink-0 text-muted" />
+                  <span className="font-mono text-body">{c.name}</span>
+                  <span className="ml-auto text-[10px] uppercase tracking-wide text-muted">
+                    {c.kind}
+                    {c.region ? ` · ${c.region}` : ""}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void removeConnection(c.name)}
+                    className="shrink-0 rounded-weft-sm px-1.5 py-0.5 text-[11px] text-muted hover:bg-red-50 hover:text-red-600"
+                    title={`Detach ${c.name}`}
+                    aria-label={`Detach ${c.name}`}
+                  >
+                    ✕
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <form onSubmit={submit}>
+          <div className="flex flex-col gap-4">
+            <div>
+              <label className="weft-label" htmlFor="conn-name">
+                Catalog name
+              </label>
+              <input
+                id="conn-name"
+                className="weft-input"
+                placeholder="legacy_glue"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div>
+              <label className="weft-label" htmlFor="conn-kind">
+                Kind
+              </label>
+              <select
+                id="conn-kind"
+                className="weft-input"
+                value={kind}
+                onChange={(e) => setKind(e.target.value as ConnectionKind)}
+              >
+                {CONNECTION_KINDS.map((c) => (
+                  <option key={c.value} value={c.value}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {kind === "glue" ? (
               <div>
-                <label className="weft-label" htmlFor="conn-name">
-                  Catalog name
+                <label className="weft-label" htmlFor="conn-region">
+                  Region
                 </label>
                 <input
-                  id="conn-name"
-                  className="weft-input"
-                  placeholder="legacy_hive"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  autoFocus
+                  id="conn-region"
+                  className="weft-input font-mono"
+                  placeholder={DEFAULT_GLUE_REGION}
+                  value={region}
+                  onChange={(e) => setRegion(e.target.value)}
                 />
+                <p className="mt-1.5 text-xs text-muted">
+                  AWS Glue uses the server's instance-role credentials — no access keys needed here.
+                </p>
               </div>
+            ) : (
               <div>
                 <label className="weft-label" htmlFor="conn-uri">
-                  Connection URI
+                  Metastore URI
                 </label>
                 <input
                   id="conn-uri"
                   className="weft-input font-mono"
-                  placeholder={hint}
+                  placeholder="thrift://host:9083"
                   value={uri}
                   onChange={(e) => setUri(e.target.value)}
                 />
               </div>
-              <div>
-                <label className="weft-label" htmlFor="conn-comment">
-                  Comment (optional)
-                </label>
-                <input
-                  id="conn-comment"
-                  className="weft-input"
-                  placeholder="Read-only mirror of the legacy lake"
-                  value={comment}
-                  onChange={(e) => setComment(e.target.value)}
-                />
-              </div>
-            </div>
-            <div className="mt-5 flex justify-end gap-2">
-              <button type="button" className="weft-btn-ghost" onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" className="weft-btn-primary" disabled={!valid || submitting}>
-                {submitting ? "Attaching…" : "Attach catalog"}
-              </button>
-            </div>
-          </form>
-        )}
+            )}
+          </div>
+
+          {error && (
+            <p className="mt-4 text-xs" style={{ color: "var(--weft-danger)" }}>
+              {error}
+            </p>
+          )}
+
+          <div className="mt-5 flex justify-end gap-2">
+            <button type="button" className="weft-btn-ghost" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="weft-btn-primary" disabled={!valid || submitting}>
+              {submitting ? "Attaching…" : "Attach catalog"}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );

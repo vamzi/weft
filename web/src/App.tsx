@@ -5,6 +5,7 @@ import { CatalogPage } from "./pages/CatalogPage";
 import { SqlPage } from "./pages/SqlPage";
 import { PermissionsPage } from "./pages/PermissionsPage";
 import { NotebooksPage } from "./pages/NotebooksPage";
+import { WorkspacePage } from "./pages/WorkspacePage";
 import { DashboardsPage } from "./pages/DashboardsPage";
 import { JobsPage } from "./pages/JobsPage";
 import { AdminPage } from "./pages/AdminPage";
@@ -34,6 +35,7 @@ export function App() {
     <Routes>
       <Route element={<Layout />}>
         <Route index element={<Navigate to="/clusters" replace />} />
+        <Route path="/workspace" element={<WorkspacePage />} />
         <Route path="/clusters" element={<ClustersPage />} />
         <Route path="/catalog" element={<CatalogPage />} />
         <Route path="/sql" element={<SqlPage />} />

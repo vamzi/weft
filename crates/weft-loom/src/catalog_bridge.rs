@@ -167,6 +167,7 @@ async fn metadata_to_provider(
     match md.format {
         TableFormat::Parquet => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -175,6 +176,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Csv => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -183,6 +185,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Json => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
+            ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             crate::build_listing_table(state, vec![url], opts, md.schema.clone())
@@ -202,6 +205,47 @@ async fn metadata_to_provider(
             let files = weft_datasource::iceberg_active_files(&path).map_err(weft_to_df)?;
             parquet_files_provider(state, &md.location, files, md.schema.clone()).await
         }
+    }
+}
+
+/// Ensure an object store is registered on the session's runtime for a remote table location so
+/// DataFusion can read it. Currently handles `s3://` — credentials come from the environment or the
+/// EC2 instance role (IMDS) via object_store's default provider; no static keys. Registering on the
+/// shared runtime is idempotent and persists for the session, so query-time resolution finds it.
+/// `file://` and bare paths need nothing and are skipped.
+fn ensure_remote_store(
+    state: &SessionState,
+    url: &datafusion::datasource::listing::ListingTableUrl,
+) {
+    if url.scheme() != "s3" {
+        return;
+    }
+    let os_url = url.object_store(); // canonical `s3://bucket` key
+    if state.runtime_env().object_store(&os_url).is_ok() {
+        return; // already registered for this bucket
+    }
+    // `os_url` is the canonical `s3://bucket/` — pull the bucket from the authority.
+    let bucket = os_url
+        .as_str()
+        .strip_prefix("s3://")
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    if bucket.is_empty() {
+        return;
+    }
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
+    match object_store::aws::AmazonS3Builder::from_env()
+        .with_bucket_name(&bucket)
+        .with_region(region)
+        .build()
+    {
+        Ok(store) => {
+            state
+                .runtime_env()
+                .register_object_store(os_url.as_ref(), Arc::new(store));
+        }
+        Err(e) => eprintln!("warn: could not register S3 object store for `{bucket}`: {e}"),
     }
 }
 
@@ -269,8 +313,8 @@ fn weft_to_df(e: Error) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::Int64Array;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::array::{Int32Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::parquet::arrow::ArrowWriter;
     use weft_catalog::{Result as CatResult, TableMetadata};
@@ -367,5 +411,240 @@ mod tests {
             .unwrap_err();
         // DataFusion's table-not-found analysis error, not a panic / internal error.
         assert!(format!("{err}").to_lowercase().contains("not"));
+    }
+
+    /// A fake catalog whose single table `mixed` lives at a fixed location with an *optionally*
+    /// declared schema — the lever the coercion test flips.
+    struct SchemaCatalog {
+        location: String,
+        schema: Option<SchemaRef>,
+    }
+
+    #[async_trait]
+    impl WeftCatalog for SchemaCatalog {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+            Ok(vec![vec!["ns".to_string()]])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+            Ok(vec!["mixed".to_string()])
+        }
+        async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+            if ns == ["ns"] && table == "mixed" {
+                let md = TableMetadata::new(
+                    "fake.ns.mixed",
+                    self.location.clone(),
+                    TableFormat::Parquet,
+                );
+                Ok(match &self.schema {
+                    Some(s) => md.with_schema(s.clone()),
+                    None => md,
+                })
+            } else {
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
+            }
+        }
+    }
+
+    /// Write two Parquet files into a fresh dir where column `v` is Int32 in one file and Int64 in
+    /// the other — the cross-file type mismatch that breaks schema inference. Returns the dir.
+    fn write_mixed_int_parquet_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weft-mixed-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // File A: v as Int32 (values 1,2,3).
+        let schema32 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
+        let batch32 = RecordBatch::try_new(
+            schema32.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-a.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema32, None).unwrap();
+        w.write(&batch32).unwrap();
+        w.close().unwrap();
+
+        // File B: v as Int64 (values 10,20).
+        let schema64 = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch64 = RecordBatch::try_new(
+            schema64.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-b.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema64, None).unwrap();
+        w.write(&batch64).unwrap();
+        w.close().unwrap();
+
+        dir
+    }
+
+    /// With a catalog-declared schema (`v: Int64`), the mixed-int-type Parquet files read fine: the
+    /// Int32 file is *cast* to Int64 at scan time by DataFusion's default expression adapter, so the
+    /// query succeeds. This is the catalog-schema-honoring behavior the change adds.
+    #[tokio::test]
+    async fn declared_schema_coerces_mixed_file_types() {
+        let dir = write_mixed_int_parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+        let declared = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location,
+                schema: Some(declared),
+            }),
+        );
+
+        let batches = engine
+            .sql("SELECT COUNT(*) AS c, SUM(v) AS s FROM fake.ns.mixed")
+            .await
+            .expect("query with declared schema should succeed");
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!((c, s), (5, 36)); // 1+2+3+10+20
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Control: *without* the declared schema, the same mixed-int-type files reproduce DataFusion's
+    /// schema-merge failure — proving the declared schema is what makes the read work.
+    #[tokio::test]
+    async fn without_declared_schema_merge_fails() {
+        let dir = write_mixed_int_parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location,
+                schema: None,
+            }),
+        );
+
+        let err = engine
+            .sql("SELECT SUM(v) AS s FROM fake.ns.mixed")
+            .await
+            .expect_err("inference should fail to merge Int32 vs Int64");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("merge") || msg.contains("does not equal") || msg.contains("data type"),
+            "expected a schema-merge error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write two Parquet files whose column is named `VendorID` (mixed case) — Int32 in one, Int64
+    /// in the other — mimicking real NYC-taxi monthly dumps. Glue would declare this column as the
+    /// lowercase `vendorid`, so the file→table name match must be case-insensitive.
+    fn write_mixedcase_int_parquet_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weft-mixedcase-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let schema32 = Arc::new(Schema::new(vec![Field::new(
+            "VendorID",
+            DataType::Int32,
+            true,
+        )]));
+        let batch32 = RecordBatch::try_new(
+            schema32.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-a.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema32, None).unwrap();
+        w.write(&batch32).unwrap();
+        w.close().unwrap();
+
+        let schema64 = Arc::new(Schema::new(vec![Field::new(
+            "VendorID",
+            DataType::Int64,
+            true,
+        )]));
+        let batch64 = RecordBatch::try_new(
+            schema64.clone(),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+        )
+        .unwrap();
+        let f = std::fs::File::create(dir.join("part-b.parquet")).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema64, None).unwrap();
+        w.write(&batch64).unwrap();
+        w.close().unwrap();
+
+        dir
+    }
+
+    /// Databricks/Athena parity: a lowercase catalog column (`vendorid`) binds to the mixed-case
+    /// file column (`VendorID`) case-insensitively, *and* the Int32 file is cast to the declared
+    /// Int64 — so `SUM(vendorid)` returns the correct non-null total instead of NULL.
+    #[tokio::test]
+    async fn declared_schema_matches_columns_case_insensitively() {
+        let dir = write_mixedcase_int_parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+        // Glue-style lowercase declared name, widened to Int64.
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "vendorid",
+            DataType::Int64,
+            true,
+        )]));
+
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(SchemaCatalog {
+                location,
+                schema: Some(declared),
+            }),
+        );
+
+        let batches = engine
+            .sql("SELECT COUNT(vendorid) AS c, SUM(vendorid) AS s FROM fake.ns.mixed")
+            .await
+            .expect("case-insensitive declared-schema query should succeed");
+        let c = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let s = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        // All 5 rows resolved (not NULL) and summed across both physical types.
+        assert_eq!((c, s), (5, 36)); // 1+2+3+10+20
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

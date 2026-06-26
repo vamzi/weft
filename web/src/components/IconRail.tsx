@@ -9,6 +9,7 @@ import {
   NotebookIcon,
   PermissionsIcon,
   SqlIcon,
+  WorkspaceIcon,
 } from "./icons";
 import { isAdmin } from "../lib/api";
 import { useAuth } from "../lib/auth";
@@ -22,6 +23,7 @@ interface Section {
 }
 
 export const SECTIONS: Section[] = [
+  { to: "/workspace", label: "Workspace", Icon: WorkspaceIcon },
   { to: "/clusters", label: "Clusters", Icon: ClustersIcon },
   { to: "/catalog", label: "Catalog", Icon: CatalogIcon },
   { to: "/sql", label: "SQL", Icon: SqlIcon },

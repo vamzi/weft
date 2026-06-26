@@ -18,8 +18,19 @@ async-trait = "0.1"
 # Arrow IPC bytes produced here line up with whatever encodes them downstream.
 # Phase 1 carves out native operators on the ~10 heavy ClickBench queries.
 datafusion = "54"
+# Read table data from object stores (S3) for Glue/Hive locations on `s3://`. Pinned to the same
+# 0.13 line DataFusion pulls so the `ObjectStore` trait/types unify; `aws` adds the S3 client + the
+# EC2 instance-role (IMDS) credential provider — no static keys.
+object_store = { version = "0.13", features = ["aws"] }
 # Data-parallel aggregation of independent key-hash partitions (the native GROUP BY carve-out).
 rayon = "1"
+# Spark `split(str, regex)` and other regex-based string UDFs (Spark splits on a regex, unlike
+# DataFusion's `split_part`). Same major line DataFusion already pulls, so the dep tree stays unified.
+regex = "1"
+# Spark JSON UDFs (get_json_object / json_array_length / json_object_keys / to_json). Already in the
+# tree via DataFusion/arrow-json, so the lock resolves to the same versions — no new dependency tree.
+serde = "1"
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

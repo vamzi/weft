@@ -24,6 +24,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+
+/// Shared Hive/Glue type-string → Arrow schema mapping (used by the Hive and Glue providers).
+pub mod hive_types;
+// Re-exported so external `CatalogProvider` implementors (e.g. `weft-catalog-glue`) can build the
+// `TableMetadata.schema` from arrow types using the *same* arrow version the engine embeds, without
+// taking a direct `arrow` dependency (which could drift to a mismatched version).
+pub use datafusion::arrow;
 // Re-exported so external `CatalogProvider` implementors can name the trait's `Result`/`Error`
 // without taking a direct `weft-common` dependency.
 pub use weft_common::{Error, Result};
@@ -79,11 +86,7 @@ pub struct TableMetadata {
 
 impl TableMetadata {
     /// Construct minimal metadata (no schema/credentials/partitions).
-    pub fn new(
-        name: impl Into<String>,
-        location: impl Into<String>,
-        format: TableFormat,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, location: impl Into<String>, format: TableFormat) -> Self {
         Self {
             name: name.into(),
             location: location.into(),
@@ -332,7 +335,10 @@ mod tests {
         assert_eq!(md.format, TableFormat::Parquet);
         assert_eq!(md.location, "file:///data/orders");
         assert!(c.table_exists(&["ns".to_string()], "orders").await.unwrap());
-        assert!(!c.table_exists(&["ns".to_string()], "missing").await.unwrap());
+        assert!(!c
+            .table_exists(&["ns".to_string()], "missing")
+            .await
+            .unwrap());
         assert!(c.namespace_exists(&["ns".to_string()]).await.unwrap());
         assert!(!c.namespace_exists(&["nope".to_string()]).await.unwrap());
     }
@@ -361,8 +367,14 @@ mod tests {
 
     #[test]
     fn format_parsing() {
-        assert_eq!(TableFormat::from_provider("PARQUET"), Some(TableFormat::Parquet));
-        assert_eq!(TableFormat::from_provider("delta"), Some(TableFormat::Delta));
+        assert_eq!(
+            TableFormat::from_provider("PARQUET"),
+            Some(TableFormat::Parquet)
+        );
+        assert_eq!(
+            TableFormat::from_provider("delta"),
+            Some(TableFormat::Delta)
+        );
         assert_eq!(TableFormat::from_provider("orc"), None);
     }
 }

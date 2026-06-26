@@ -10,7 +10,10 @@
 //! current-principal, and cluster-lifecycle endpoints against an in-memory store today, with
 //! persistence/auth/Spark-Connect-routing layering on top of the same surface.
 
-pub mod glue;
+pub mod cloud;
+pub mod cluster_client;
+pub mod oidc;
+pub mod scim;
 pub mod server;
 
 /// HTTP methods used by the gateway API.
@@ -44,14 +47,24 @@ pub struct Route {
 pub const ROUTES: &[Route] = &[
     // Auth / identity
     Route {
-        method: Method::Get,
+        method: Method::Post,
         path: "/api/auth/login",
-        summary: "Begin OIDC/SAML SSO login",
+        summary: "Local username/password login → session JWT (break-glass admin)",
+    },
+    Route {
+        method: Method::Get,
+        path: "/api/auth/sso/login",
+        summary: "Begin OIDC SSO (PKCE) → 302 to the external IdP",
     },
     Route {
         method: Method::Get,
         path: "/api/auth/callback",
-        summary: "SSO redirect callback → session JWT",
+        summary: "OIDC redirect callback → session JWT (fragment redirect)",
+    },
+    Route {
+        method: Method::Get,
+        path: "/api/auth/config",
+        summary: "SSO availability + provider label (public)",
     },
     Route {
         method: Method::Post,
@@ -63,15 +76,36 @@ pub const ROUTES: &[Route] = &[
         path: "/api/me",
         summary: "Current principal + resolved groups",
     },
+    // SCIM 2.0 provisioning (behind WEFT_SCIM_TOKEN)
     Route {
         method: Method::Post,
         path: "/scim/v2/Users",
-        summary: "SCIM user provisioning",
+        summary: "SCIM create user",
+    },
+    Route {
+        method: Method::Get,
+        path: "/scim/v2/Users",
+        summary: "SCIM list users (filter: userName eq)",
+    },
+    Route {
+        method: Method::Get,
+        path: "/scim/v2/Users/:id",
+        summary: "SCIM get/replace/patch/delete user",
     },
     Route {
         method: Method::Post,
         path: "/scim/v2/Groups",
-        summary: "SCIM group provisioning",
+        summary: "SCIM create group",
+    },
+    Route {
+        method: Method::Get,
+        path: "/scim/v2/Groups",
+        summary: "SCIM list groups (filter: displayName eq)",
+    },
+    Route {
+        method: Method::Get,
+        path: "/scim/v2/Groups/:id",
+        summary: "SCIM get/replace/patch/delete group",
     },
     // Clusters
     Route {
