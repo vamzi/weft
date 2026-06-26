@@ -62,9 +62,12 @@ impl Bucket {
     /// Whether this counts toward the **semantic** parity score (right answer / right
     /// rejection, allowing benign schema-name and both-error divergences).
     pub fn is_semantic_pass(self) -> bool {
+        // `Ordering` counts: same rows in a different order is semantically correct when the
+        // query's `ORDER BY` leaves ties unordered — and it keeps the score deterministic
+        // (tie-order can otherwise vary run-to-run).
         matches!(
             self,
-            Bucket::Pass | Bucket::ErrorParity | Bucket::SchemaOnly
+            Bucket::Pass | Bucket::ErrorParity | Bucket::SchemaOnly | Bucket::Ordering
         )
     }
 }
