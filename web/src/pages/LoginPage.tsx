@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTheme } from "../lib/theme";
 import { useAuth } from "../lib/auth";
+import { api, type AuthConfig } from "../lib/api";
 import { MoonIcon, SunIcon } from "../components/icons";
 
 /**
@@ -10,11 +11,32 @@ import { MoonIcon, SunIcon } from "../components/icons";
  */
 export function LoginPage() {
   const { theme, toggle } = useTheme();
-  const { login } = useAuth();
+  const { login, ssoError } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  // Seed the banner with any one-time SSO failure carried back in the fragment.
+  const [error, setError] = useState<string | null>(
+    ssoError ? `SSO sign-in failed: ${ssoError}` : null,
+  );
   const [busy, setBusy] = useState(false);
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+
+  // Ask the gateway (public, no auth) whether to offer SSO. On any failure we
+  // simply don't show the button — the credentials form always works.
+  useEffect(() => {
+    let alive = true;
+    api
+      .authConfig()
+      .then((cfg) => {
+        if (alive) setAuthConfig(cfg);
+      })
+      .catch(() => {
+        if (alive) setAuthConfig(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const valid = username.trim().length > 0 && password.length > 0;
 
@@ -65,6 +87,27 @@ export function LoginPage() {
         </div>
 
         <form onSubmit={onSubmit} className="weft-card flex flex-col gap-4 px-6 py-6">
+          {authConfig?.sso_enabled && (
+            <>
+              <button
+                type="button"
+                className="weft-btn-primary justify-center"
+                onClick={() => {
+                  // Full navigation (NOT fetch): the browser must follow the
+                  // gateway's 302s out to the IdP and back.
+                  window.location.href = "/api/auth/sso/login";
+                }}
+              >
+                Sign in with {authConfig.provider_label}
+              </button>
+              <div className="flex items-center gap-3 text-xs text-muted">
+                <span className="h-px flex-1 bg-hairline" />
+                <span>or sign in with credentials</span>
+                <span className="h-px flex-1 bg-hairline" />
+              </div>
+            </>
+          )}
+
           <div>
             <label className="weft-label" htmlFor="login-user">
               Username

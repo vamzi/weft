@@ -350,6 +350,15 @@ export interface LoginResult {
   groups: string[];
 }
 
+/**
+ * Public auth configuration (`GET /api/auth/config`, no auth). Tells the SPA
+ * whether to offer the SSO button and what to label it.
+ */
+export interface AuthConfig {
+  sso_enabled: boolean;
+  provider_label: string;
+}
+
 /** Whether the signed-in principal is an administrator (member of `admins`). */
 export function isAdmin(me: Principal | null): boolean {
   return !!me?.groups?.includes("admins");
@@ -803,6 +812,14 @@ export const api = {
   /** GET /api/me (LIVE) — the signed-in principal; throws/401s if not authed. */
   async me(): Promise<Principal> {
     return request("GET", "/api/me");
+  },
+
+  /**
+   * GET /api/auth/config (PUBLIC) — whether SSO is enabled and its label.
+   * No bearer token: this is the one thing the SPA needs before login.
+   */
+  async authConfig(): Promise<AuthConfig> {
+    return request("GET", "/api/auth/config", undefined, { auth: false });
   },
 
   // Clusters (LIVE) -------------------------------------------------------

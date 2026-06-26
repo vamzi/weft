@@ -32,10 +32,14 @@ serde_json = "1"
 jsonwebtoken = "9"
 bcrypt = "0.15"
 tower-http = { version = "0.5", features = ["fs"] }
-# TODO(deps): tonic (Spark Connect client to clusters), openidconnect (OIDC) + a SAML SP lib for
-# full SSO, sqlx (via weft-meta) for the user/grant store. The router below serves the frozen
-# ROUTES surface + the web SPA with local username/password auth (bcrypt + JWT) as the break-glass
-# admin path; OIDC/SAML/SCIM layer on top of the same session-JWT seam.
+# External-IdP SSO (OIDC) + SCIM 2.0 provisioning. `openidconnect` drives discovery, the PKCE
+# auth-code flow, and id_token validation (issuer/audience/nonce/exp/JWKS signature); `reqwest` is
+# its async HTTP backend (rustls, no OpenSSL). The router layers OIDC/SCIM on top of the same
+# session-JWT seam as the break-glass local admin login.
+openidconnect = { version = "4", default-features = false, features = ["reqwest"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# TODO(deps): tonic (Spark Connect client to clusters), a SAML SP lib for SAML SSO, sqlx (via
+# weft-meta) for the user/grant store.
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

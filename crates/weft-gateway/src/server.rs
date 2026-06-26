@@ -28,6 +28,9 @@ use weft_loom::Engine;
 
 use crate::cloud;
 use crate::cluster_client;
+use crate::oidc::{self, OidcConfig, PendingStore};
+use crate::scim;
+use openidconnect::core::CoreProviderMetadata;
 use weft_catalog_glue::GlueCatalog;
 
 // ─────────────────────────────────────────── Auth ───────────────────────────────────────────────
@@ -43,8 +46,9 @@ pub struct Claims {
     pub exp: usize,
 }
 
-/// A local user record.
-#[derive(Clone)]
+/// A local/federated user record. `password_hash` is empty for SSO/SCIM-sourced users so the local
+/// bcrypt login path can never match them (bcrypt rejects an empty hash).
+#[derive(Clone, Serialize, Deserialize)]
 struct UserRecord {
     password_hash: String,
     groups: Vec<String>,
@@ -234,6 +238,14 @@ pub struct AppState {
     last_activity: Arc<Mutex<HashMap<String, u64>>>,
     /// Seconds of inactivity before a running cluster is auto-terminated (0 = never).
     idle_secs: u64,
+    /// External-IdP OIDC SSO config (from env). `None` → SSO disabled.
+    oidc: Arc<Option<OidcConfig>>,
+    /// In-flight OIDC PKCE/state entries (keyed by the `state` handed to the IdP).
+    oidc_pending: Arc<Mutex<PendingStore>>,
+    /// Discovered OIDC provider metadata, cached after the first `/.well-known` fetch.
+    oidc_meta: Arc<Mutex<Option<CoreProviderMetadata>>>,
+    /// Static bearer token guarding `/scim/*` (from `WEFT_SCIM_TOKEN`). `None` → SCIM disabled.
+    scim_token: Arc<Option<String>>,
 }
 
 impl AppState {
@@ -309,8 +321,35 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800),
+            oidc: Arc::new(OidcConfig::from_env()),
+            oidc_pending: Arc::new(Mutex::new(PendingStore::default())),
+            oidc_meta: Arc::new(Mutex::new(None)),
+            scim_token: Arc::new(
+                std::env::var("WEFT_SCIM_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            ),
         };
         st
+    }
+
+    // ── SSO / SCIM accessors (let the `oidc`/`scim` modules reach private state) ──
+
+    /// The OIDC SSO config (`None` if SSO is disabled).
+    pub(crate) fn oidc(&self) -> &Arc<Option<OidcConfig>> {
+        &self.oidc
+    }
+    /// The in-flight OIDC PKCE/state store.
+    pub(crate) fn oidc_pending(&self) -> &Arc<Mutex<PendingStore>> {
+        &self.oidc_pending
+    }
+    /// The cached discovered provider metadata.
+    pub(crate) fn oidc_meta(&self) -> &Arc<Mutex<Option<CoreProviderMetadata>>> {
+        &self.oidc_meta
+    }
+    /// The SCIM bearer token (`None` if SCIM is disabled).
+    pub(crate) fn scim_token(&self) -> &Arc<Option<String>> {
+        &self.scim_token
     }
 
     /// Allocate a unique id with the given prefix (e.g. `nb-7`, `q-3`).
@@ -340,6 +379,136 @@ impl AppState {
             "connections".into(),
             body,
         ));
+    }
+
+    /// Persist the user store (DynamoDB key `users`). Mirrors `save_connections`; best-effort,
+    /// off the request path. Used by the SSO callback + SCIM provisioning.
+    pub(crate) fn save_users(&self) {
+        let snapshot: HashMap<String, UserRecord> = self.users.lock().unwrap().clone();
+        let body = serde_json::to_string(&snapshot).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "users".into(), body));
+    }
+
+    /// Persist the group store (DynamoDB key `groups`).
+    pub(crate) fn save_groups(&self) {
+        let body = serde_json::to_string(&*self.groups.lock().unwrap()).unwrap_or_default();
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "groups".into(),
+            body,
+        ));
+    }
+
+    // ── SSO / SCIM store mutations (shared by the `oidc` + `scim` modules) ──
+
+    /// Add `user` to each named group's member list (idempotent).
+    fn add_to_groups(groups: &mut HashMap<String, Vec<String>>, user: &str, names: &[String]) {
+        for g in names {
+            let members = groups.entry(g.clone()).or_default();
+            if !members.iter().any(|m| m == user) {
+                members.push(user.to_string());
+            }
+        }
+    }
+
+    /// Remove `user` from every group's member list.
+    fn remove_from_all_groups(groups: &mut HashMap<String, Vec<String>>, user: &str) {
+        for members in groups.values_mut() {
+            members.retain(|m| m != user);
+        }
+    }
+
+    /// Upsert an SSO/SCIM-federated user: empty password hash (local login can never match), set the
+    /// user's groups to exactly `groups`, and reconcile the group store (add to new groups, drop from
+    /// groups the user no longer belongs to). Returns nothing; caller persists.
+    pub(crate) fn upsert_sso_user(&self, username: &str, groups: &[String]) {
+        {
+            let mut users = self.users.lock().unwrap();
+            users.insert(
+                username.to_string(),
+                UserRecord {
+                    password_hash: String::new(),
+                    groups: groups.to_vec(),
+                },
+            );
+        }
+        let mut g = self.groups.lock().unwrap();
+        // Drop from groups not in the new set, then add to the new set.
+        for (name, members) in g.iter_mut() {
+            if !groups.iter().any(|x| x == name) {
+                members.retain(|m| m != username);
+            }
+        }
+        Self::add_to_groups(&mut g, username, groups);
+    }
+
+    /// SCIM: create/replace a user with exactly `groups`. (Same reconcile as [`Self::upsert_sso_user`].)
+    pub(crate) fn scim_upsert_user(&self, username: &str, groups: &[String]) {
+        self.upsert_sso_user(username, groups);
+    }
+
+    /// SCIM: the user's groups, or `None` if no such user.
+    pub(crate) fn scim_get_user(&self, username: &str) -> Option<Vec<String>> {
+        self.users.lock().unwrap().get(username).map(|u| u.groups.clone())
+    }
+
+    /// SCIM: all users as `(username, groups)`, sorted by username.
+    pub(crate) fn scim_list_users(&self) -> Vec<(String, Vec<String>)> {
+        let users = self.users.lock().unwrap();
+        let mut out: Vec<(String, Vec<String>)> =
+            users.iter().map(|(u, r)| (u.clone(), r.groups.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// SCIM: delete a user and drop it from every group. Returns whether it existed.
+    pub(crate) fn scim_delete_user(&self, username: &str) -> bool {
+        let existed = self.users.lock().unwrap().remove(username).is_some();
+        if existed {
+            Self::remove_from_all_groups(&mut self.groups.lock().unwrap(), username);
+        }
+        existed
+    }
+
+    /// SCIM: create/replace a group's membership (and reflect it into each member's `groups`).
+    pub(crate) fn scim_set_group(&self, name: &str, members: Vec<String>) {
+        self.groups.lock().unwrap().insert(name.to_string(), members.clone());
+        // Reflect membership into the user records: add for members, remove for non-members.
+        let mut users = self.users.lock().unwrap();
+        for (uname, rec) in users.iter_mut() {
+            let should = members.iter().any(|m| m == uname);
+            let has = rec.groups.iter().any(|g| g == name);
+            if should && !has {
+                rec.groups.push(name.to_string());
+            } else if !should && has {
+                rec.groups.retain(|g| g != name);
+            }
+        }
+    }
+
+    /// SCIM: a group's members, or `None` if no such group.
+    pub(crate) fn scim_get_group(&self, name: &str) -> Option<Vec<String>> {
+        self.groups.lock().unwrap().get(name).cloned()
+    }
+
+    /// SCIM: all groups as `(name, members)`, sorted by name.
+    pub(crate) fn scim_list_groups(&self) -> Vec<(String, Vec<String>)> {
+        let groups = self.groups.lock().unwrap();
+        let mut out: Vec<(String, Vec<String>)> =
+            groups.iter().map(|(n, m)| (n.clone(), m.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// SCIM: delete a group (and strip it from each user's `groups`). Returns whether it existed.
+    pub(crate) fn scim_delete_group(&self, name: &str) -> bool {
+        let existed = self.groups.lock().unwrap().remove(name).is_some();
+        if existed {
+            for rec in self.users.lock().unwrap().values_mut() {
+                rec.groups.retain(|g| g != name);
+            }
+        }
+        existed
     }
 
     fn save_clusters(&self) {
@@ -384,6 +553,24 @@ impl AppState {
         if let Some(body) = cloud::ddb_get(&self.ddb_table, "clusters").await {
             if let Ok(saved) = serde_json::from_str::<Vec<Cluster>>(&body) {
                 self.adopt_clusters(saved).await;
+            }
+        }
+        // Users + groups (DynamoDB) → SSO/SCIM-provisioned directory. Merged *over* the seeded
+        // break-glass admin (loaded entries win for their keys, but the admin is never dropped).
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "users").await {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, UserRecord>>(&body) {
+                let mut users = self.users.lock().unwrap();
+                for (k, v) in saved {
+                    users.insert(k, v);
+                }
+            }
+        }
+        if let Some(body) = cloud::ddb_get(&self.ddb_table, "groups").await {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, Vec<String>>>(&body) {
+                let mut groups = self.groups.lock().unwrap();
+                for (k, v) in saved {
+                    groups.insert(k, v);
+                }
             }
         }
     }
@@ -474,7 +661,7 @@ impl AppState {
         format!("cluster-{n}")
     }
 
-    fn issue_token(&self, user: &str, groups: &[String]) -> Option<String> {
+    pub(crate) fn issue_token(&self, user: &str, groups: &[String]) -> Option<String> {
         let exp = now_secs() + TOKEN_TTL_SECS;
         let claims = Claims {
             sub: user.to_string(),
@@ -564,6 +751,32 @@ pub fn app(state: AppState) -> Router {
         )
         .route_layer(from_fn_with_state(state.clone(), auth_mw));
 
+    // SCIM 2.0 provisioning surface, guarded by a static bearer token (WEFT_SCIM_TOKEN).
+    let scim_routes = Router::new()
+        .route(
+            "/scim/v2/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/:id",
+            get(scim::get_user)
+                .put(scim::put_user)
+                .patch(scim::patch_user)
+                .delete(scim::delete_user),
+        )
+        .route(
+            "/scim/v2/Groups",
+            get(scim::list_groups).post(scim::create_group),
+        )
+        .route(
+            "/scim/v2/Groups/:id",
+            get(scim::get_group)
+                .put(scim::put_group)
+                .patch(scim::patch_group)
+                .delete(scim::delete_group),
+        )
+        .route_layer(from_fn_with_state(state.clone(), scim::scim_guard));
+
     // SPA: serve hashed assets directly; any other path (`/`, `/admin`, `/sql`, refreshes, deep
     // links) returns index.html so the client-side router takes over. This is the robust SPA
     // pattern — a plain ServeDir 404s on client routes.
@@ -573,7 +786,12 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
+        // External-IdP OIDC SSO — all PUBLIC (no Bearer), same group as local login.
+        .route("/api/auth/sso/login", get(oidc::sso_login))
+        .route("/api/auth/callback", get(oidc::callback))
+        .route("/api/auth/config", get(oidc::auth_config))
         .merge(protected)
+        .merge(scim_routes)
         .nest_service("/assets", assets)
         .fallback(spa_index)
         .with_state(state)
@@ -2153,5 +2371,234 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(resp).await["state"], "TERMINATED");
+    }
+
+    // ── SSO config + SCIM provisioning (end-to-end through the real router) ──
+
+    /// Serialize tests that mutate process-global env (`WEFT_SCIM_TOKEN`, OIDC vars) so they don't
+    /// race other env-touching tests in this binary.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn auth_config_reports_sso_disabled_by_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["sso_enabled"], false);
+        assert_eq!(j["provider_label"], "SSO");
+    }
+
+    #[tokio::test]
+    async fn sso_login_503_when_disabled() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_OIDC_ISSUER");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/api/auth/sso/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Build state with a SCIM token set (constructed under the env lock).
+    fn scim_state(token: &str) -> AppState {
+        std::env::set_var("WEFT_SCIM_TOKEN", token);
+        let st = AppState::new(
+            "admin",
+            "secretsecret1234",
+            b"test-secret".to_vec(),
+            PathBuf::from("web/dist"),
+        );
+        std::env::remove_var("WEFT_SCIM_TOKEN");
+        st
+    }
+
+    #[tokio::test]
+    async fn scim_disabled_returns_503() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WEFT_SCIM_TOKEN");
+        let st = state();
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn scim_requires_bearer_token() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        // No token → 401.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Wrong token → 401.
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scim_user_provisioning_round_trip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        let auth = "Bearer scim-secret";
+
+        // Create a user in two groups.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::post("/scim/v2/Users")
+                    .header("content-type", "application/scim+json")
+                    .header("authorization", auth)
+                    .body(Body::from(
+                        r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"alice@corp.com","groups":[{"value":"admins"},{"value":"analysts"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        assert_eq!(created["userName"], "alice@corp.com");
+        assert_eq!(created["meta"]["resourceType"], "User");
+
+        // The SSO/SCIM user has an empty password → local login must reject it.
+        assert!(login_token(&st, "alice@corp.com", "").await.is_none());
+
+        // Filtered list returns exactly that user.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get(r#"/scim/v2/Users?filter=userName%20eq%20%22alice@corp.com%22"#)
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        assert_eq!(j["totalResults"], 1);
+        assert_eq!(j["Resources"][0]["userName"], "alice@corp.com");
+
+        // The group store reflects the membership (admin endpoint, behind a session token).
+        let token = login_token(&st, "admin", "secretsecret1234").await.unwrap();
+        let resp = app(st.clone())
+            .oneshot(
+                Request::get("/api/admin/groups")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let groups = body_json(resp).await;
+        let analysts = groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "analysts")
+            .expect("analysts group exists");
+        assert!(analysts["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "alice@corp.com"));
+
+        // DELETE de-provisions.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::delete("/scim/v2/Users/alice@corp.com")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app(st)
+            .oneshot(
+                Request::get("/scim/v2/Users/alice@corp.com")
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scim_group_patch_add_member() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let st = scim_state("scim-secret");
+        let auth = "Bearer scim-secret";
+
+        // Create group with one member.
+        app(st.clone())
+            .oneshot(
+                Request::post("/scim/v2/Groups")
+                    .header("authorization", auth)
+                    .header("content-type", "application/scim+json")
+                    .body(Body::from(
+                        r#"{"displayName":"engineers","members":[{"value":"alice"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // PATCH add a member.
+        let resp = app(st.clone())
+            .oneshot(
+                Request::patch("/scim/v2/Groups/engineers")
+                    .header("authorization", auth)
+                    .header("content-type", "application/scim+json")
+                    .body(Body::from(
+                        r#"{"Operations":[{"op":"add","path":"members","value":[{"value":"bob"}]}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let g = body_json(resp).await;
+        let members: Vec<&str> = g["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["value"].as_str().unwrap())
+            .collect();
+        assert!(members.contains(&"alice") && members.contains(&"bob"));
     }
 }
