@@ -43,6 +43,14 @@ use regex::Regex;
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(RegexpExtract::new()));
     ctx.register_udf(ScalarUDF::from(RegexpExtractAll::new()));
+    ctx.register_udf(ScalarUDF::from(RegexpSubstr::new()));
+    ctx.register_udf(ScalarUDF::from(RegexpCount::new()));
+    ctx.register_udf(ScalarUDF::from(RegexpInstr::new()));
+    // `regexp_like` and its aliases `regexp` / `rlike` (when invoked as a function) are the same
+    // boolean "does the regex match anywhere" predicate.
+    ctx.register_udf(ScalarUDF::from(RegexpLike::new("regexp_like")));
+    ctx.register_udf(ScalarUDF::from(RegexpLike::new("regexp")));
+    ctx.register_udf(ScalarUDF::from(RegexpLike::new("rlike")));
     // Shadows DataFusion's builtin `regexp_replace`, whose semantics diverge from Spark on three
     // counts (no `\\`→`\` unescape, first-match-only, and a `flags` 4th arg where Spark has a
     // 1-based `position`). `RegexpReplace` reimplements Spark's documented contract faithfully.
@@ -210,6 +218,224 @@ impl ScalarUDFImpl for RegexpExtract {
                 None => String::new(),
             };
             out.append_value(extracted);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regexp_substr(str, regex) -> string
+// ---------------------------------------------------------------------------
+
+/// Spark `regexp_substr(str, regexp)` — the **first** substring of `str` matching `regexp` (the
+/// whole match, i.e. group 0), or `NULL` when there is no match. This is the one behavioral
+/// difference from `regexp_extract(str, regexp, 0)`, which returns `''` on no match; `regexp_substr`
+/// returns `NULL`. A NULL `str` or `regexp` propagates to NULL; an invalid pattern raises Spark's
+/// `INVALID_PARAMETER_VALUE.PATTERN`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegexpSubstr {
+    signature: Signature,
+}
+
+impl RegexpSubstr {
+    fn new() -> Self {
+        Self {
+            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for RegexpSubstr {
+    fn name(&self) -> &str {
+        "regexp_substr"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        if args.args.len() != 2 {
+            return exec_err!("regexp_substr: expected 2 arguments");
+        }
+        let strs = to_str_array(&args.args[0], n)?;
+        let pats = to_str_array(&args.args[1], n)?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().unwrap();
+        let pats = pats.as_any().downcast_ref::<StringArray>().unwrap();
+
+        let mut out = StringBuilder::new();
+        for row in 0..n {
+            if strs.is_null(row) || pats.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let pat = pats.value(row);
+            // Spark returns NULL for an empty pattern (rather than the zero-width match an empty
+            // regex would otherwise yield) — see `regexp_substr('1a 2b 14m', '')` → NULL.
+            if pat.is_empty() {
+                out.append_null();
+                continue;
+            }
+            let re = compile_pattern("regexp_substr", pat)?;
+            // The leftmost whole match (group 0); no match → NULL (not `''`).
+            match re.find(strs.value(row)) {
+                Some(m) => out.append_value(m.as_str()),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regexp_count(str, regex) -> int   ·   regexp_instr(str, regex) -> int
+// regexp_like / regexp / rlike (str, regex) -> boolean
+// ---------------------------------------------------------------------------
+
+/// Materialize the (str, regexp) operands of a 2-arg regex predicate as `Utf8` arrays.
+fn regex_pair(args: &ScalarFunctionArgs, func: &str) -> Result<(ArrayRef, ArrayRef)> {
+    if args.args.len() != 2 {
+        return exec_err!("{func}: expected 2 arguments");
+    }
+    let n = args.number_rows;
+    Ok((to_str_array(&args.args[0], n)?, to_str_array(&args.args[1], n)?))
+}
+
+/// Spark `regexp_count(str, regexp)` — the number of non-overlapping matches of `regexp` in `str`
+/// (`0` when none). NULL `str`/`regexp` → NULL. Returns `int`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegexpCount {
+    signature: Signature,
+}
+
+impl RegexpCount {
+    fn new() -> Self {
+        Self {
+            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for RegexpCount {
+    fn name(&self) -> &str {
+        "regexp_count"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int32)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let (strs, pats) = regex_pair(&args, "regexp_count")?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().unwrap();
+        let pats = pats.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut out = Int32Array::builder(n);
+        for row in 0..n {
+            if strs.is_null(row) || pats.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let re = compile_pattern("regexp_count", pats.value(row))?;
+            out.append_value(re.find_iter(strs.value(row)).count() as i32);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Spark `regexp_instr(str, regexp)` — the **1-based character** position at which the first match
+/// of `regexp` begins in `str`, or `0` when there is no match. NULL `str`/`regexp` → NULL.
+/// Returns `int`. (Spark's auto-name carries a synthetic `, 0` idx argument — see `spark_names`.)
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegexpInstr {
+    signature: Signature,
+}
+
+impl RegexpInstr {
+    fn new() -> Self {
+        Self {
+            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for RegexpInstr {
+    fn name(&self) -> &str {
+        "regexp_instr"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int32)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let (strs, pats) = regex_pair(&args, "regexp_instr")?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().unwrap();
+        let pats = pats.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut out = Int32Array::builder(n);
+        for row in 0..n {
+            if strs.is_null(row) || pats.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let text = strs.value(row);
+            let re = compile_pattern("regexp_instr", pats.value(row))?;
+            let pos = match re.find(text) {
+                // 1-based *character* index of the match start (not byte offset).
+                Some(m) => text[..m.start()].chars().count() as i32 + 1,
+                None => 0,
+            };
+            out.append_value(pos);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Spark `regexp_like(str, regexp)` (and its function-call aliases `regexp` / `rlike`) — whether
+/// `regexp` matches anywhere in `str`. NULL `str`/`regexp` → NULL. Returns `boolean`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegexpLike {
+    signature: Signature,
+    name: &'static str,
+}
+
+impl RegexpLike {
+    fn new(name: &'static str) -> Self {
+        Self {
+            signature: Signature::one_of(vec![TypeSignature::Any(2)], Volatility::Immutable),
+            name,
+        }
+    }
+}
+
+impl ScalarUDFImpl for RegexpLike {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let (strs, pats) = regex_pair(&args, self.name)?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().unwrap();
+        let pats = pats.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut out = datafusion::arrow::array::BooleanArray::builder(n);
+        for row in 0..n {
+            if strs.is_null(row) || pats.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let re = compile_pattern(self.name, pats.value(row))?;
+            out.append_value(re.is_match(strs.value(row)));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -553,6 +779,16 @@ mod tests {
         crate::arrow::util::pretty::pretty_format_batches(&batches)
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn regexp_substr_first_match_or_null() {
+        // First whole match.
+        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+') AS x").await.contains("| 1 "));
+        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+(a|b|m)') AS x").await.contains("1a"));
+        // No match → NULL (not empty string, which is what regexp_extract would give). Arrow's
+        // pretty-format prints a null as blank, so assert nullness via `IS NULL`.
+        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+ x') IS NULL AS x").await.contains("true"));
     }
 
     #[tokio::test]
