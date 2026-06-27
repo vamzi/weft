@@ -8,20 +8,20 @@
     "error-parity": 2406,
     "exec-error": 1093,
     "feature-unsupported": 482,
-    "function-missing": 721,
+    "function-missing": 716,
     "missing-error": 166,
     "missing-relation": 900,
     "nondeterministic": 4,
     "null-semantics": 71,
-    "ordering": 51,
+    "ordering": 50,
     "parser-unsupported": 1238,
-    "pass": 2919,
+    "pass": 2924,
     "requires-udf-registration": 87,
-    "schema-only": 2021
+    "schema-only": 2022
   },
   "files_skipped": 63,
   "files_total": 303,
-  "semantic_pass": 7397,
+  "semantic_pass": 7402,
   "spark_version": "v4.0.0",
-  "strict_pass": 2919
+  "strict_pass": 2923
 }
