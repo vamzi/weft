@@ -78,7 +78,10 @@ async fn run_auto(c2: &Cluster2, planner: &Engine, sql: &str) -> Vec<RecordBatch
         .await
         .expect("plan_distributed");
     let mut out = None;
-    for _ in 0..50 {
+    // Up to 15s: CI runners boot the two workers and run the multi-stage shuffle under heavy
+    // parallel-test load far slower than a dev box (where this succeeds on the first try), so a
+    // 5s budget flaked intermittently. Bumping the retry window keeps the gate reliable.
+    for _ in 0..150 {
         match run_stages(&c2.cluster, &dq.stages).await {
             Ok(b) => {
                 out = Some(b);
@@ -232,7 +235,8 @@ async fn auto_derived_broadcast_join() {
         .await
         .expect("plan_distributed should auto-derive the broadcast join");
     let mut gathered = None;
-    for _ in 0..50 {
+    // Up to 15s — see `run_auto`; the broadcast-join cluster is just as sensitive to CI load.
+    for _ in 0..150 {
         if let Ok(b) = run_stages(&cluster, &dq.stages).await {
             gathered = Some(b);
             break;
