@@ -1,0 +1,98 @@
+name: weft-image
+
+# Build & publish the open-source Weft ENGINE image to Docker Hub as `vamzi/weft`.
+#
+# This is the `weft` binary (crate weft-cli) in a hardened distroless image. The
+# control-plane gateway provisions per-user compute pods from THIS one image,
+# overriding the command per role:
+#     weft spark server --port 50051   -> Spark Connect driver  ("cluster")
+#     weft worker       --port 50561   -> Arrow Flight worker    (same image, diff args)
+# so a single `vamzi/weft` image covers both; no separate worker image is needed.
+#
+# SCOPE — engine only. The proprietary control-plane GATEWAY image is built in the
+# PRIVATE GitLab repo (its own .gitlab-ci.yml -> a private registry) and is
+# deliberately NOT built or published here. Do not add gateway.Dockerfile.
+#
+# Repo secrets required (Settings -> Secrets and variables -> Actions):
+#   DOCKERHUB_USERNAME   Docker Hub account that can push to vamzi/weft (e.g. vamzi)
+#   DOCKERHUB_TOKEN      Docker Hub access token with Read/Write (NOT the password)
+#
+# Built linux/amd64 to match the default EKS node arch. For Graviton (arm64) nodes,
+# add linux/arm64 to `platforms:` (arm64 builds under emulation, ~2x slower).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "deploy/docker/connect-server.Dockerfile"
+      - ".github/workflows/weft-image.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to publish alongside latest/sha (e.g. demo, v0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weft-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk (engine build is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /opt/az \
+            /usr/local/lib/node_modules /usr/share/swift || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/vamzi/weft
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - name: Build & push vamzi/weft (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/connect-server.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Published \`vamzi/weft\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
