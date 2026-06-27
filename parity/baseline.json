@@ -5,23 +5,23 @@
     "datetime": 13,
     "decimal-precision": 189,
     "engine-panic": 3,
-    "error-parity": 2406,
+    "error-parity": 2409,
     "exec-error": 1093,
     "feature-unsupported": 482,
-    "function-missing": 705,
-    "missing-error": 166,
+    "function-missing": 695,
+    "missing-error": 163,
     "missing-relation": 900,
     "nondeterministic": 4,
     "null-semantics": 69,
-    "ordering": 49,
-    "parser-unsupported": 1238,
-    "pass": 2946,
+    "ordering": 48,
+    "parser-unsupported": 1239,
+    "pass": 2952,
     "requires-udf-registration": 87,
-    "schema-only": 2014
+    "schema-only": 2018
   },
   "files_skipped": 63,
   "files_total": 303,
-  "semantic_pass": 7415,
+  "semantic_pass": 7427,
   "spark_version": "v4.0.0",
-  "strict_pass": 2945
+  "strict_pass": 2951
 }
