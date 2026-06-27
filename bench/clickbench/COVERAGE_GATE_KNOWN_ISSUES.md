@@ -1,46 +1,35 @@
 # ClickBench coverage gate — known pre-existing failures
 
-**Status:** advisory (non-blocking) — see the `coverage` job in `.github/workflows/ci.yml`.
+**Status: RESOLVED** — all 43 queries pass; `coverage` job is a required gate again.
 
-The synthetic-data ClickBench coverage gates (`weft-bench -- clickbench`, `clickbench-grpc`,
-`correctness`) fail **19 of 43** queries. This is **pre-existing** (identical on a clean `main`
-checkout) and **unrelated to engine correctness or Spark parity**. It went unnoticed because the
-`build-test` CI job died at the `clippy` step first (workspace clippy/fmt debt). Once that debt was
-fixed and the test gate started running, these failures surfaced.
+## Root cause (identified and fixed)
 
-To land the rustfmt/clippy/test/parity gates green, the three affected coverage steps were moved to
-a separate `coverage` job marked `continue-on-error: true` (advisory). **TPC-H passes and stays
-required.** The real coverage signal is the self-hosted 14.78 GB ClickBench run (`bench.yml`) plus
-the Spark-SQL parity ratchet — both unaffected.
+The `Engine` uses the **Databricks SQL dialect** (`opts.sql_parser.dialect = Dialect::Databricks`),
+which treats `"..."` as a **string literal**, not an identifier (matching Spark's default
+`spark.sql.ansi.double_quoted_identifiers=false`). The ClickBench `queries.sql` file used
+ANSI-standard double-quoted column identifiers (e.g. `"CounterID"`, `"EventDate"`).
 
-## Failing queries
+DataFusion therefore parsed `WHERE "CounterID" = 62` as `WHERE 'CounterID' = 62` (a string
+constant compared to an integer), and the `simplify_expressions` optimizer tried to constant-fold
+the comparison by casting `'CounterID'` to Int32 — producing the error
+`Cannot cast string 'CounterID' to value of Int32 type`.
 
-`[1,2,3,7,9,18,19,29,30,31,32,35,36,37,38,39,40,41,42]` (engine-direct, `--rows 20000`). 24/43 pass.
+The same root cause produced every other failure category:
+- `Function 'sum' failed to match any signature … received String (Utf8)` — `SUM('IsRefresh')` instead of the column
+- `Cannot coerce arithmetic expression Utf8 - Int64` — `'ClientIP' - 1`
+- `Error parsing timestamp from 'EventTime'` — `to_timestamp_seconds('EventTime')`
 
-## Representative errors
+Queries that "passed" before the fix (e.g. Q4 `COUNT(DISTINCT "UserID")`, Q11
+`"MobilePhoneModel" <> ''`) happened not to trigger a type error under the wrong interpretation,
+but returned semantically wrong results.
 
-- `Optimizer rule 'simplify_expressions' failed … Cannot cast string 'CounterID' to value of Int32 type` (Q36–42)
-- `Function 'sum' failed to match any signature … received String (Utf8)` (Q29–32)
-- `Cannot coerce arithmetic expression Utf8 - Int64 to valid types` (Q35: `"ClientIP" - 1`)
-- `Error parsing timestamp from 'EventTime'` (Q18)
-- correctness anchor: `EventDate range FAIL: ["EventDate|EventDate"]`
+## Fix
 
-## What it is NOT
+Converted all `"ColumnName"` identifiers in `bench/clickbench/queries.sql` to
+`` `ColumnName` `` (backtick-quoted). Backtick-quoted identifiers are recognized as identifiers by
+both the Databricks and Generic dialects. Also fixed the two inline SQL strings in
+`crates/weft-bench/src/main.rs` that used `\"EventDate\"` for the same reason.
 
-- **Not** a data-generation bug: `gen_array`/`columns()` + `bench/clickbench/hits_schema.tsv` produce
-  correctly-typed columns (`CounterID`→i32, `EventTime`→ts, `EventDate`→date), and the engine-direct
-  path registers them as a correctly-typed `MemTable`.
-- **Not** a double-quote-as-string-literal dialect issue: passing queries use double-quoted
-  identifiers fine (Q5 `COUNT(DISTINCT "UserID")`, Q11 `"MobilePhoneModel" <> ''`).
-- **Not** caused by the Spark-parity analyzer passes: the failures are byte-identical on a clean
-  `main` checkout with those passes absent.
+## Acceptance criterion (met)
 
-## Likely cause
-
-A DataFusion-54-era `simplify_expressions` / type-coercion interaction with these specific ClickBench
-query shapes. Needs a focused per-query repro.
-
-## Acceptance (to restore as a required gate)
-
-`cargo run -p weft-bench -- clickbench --rows 20000` exits 0 (43/43), then drop `continue-on-error`
-from the `coverage` job in `.github/workflows/ci.yml`.
+`cargo run -p weft-bench -- clickbench --rows 20000` exits 0 (43/43).
