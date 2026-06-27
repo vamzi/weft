@@ -253,6 +253,13 @@ fn render_scalar_fn(sf: &ScalarFunction, agg: &AggMap) -> String {
     if sf.func.name() == "spark_divide" && sf.args.len() == 2 {
         return format!("({} / {})", render(&sf.args[0], agg), render(&sf.args[1], agg));
     }
+    // weft lowers an integral `*` with a `bigint` result to the internal `spark_checked_mul` UDF so
+    // an Int64 overflow raises ARITHMETIC_OVERFLOW like Spark ANSI. Spark names it as the ordinary
+    // `(left * right)` multiply it was written as, so render it that way — the operand coercion casts
+    // are stripped by `render`, exactly as for a plain `BinaryExpr` multiply.
+    if sf.func.name() == "spark_checked_mul" && sf.args.len() == 2 {
+        return format!("({} * {})", render(&sf.args[0], agg), render(&sf.args[1], agg));
+    }
     // Spark names `from_json`'s output column with *only* the JSON argument — the schema string and
     // the optional options map are dropped (`JsonToStructs.prettyName`): `from_json({"a":1})`.
     if sf.func.name() == "from_json" && !sf.args.is_empty() {

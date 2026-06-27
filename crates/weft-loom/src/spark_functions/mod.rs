@@ -21,6 +21,10 @@ mod spark_aggregates;
 mod spark_aggregates2;
 mod spark_array;
 mod spark_bitshift;
+// `pub(crate)` (like `spark_divide`): `lower_checked_multiply` in `lib.rs` embeds the
+// `spark_checked_mul` UDF directly via `spark_checked_mul::udf()` when lowering an integral `*`
+// whose Spark result type is `bigint`.
+pub(crate) mod spark_checked_mul;
 // `pub(crate)` so `crate::spark_names` can reuse the cast-alias name list for column naming.
 pub(crate) mod spark_cast_constructors;
 mod spark_convert;
@@ -56,6 +60,7 @@ pub fn register(ctx: &SessionContext) {
     spark_from_json::register(ctx);
     spark_if::register(ctx);
     spark_divide::register(ctx);
+    spark_checked_mul::register(ctx);
     spark_math::register(ctx);
     spark_misc::register(ctx);
     spark_array::register(ctx);

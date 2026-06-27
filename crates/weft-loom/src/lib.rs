@@ -668,7 +668,7 @@ impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
     > {
         use datafusion::arrow::datatypes::DataType;
         use datafusion::logical_expr::planner::PlannerResult;
-        use datafusion::logical_expr::{cast, BinaryExpr, Expr, ExprSchemable, Operator};
+        use datafusion::logical_expr::{cast, Expr, ExprSchemable};
         use datafusion::sql::sqlparser::ast::BinaryOperator;
 
         // Spark `/` only. (Spark integer division `DIV` is `Operator::IntegerDivide`, never `/`.)
@@ -687,34 +687,128 @@ impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
         if !is_integral(&left_ty) || !is_integral(&right_ty) {
             return Ok(PlannerResult::Original(expr));
         }
-        // A literal-zero divisor needs Spark's *static DOUBLE* type (so a dead `1/0` branch in
-        // `if`/`coalesce`/`CASE` promotes the column to `double` and prints `1.0`, not `1`) while
-        // STILL raising Spark's ANSI `DIVIDE_BY_ZERO` when the divisor actually evaluates to zero
-        // (eager `SELECT 5 / 0`). A plain double divide can't do both — `5.0 / 0.0` is `Infinity`,
-        // which would silently drop the error. So lower it to the internal `spark_divide(double,
-        // double)` UDF: return type `Float64` (the static double), and an `invoke` that raises
-        // DIVIDE_BY_ZERO on a non-null zero divisor. The dead-branch cases never hit that error —
-        // the constant-guard `CASE`/`coalesce` is pruned by the simplifier before the UDF runs (and
-        // a dynamic branch is evaluated only on matching rows). See `spark_functions::spark_divide`.
-        if is_literal_zero(&expr.right) {
-            use datafusion::logical_expr::expr::ScalarFunction;
-            let planned = Expr::ScalarFunction(ScalarFunction::new_udf(
-                crate::spark_functions::spark_divide::udf(),
-                vec![
-                    cast(expr.left, DataType::Float64),
-                    cast(expr.right, DataType::Float64),
-                ],
-            ));
-            return Ok(PlannerResult::Planned(planned));
-        }
-
-        let planned = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(cast(expr.left, DataType::Float64)),
-            Operator::Divide,
-            Box::new(cast(expr.right, DataType::Float64)),
+        // Route EVERY integral `/` through the internal `spark_divide(double, double)` UDF. It has a
+        // static `Float64` return type — identical to a plain `CAST(l AS DOUBLE) / CAST(r AS DOUBLE)`
+        // double divide for every non-zero (and null) divisor, so those rows are byte-identical — but
+        // it ALSO raises Spark's ANSI `DIVIDE_BY_ZERO` whenever a divisor *actually evaluates to zero*
+        // (eager `SELECT 5 / 0`, or a cast-zero divisor like `bigint('0')` that a literal-zero check
+        // can't see). A plain double divide yields `Infinity` there, silently dropping a Spark error
+        // (a forbidden missing-error regression); the UDF closes that gap for all integral `/` while
+        // changing only the runtime-zero-divisor rows — which Spark ANSI always rejects. The static
+        // DOUBLE type also lets a dead `1/0` branch in `if`/`coalesce`/`CASE` promote the column to
+        // `double` and print `1.0`; those dead branches never hit the error (the constant-guard
+        // `CASE`/`coalesce` is pruned by the simplifier before the UDF runs, and a dynamic branch is
+        // evaluated only on matching rows). See `spark_functions::spark_divide`.
+        use datafusion::logical_expr::expr::ScalarFunction;
+        let planned = Expr::ScalarFunction(ScalarFunction::new_udf(
+            crate::spark_functions::spark_divide::udf(),
+            vec![
+                cast(expr.left, DataType::Float64),
+                cast(expr.right, DataType::Float64),
+            ],
         ));
         Ok(PlannerResult::Planned(planned))
     }
+}
+
+/// Lower every integral `*` whose Spark result type is `bigint` to the ANSI-checked
+/// `spark_checked_mul` UDF, matching Spark's overflow contract.
+///
+/// Spark's `*` is ANSI-checked: an `Int64` product that overflows two's-complement raises
+/// `ARITHMETIC_OVERFLOW` (`bigint(min) * bigint(-1)`, the unfiltered `q1 * q2` over `INT8_TBL`).
+/// DataFusion's native `Int64` multiply *wraps* silently, yielding a corrupt value where Spark
+/// errors — a forbidden missing-error gap.
+///
+/// This runs as a logical-plan rewrite, deliberately **after** [`spark_int_literals::
+/// downcast_int_literals`], so every operand type it sees is already Spark-final: an in-range
+/// integer literal is `Int32` (Spark `int`), so `int_col * 2` is an `int` product and is left alone,
+/// while a genuine `bigint` operand (a `bigint` column, a `CAST(... AS BIGINT)`, or an out-of-range
+/// literal) makes the product `bigint`. (Doing this at expression-planning time instead would see
+/// DataFusion's transient pre-retyping `Int64` literal types and wrongly promote `int * 2` to
+/// `bigint`.) For each integral `*` with at least one `Int64` operand we cast both operands to
+/// `Int64` and route to `spark_checked_mul` (return type `Int64`, identical to the native multiply's
+/// result type). The checked product equals the wrapping product whenever no overflow occurs, so
+/// every non-overflowing row is byte-identical; only overflow rows change, and Spark ANSI rejects
+/// those too — so this can only convert missing-error→error-parity, never pass→fail. A `NULL`
+/// operand yields `NULL` (no error), exactly like Spark `*`. Output column names are preserved (the
+/// [`NamePreserver`], like the literal-retype pass) so no by-name reference breaks, and the
+/// per-node schema is recomputed; any node that cannot be re-validated aborts the rewrite back to
+/// the original plan (never an error, never a partial plan).
+fn lower_checked_multiply(plan: datafusion::logical_expr::LogicalPlan) -> datafusion::logical_expr::LogicalPlan {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::expr_rewriter::NamePreserver;
+    use std::cell::Cell;
+
+    let changed = Cell::new(false);
+    let rewritten = plan.clone().transform_up(|node| {
+        // Operand types in this node's expressions resolve against its children's combined output
+        // schema (Projection/Filter/Aggregate read their input; a Join's `ON` reads both sides).
+        let mut input_schema = DFSchema::empty();
+        for input in node.inputs() {
+            input_schema.merge(input.schema());
+        }
+        let preserver = NamePreserver::new(&node);
+        let mut node_changed = false;
+        let t = node.map_expressions(|expr| {
+            let saved = preserver.save(&expr);
+            let r = rewrite_mul_expr(expr, &input_schema)?;
+            node_changed |= r.transformed;
+            Ok(r.update_data(|e| saved.restore(e)))
+        })?;
+        if node_changed {
+            changed.set(true);
+            // Recompute the node's schema so the `bigint` product type flows through consistently.
+            let node = t.data.recompute_schema()?;
+            Ok(Transformed::yes(node))
+        } else {
+            Ok(Transformed::no(t.data))
+        }
+    });
+    match rewritten {
+        Ok(t) if changed.get() => t.data,
+        _ => plan,
+    }
+}
+
+/// Rewrite every integral `*` (with at least one `Int64` operand) nested anywhere in one expression
+/// into `spark_checked_mul(CAST(l AS BIGINT), CAST(r AS BIGINT))`. Operand types are resolved
+/// against `schema`; an operand whose type can't be resolved leaves that `*` untouched.
+fn rewrite_mul_expr(
+    expr: datafusion::logical_expr::Expr,
+    schema: &datafusion::common::DFSchema,
+) -> datafusion::common::Result<datafusion::common::tree_node::Transformed<datafusion::logical_expr::Expr>> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::logical_expr::{cast, BinaryExpr, Expr, ExprSchemable, Operator};
+
+    expr.transform_up(|e| {
+        let Expr::BinaryExpr(BinaryExpr { left, op: Operator::Multiply, right }) = &e else {
+            return Ok(Transformed::no(e));
+        };
+        let (Ok(lt), Ok(rt)) = (left.get_type(schema), right.get_type(schema)) else {
+            return Ok(Transformed::no(e));
+        };
+        // Both integral and at least one `Int64` (Spark `bigint` result). `Int32 * Int32` (and
+        // narrower) keeps Spark's `int` result type — its overflow boundary is different and is left
+        // on DataFusion. Decimal/float/double operands aren't integral, so they're untouched.
+        if !is_integral(&lt) || !is_integral(&rt) {
+            return Ok(Transformed::no(e));
+        }
+        if !matches!(lt, DataType::Int64) && !matches!(rt, DataType::Int64) {
+            return Ok(Transformed::no(e));
+        }
+        let (l, r) = match e {
+            Expr::BinaryExpr(BinaryExpr { left, right, .. }) => (*left, *right),
+            _ => unreachable!("matched BinaryExpr above"),
+        };
+        let new = Expr::ScalarFunction(ScalarFunction::new_udf(
+            crate::spark_functions::spark_checked_mul::udf(),
+            vec![cast(l, DataType::Int64), cast(r, DataType::Int64)],
+        ));
+        Ok(Transformed::yes(new))
+    })
 }
 
 /// Whether `t` is one of Spark's integral types (the signed/unsigned fixed-width integers). Decimal,
@@ -727,31 +821,6 @@ fn is_integral(t: &datafusion::arrow::datatypes::DataType) -> bool {
         t,
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
     )
-}
-
-/// Whether `e` is (a cast wrapper around) an integer literal `0`. Used to keep a literal-zero
-/// divisor on DataFusion's integer-divide path, which raises `DIVIDE_BY_ZERO` like Spark ANSI `/`.
-fn is_literal_zero(e: &datafusion::logical_expr::Expr) -> bool {
-    use datafusion::common::ScalarValue::{
-        Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8,
-    };
-    use datafusion::logical_expr::Expr;
-    match e {
-        Expr::Cast(c) => is_literal_zero(&c.expr),
-        Expr::TryCast(c) => is_literal_zero(&c.expr),
-        Expr::Literal(v, _) => matches!(
-            v,
-            Int8(Some(0))
-                | Int16(Some(0))
-                | Int32(Some(0))
-                | Int64(Some(0))
-                | UInt8(Some(0))
-                | UInt16(Some(0))
-                | UInt32(Some(0))
-                | UInt64(Some(0))
-        ),
-        _ => false,
-    }
 }
 
 /// AND for the `ALL` quantifier, OR for `ANY`/`SOME`.
@@ -1017,6 +1086,18 @@ impl Engine {
             // `"..."` as an identifier, which mis-parses Spark string literals like
             // `next_day("2015-07-23", "Mon")`.
             opts.sql_parser.dialect = datafusion::common::config::Dialect::Databricks;
+            // Spark's default NULL ordering treats NULL as the smallest value (ASC → NULLS FIRST,
+            // DESC → NULLS LAST), whereas DataFusion defaults to Postgres's `nulls_max` (ASC →
+            // NULLS LAST). Matching Spark makes weft's implicit ORDER BY (including window-function
+            // ORDER BY, where it changes computed running aggregates, not just row order) produce
+            // Spark's committed output.
+            opts.sql_parser.default_null_ordering = "nulls_min".to_string();
+            // Spark's default null ordering is ASC NULLS FIRST / DESC NULLS LAST, expressed by
+            // DataFusion's `nulls_min`. DataFusion's own default (`nulls_max`, Postgres-style ASC
+            // NULLS LAST) silently flips both the outer ORDER BY *and* the within-window ORDER BY,
+            // which changes window-frame contents (e.g. a NULL row's RANGE/ROWS neighbours) and the
+            // final row order. Aligning the default is a faithful match to Spark.
+            opts.sql_parser.default_null_ordering = "nulls_min".to_string();
             opts.execution.parquet.pushdown_filters = true;
             opts.execution.parquet.reorder_filters = true;
             opts.execution.parquet.binary_as_string = true;
@@ -1144,6 +1225,10 @@ impl Engine {
         // defeat the Spark-name pass.
         let plan = spark_names::project_spark_names(plan);
         let plan = spark_int_literals::downcast_int_literals(plan);
+        // Lower integral `*` with a `bigint` result to the ANSI-checked-overflow UDF. Runs AFTER the
+        // literal retype so operand types are Spark-final (an in-range literal is `int`, so `int * 2`
+        // stays `int` and is not promoted to `bigint`). See `lower_checked_multiply`.
+        let plan = lower_checked_multiply(plan);
         self.ctx
             .execute_logical_plan(plan)
             .await
