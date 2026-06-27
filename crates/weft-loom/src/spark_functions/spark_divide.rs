@@ -150,8 +150,14 @@ mod tests {
         assert_eq!(cell("SELECT if(1 != 1, 1/0, 1) AS x").await, "1.0");
         assert_eq!(cell("SELECT coalesce(1, 1/0) AS x").await, "1.0");
         assert_eq!(cell("SELECT coalesce(null, 1, 1/0) AS x").await, "1.0");
-        assert_eq!(cell("SELECT case when 1 < 2 then 1 else 1/0 end AS x").await, "1.0");
-        assert_eq!(cell("SELECT case when 1 > 2 then 1/0 else 1 end AS x").await, "1.0");
+        assert_eq!(
+            cell("SELECT case when 1 < 2 then 1 else 1/0 end AS x").await,
+            "1.0"
+        );
+        assert_eq!(
+            cell("SELECT case when 1 > 2 then 1/0 else 1 end AS x").await,
+            "1.0"
+        );
     }
 
     /// An eager `5/0` must still raise DIVIDE_BY_ZERO (the error Spark raises), not return Infinity.

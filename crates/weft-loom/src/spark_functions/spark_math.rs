@@ -109,7 +109,11 @@ impl ScalarUDFImpl for SparkRound {
         if int_bounds(value_type).is_some() {
             // Spark returns the SAME integral type as the value argument.
             let nullable = args.arg_fields.iter().any(|f| f.is_nullable());
-            Ok(Arc::new(Field::new(self.name(), value_type.clone(), nullable)))
+            Ok(Arc::new(Field::new(
+                self.name(),
+                value_type.clone(),
+                nullable,
+            )))
         } else {
             self.builtin.return_field_from_args(args)
         }

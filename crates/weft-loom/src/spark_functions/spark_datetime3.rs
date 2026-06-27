@@ -50,8 +50,14 @@ use datafusion::prelude::SessionContext;
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(MakeTimestamp::new("make_timestamp")));
     ctx.register_udf(ScalarUDF::from(MakeTimestamp::new("make_timestamp_ntz")));
-    ctx.register_udf(ScalarUDF::from(ToTimestampNtz::new("to_timestamp_ntz", false)));
-    ctx.register_udf(ScalarUDF::from(ToTimestampNtz::new("try_to_timestamp", true)));
+    ctx.register_udf(ScalarUDF::from(ToTimestampNtz::new(
+        "to_timestamp_ntz",
+        false,
+    )));
+    ctx.register_udf(ScalarUDF::from(ToTimestampNtz::new(
+        "try_to_timestamp",
+        true,
+    )));
     ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Seconds)));
     ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Millis)));
     ctx.register_udf(ScalarUDF::from(UnixDate::new()));
@@ -438,7 +444,11 @@ fn parse_default(s: &str) -> Option<i64> {
         return None;
     }
     let days = days_from_civil(y, mo, d);
-    Some(days * MICROS_PER_DAY + (h as i64 * 3600 + mi as i64 * 60 + se as i64) * MICROS_PER_SEC + micros)
+    Some(
+        days * MICROS_PER_DAY
+            + (h as i64 * 3600 + mi as i64 * 60 + se as i64) * MICROS_PER_SEC
+            + micros,
+    )
 }
 
 /// The java.time pattern letters [`parse_with_pattern`] understands (numeric fields only). Any other
@@ -463,7 +473,8 @@ fn parse_with_pattern(input: &str, fmt: &str) -> Option<i64> {
             let close = open + close;
             let with = format!("{}{}", &fmt[..open], &fmt[open + 1..close]) + &fmt[close + 1..];
             let without = format!("{}{}", &fmt[..open], &fmt[close + 1..]);
-            return parse_with_pattern(input, &with).or_else(|| parse_with_pattern(input, &without));
+            return parse_with_pattern(input, &with)
+                .or_else(|| parse_with_pattern(input, &without));
         }
     }
     parse_fixed_pattern(input, fmt)
@@ -831,12 +842,9 @@ impl ScalarUDFImpl for DateAdd {
 
         // numDays: cast strictly to Int32 (string '1.2' must error, matching Spark CAST_INVALID_INPUT).
         let days_in = args.args[1].clone().into_array(n)?;
-        let days = datafusion::arrow::compute::cast_with_options(
-            &days_in,
-            &DataType::Int32,
-            &cast_opts,
-        )
-        .map_err(arrow_err)?;
+        let days =
+            datafusion::arrow::compute::cast_with_options(&days_in, &DataType::Int32, &cast_opts)
+                .map_err(arrow_err)?;
         let days = days.as_any().downcast_ref::<Int32Array>().unwrap();
 
         let mut out = Date32Array::builder(n);
@@ -1062,7 +1070,10 @@ mod tests {
             "2011-11-12"
         );
         // NULL passthrough.
-        assert_eq!(cell("SELECT date_add(CAST(NULL AS DATE), 1) AS x").await, "NULL");
+        assert_eq!(
+            cell("SELECT date_add(CAST(NULL AS DATE), 1) AS x").await,
+            "NULL"
+        );
         assert_eq!(
             cell("SELECT date_add(DATE '2011-11-11', CAST(NULL AS INT)) AS x").await,
             "NULL"
@@ -1073,6 +1084,9 @@ mod tests {
     async fn date_add_invalid_inputs_error() {
         let engine = Engine::new();
         // Non-numeric day-count string -> CAST_INVALID_INPUT (error, not NULL).
-        assert!(engine.sql("SELECT date_add('2011-11-11', '1.2')").await.is_err());
+        assert!(engine
+            .sql("SELECT date_add('2011-11-11', '1.2')")
+            .await
+            .is_err());
     }
 }

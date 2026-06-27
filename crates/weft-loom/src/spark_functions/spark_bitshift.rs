@@ -159,7 +159,9 @@ mod tests {
     #[tokio::test]
     async fn shift_left_masks_and_preserves_int() {
         // -1 << 31 = i32::MIN (-2147483648); shift amount masked to 31 bits.
-        assert!(run("SELECT shiftleft(int(-1), 31) AS x").await.contains("-2147483648"));
+        assert!(run("SELECT shiftleft(int(-1), 31) AS x")
+            .await
+            .contains("-2147483648"));
         // 1 << 3 = 8.
         assert!(run("SELECT shiftleft(int(1), 3) AS x").await.contains('8'));
     }
@@ -167,9 +169,13 @@ mod tests {
     #[tokio::test]
     async fn shift_right_signed_vs_unsigned() {
         // -8 >> 1 = -4 (arithmetic).
-        assert!(run("SELECT shiftright(int(-8), 1) AS x").await.contains("-4"));
+        assert!(run("SELECT shiftright(int(-8), 1) AS x")
+            .await
+            .contains("-4"));
         // -1 >>> 28 = 15 (logical, on 32-bit).
-        assert!(run("SELECT shiftrightunsigned(int(-1), 28) AS x").await.contains("15"));
+        assert!(run("SELECT shiftrightunsigned(int(-1), 28) AS x")
+            .await
+            .contains("15"));
     }
 
     #[tokio::test]

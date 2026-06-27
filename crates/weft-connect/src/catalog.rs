@@ -27,7 +27,9 @@ const PREFIX: &str = "spark.sql.catalog.";
 ///
 /// The bare `spark.sql.catalog.<name>` entry (Spark's implementation-class slot) is captured as the
 /// `type` option, so both `spark.sql.catalog.prod=hive` and `spark.sql.catalog.prod.type=hive` work.
-pub fn group_catalog_options(config: &HashMap<String, String>) -> HashMap<String, HashMap<String, String>> {
+pub fn group_catalog_options(
+    config: &HashMap<String, String>,
+) -> HashMap<String, HashMap<String, String>> {
     let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (k, v) in config {
         let Some(rest) = k.strip_prefix(PREFIX) else {
@@ -104,9 +106,10 @@ pub async fn handle_catalog(
                 .map_err(err_to_status)?;
             Ok(empty_result())
         }
-        CatType::CurrentDatabase(_) => {
-            Ok(scalar_string("name", &registry.current_namespace().join(".")))
-        }
+        CatType::CurrentDatabase(_) => Ok(scalar_string(
+            "name",
+            &registry.current_namespace().join("."),
+        )),
         CatType::SetCurrentDatabase(s) => {
             registry.set_current_namespace(&s.db_name);
             Ok(empty_result())
@@ -116,7 +119,8 @@ pub async fn handle_catalog(
             list_tables(engine, registry, l.db_name.as_deref(), l.pattern.as_deref()).await
         }
         CatType::TableExists(t) => {
-            let exists = table_exists(engine, registry, &t.table_name, t.db_name.as_deref()).await?;
+            let exists =
+                table_exists(engine, registry, &t.table_name, t.db_name.as_deref()).await?;
             Ok(scalar_bool(exists))
         }
         CatType::DatabaseExists(d) => {
@@ -143,7 +147,11 @@ pub fn result_schema(cat: &sc::Catalog) -> Option<SchemaRef> {
             Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]))
         }
         CatType::TableExists(_) | CatType::DatabaseExists(_) => {
-            Arc::new(Schema::new(vec![Field::new("exists", DataType::Boolean, false)]))
+            Arc::new(Schema::new(vec![Field::new(
+                "exists",
+                DataType::Boolean,
+                false,
+            )]))
         }
         _ => return None,
     })
@@ -367,12 +375,22 @@ fn matches_pattern(name: &str, pattern: Option<&str>) -> bool {
 fn scalar_string(col: &str, value: &str) -> Vec<RecordBatch> {
     use weft_loom::arrow::array::StringArray;
     let schema = Arc::new(Schema::new(vec![Field::new(col, DataType::Utf8, false)]));
-    vec![RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))]).expect("scalar")]
+    vec![
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![value]))])
+            .expect("scalar"),
+    ]
 }
 
 fn scalar_bool(value: bool) -> Vec<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![Field::new("exists", DataType::Boolean, false)]));
-    vec![RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(vec![value]))]).expect("bool")]
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "exists",
+        DataType::Boolean,
+        false,
+    )]));
+    vec![
+        RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(vec![value]))])
+            .expect("bool"),
+    ]
 }
 
 /// An empty (zero-row, zero-column) result for the set-current ops.
@@ -521,21 +539,36 @@ mod tests {
         registry.set_current_namespace("sales");
 
         // listCatalogs includes the external catalog.
-        let b = handle_catalog(&engine, &registry, &op(CatType::ListCatalogs(sc::ListCatalogs { pattern: None })))
-            .await
-            .unwrap();
+        let b = handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::ListCatalogs(sc::ListCatalogs { pattern: None })),
+        )
+        .await
+        .unwrap();
         assert!(col_strings(&b[0], 0).contains(&"prod".to_string()));
 
         // listDatabases on the current (external) catalog.
-        let b = handle_catalog(&engine, &registry, &op(CatType::ListDatabases(sc::ListDatabases { pattern: None })))
-            .await
-            .unwrap();
+        let b = handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::ListDatabases(sc::ListDatabases { pattern: None })),
+        )
+        .await
+        .unwrap();
         assert_eq!(col_strings(&b[0], 0), vec!["sales".to_string()]);
 
         // listTables → orders.
-        let b = handle_catalog(&engine, &registry, &op(CatType::ListTables(sc::ListTables { db_name: None, pattern: None })))
-            .await
-            .unwrap();
+        let b = handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::ListTables(sc::ListTables {
+                db_name: None,
+                pattern: None,
+            })),
+        )
+        .await
+        .unwrap();
         assert_eq!(col_strings(&b[0], 0), vec!["orders".to_string()]);
 
         // tableExists for a real and a missing table.
@@ -591,9 +624,13 @@ mod tests {
         use sc::catalog::CatType;
         let engine = Engine::new();
         let registry = CatalogRegistry::new();
-        let b = handle_catalog(&engine, &registry, &op(CatType::CurrentCatalog(sc::CurrentCatalog {})))
-            .await
-            .unwrap();
+        let b = handle_catalog(
+            &engine,
+            &registry,
+            &op(CatType::CurrentCatalog(sc::CurrentCatalog {})),
+        )
+        .await
+        .unwrap();
         assert_eq!(col_strings(&b[0], 0), vec!["spark_catalog".to_string()]);
 
         // Setting an unregistered catalog is an error.
@@ -612,7 +649,10 @@ mod tests {
     #[test]
     fn config_grouping_and_provider_build() {
         let mut config = HashMap::new();
-        config.insert("spark.sql.catalog.prod.type".to_string(), "hive".to_string());
+        config.insert(
+            "spark.sql.catalog.prod.type".to_string(),
+            "hive".to_string(),
+        );
         config.insert(
             "spark.sql.catalog.prod.uri".to_string(),
             "thrift://hms:9083".to_string(),

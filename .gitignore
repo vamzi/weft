@@ -31,5 +31,8 @@ node_modules/
 .vscode/
 .DS_Store
 
+# Claude Code local state + agent worktrees (never commit)
+.claude/
+
 # Session-scoped AWS runner: keypair PEM, state, sweep scripts (never commit secrets)
 scratchpad/

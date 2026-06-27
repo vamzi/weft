@@ -181,10 +181,7 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Tok>, String> {
 }
 
 /// Parse one `DataType` starting at `pos`; return `(type, next_pos)`.
-fn parse_data_type(
-    toks: &[Tok],
-    pos: usize,
-) -> std::result::Result<(DataType, usize), String> {
+fn parse_data_type(toks: &[Tok], pos: usize) -> std::result::Result<(DataType, usize), String> {
     let word = match toks.get(pos) {
         Some(Tok::Word(w)) => w.to_ascii_lowercase(),
         _ => return Err("expected a type name".to_string()),
@@ -826,8 +823,9 @@ impl ScalarUDFImpl for FromJson {
             );
         }
         let schema = schema_literal(args.scalar_arguments.get(1).copied().flatten())?;
-        let dt = parse_spark_schema(&schema)
-            .map_err(|e| DataFusionError::Plan(format!("from_json: invalid schema `{schema}`: {e}")))?;
+        let dt = parse_spark_schema(&schema).map_err(|e| {
+            DataFusionError::Plan(format!("from_json: invalid schema `{schema}`: {e}"))
+        })?;
         if let Some(opt_field) = args.arg_fields.get(2) {
             validate_options_type(opt_field)?;
         }
@@ -917,10 +915,10 @@ fn read_options(arg: &ColumnarValue, n: usize) -> Result<JsonOptions> {
         return Ok(JsonOptions::default());
     }
     let entries = map.value(0);
-    let keys = datafusion::arrow::compute::cast(entries.column(0), &DataType::Utf8)
-        .map_err(arrow_err)?;
-    let vals = datafusion::arrow::compute::cast(entries.column(1), &DataType::Utf8)
-        .map_err(arrow_err)?;
+    let keys =
+        datafusion::arrow::compute::cast(entries.column(0), &DataType::Utf8).map_err(arrow_err)?;
+    let vals =
+        datafusion::arrow::compute::cast(entries.column(1), &DataType::Utf8).map_err(arrow_err)?;
     let keys = keys.as_any().downcast_ref::<StringArray>().unwrap();
     let vals = vals.as_any().downcast_ref::<StringArray>().unwrap();
     let mut m: HashMap<String, String> = HashMap::new();
@@ -948,7 +946,11 @@ mod tests {
         // SQL keywords are valid field names.
         assert_eq!(
             parse_spark_schema("create INT").unwrap(),
-            DataType::Struct(Fields::from(vec![Field::new("create", DataType::Int32, true)]))
+            DataType::Struct(Fields::from(vec![Field::new(
+                "create",
+                DataType::Int32,
+                true
+            )]))
         );
         assert_eq!(
             parse_spark_schema("a INT, b STRING").unwrap(),
@@ -998,7 +1000,10 @@ mod tests {
 
     #[test]
     fn pattern_translation_and_narrow_text_rejected() {
-        assert_eq!(spark_pattern_to_chrono("yyyy-MM-dd").as_deref(), Some("%Y-%m-%d"));
+        assert_eq!(
+            spark_pattern_to_chrono("yyyy-MM-dd").as_deref(),
+            Some("%Y-%m-%d")
+        );
         assert_eq!(
             spark_pattern_to_chrono("dd/MM/yyyy").as_deref(),
             Some("%d/%m/%Y")

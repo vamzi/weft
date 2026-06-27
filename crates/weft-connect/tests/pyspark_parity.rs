@@ -7,7 +7,7 @@ use std::time::Duration;
 use sc::spark_connect_service_client::SparkConnectServiceClient;
 use tonic::transport::Channel;
 use weft_connect::{serve, ServerConfig};
-use weft_loom::arrow::array::Int64Array;
+use weft_loom::arrow::array::{Int32Array, Int64Array};
 use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_proto::spark::connect as sc;
 
@@ -15,7 +15,11 @@ const SESSION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
 async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port, ..Default::default() }).await;
+        let _ = serve(ServerConfig {
+            port,
+            ..Default::default()
+        })
+        .await;
     });
     let endpoint = format!("http://127.0.0.1:{port}");
     for _ in 0..50 {
@@ -115,6 +119,13 @@ fn first_i64(resps: &[sc::execute_plan_response::ResponseType]) -> Option<i64> {
                 if let Some(c) = rb.column(0).as_any().downcast_ref::<Int64Array>() {
                     if !c.is_empty() {
                         return Some(c.value(0));
+                    }
+                } else if let Some(c) = rb.column(0).as_any().downcast_ref::<Int32Array>() {
+                    // `SELECT 7` / `SELECT 42` are Spark `IntegerType` (Int32) — weft types integer
+                    // literals as Int32 to match Spark (real PySpark `SELECT 1` → IntegerType), so
+                    // widen here to keep this i64 helper working for both widths.
+                    if !c.is_empty() {
+                        return Some(c.value(0) as i64);
                     }
                 }
             }
@@ -283,9 +294,11 @@ async fn analyze_schema_returns_spark_types() {
     };
     assert_eq!(st.fields.len(), 2);
     assert_eq!(st.fields[0].name, "a");
+    // `SELECT 1` is Spark `IntegerType` (Int32) — weft types integer literals as Int32 to match
+    // Spark (real PySpark `SELECT 1 AS a` → IntegerType), not DataFusion's native Int64/Long.
     assert!(matches!(
         st.fields[0].data_type.as_ref().unwrap().kind,
-        Some(sc::data_type::Kind::Long(_))
+        Some(sc::data_type::Kind::Integer(_))
     ));
     assert_eq!(st.fields[1].name, "b");
     assert!(matches!(
@@ -385,8 +398,13 @@ async fn analyze_tree_string_formats_schema() {
         panic!("expected TreeString result")
     };
     assert!(t.tree_string.starts_with("root\n"), "{}", t.tree_string);
-    // `SELECT 1` is an i64 in DataFusion → Spark `long`.
-    assert!(t.tree_string.contains("|-- a: long"), "{}", t.tree_string);
+    // `SELECT 1` is Spark `IntegerType` (Int32) — weft types integer literals as Int32 to match
+    // Spark (real PySpark `SELECT 1` → IntegerType / "integer"), not DataFusion's native i64/long.
+    assert!(
+        t.tree_string.contains("|-- a: integer"),
+        "{}",
+        t.tree_string
+    );
     assert!(t.tree_string.contains("|-- b: string"), "{}", t.tree_string);
 }
 

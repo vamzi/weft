@@ -81,7 +81,8 @@ fn gen_orders(dir: &str, delta: bool) {
 }
 
 async fn query(table: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let uri = std::env::var("WEFT_HMS_URI").unwrap_or_else(|_| "thrift://localhost:9083".to_string());
+    let uri =
+        std::env::var("WEFT_HMS_URI").unwrap_or_else(|_| "thrift://localhost:9083".to_string());
     println!("== connecting to Hive Metastore at {uri} (table=sales.{table}) ==");
     let catalog = HiveCatalog::from_uri("hive", &uri)?;
 
@@ -98,7 +99,9 @@ async fn query(table: &str) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let exists = catalog.table_exists(&["sales".to_string()], table).await?;
-    let ghost = catalog.table_exists(&["sales".to_string()], "ghost").await?;
+    let ghost = catalog
+        .table_exists(&["sales".to_string()], "ghost")
+        .await?;
     println!("tableExists {table}={exists} ghost={ghost}");
 
     // Register the catalog and run a query that was NEVER pre-registered — it resolves lazily.

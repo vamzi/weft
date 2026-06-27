@@ -17,7 +17,11 @@ const SESSION: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
 async fn boot(port: u16) -> SparkConnectServiceClient<Channel> {
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port, ..Default::default() }).await;
+        let _ = serve(ServerConfig {
+            port,
+            ..Default::default()
+        })
+        .await;
     });
     let endpoint = format!("http://127.0.0.1:{port}");
     for _ in 0..50 {
