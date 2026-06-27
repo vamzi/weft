@@ -258,6 +258,24 @@ fn render_scalar_fn(sf: &ScalarFunction, agg: &AggMap) -> String {
     if sf.func.name() == "from_json" && !sf.args.is_empty() {
         return format!("from_json({})", render(&sf.args[0], agg));
     }
+    // Spark prints `regexp_like`/`regexp`/`rlike` (the `RLike` expression) with the UPPERCASE
+    // `REGEXP_LIKE` prettyName: `REGEXP_LIKE(1a 2b 14m, \d+b)`.
+    if matches!(sf.func.name(), "regexp_like" | "regexp" | "rlike") && sf.args.len() == 2 {
+        return format!(
+            "REGEXP_LIKE({}, {})",
+            render(&sf.args[0], agg),
+            render(&sf.args[1], agg)
+        );
+    }
+    // Spark's `RegExpInStr.prettyName` carries the optional `idx` argument (default `0`) in the
+    // name even when the call omits it: `regexp_instr(abc, b)` → column `regexp_instr(abc, b, 0)`.
+    if sf.func.name() == "regexp_instr" && sf.args.len() == 2 {
+        return format!(
+            "regexp_instr({}, {}, 0)",
+            render(&sf.args[0], agg),
+            render(&sf.args[1], agg)
+        );
+    }
     // Spark's cast-alias constructors (`int(x)`, `double(x)`, `decimal(x)`, …) name their column
     // after the *child*, exactly like an explicit `CAST(x AS T)` (Spark omits the cast from the
     // name): `SELECT int(1)` → column `1`. weft lowers these to a `Cast` for execution, but the
