@@ -1,0 +1,77 @@
+name: release
+
+# One-click semver release: bumps Cargo.toml workspace version, commits, tags,
+# and pushes — which triggers weft-image.yml to publish the versioned Docker
+# manifest (vamzi/weft:X.Y.Z, X.Y, X, latest).
+#
+# Usage: Actions → release → Run workflow → choose patch / minor / major
+#
+# The version bump commit carries [skip ci] so only the tag event (not the
+# branch push) fires the expensive image build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version component to increment"
+        required: true
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GITHUB_TOKEN with contents:write can push to main on public repos.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump workspace version
+        id: ver
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) NEW="$((MAJOR+1)).0.0" ;;
+            minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+            patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+          esac
+          sed -i "s/^version = \"${CURRENT}\"/version = \"${NEW}\"/" Cargo.toml
+          echo "old=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "version=${NEW}"  >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEW}"     >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, push
+        run: |
+          git add Cargo.toml
+          git commit -m "chore: release ${{ steps.ver.outputs.tag }} [skip ci]"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin main --follow-tags
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Released \`${{ steps.ver.outputs.tag }}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Previous version | \`${{ steps.ver.outputs.old }}\` |"
+            echo "| New version | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| Git tag | \`${{ steps.ver.outputs.tag }}\` |"
+            echo ""
+            echo "The **weft-image** workflow will now publish:"
+            echo "- \`vamzi/weft:${{ steps.ver.outputs.version }}\`"
+            echo "- \`vamzi/weft:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1,2)\`"
+            echo "- \`vamzi/weft:$(echo ${{ steps.ver.outputs.version }} | cut -d. -f1)\`"
+            echo "- \`vamzi/weft:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
