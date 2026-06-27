@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int32Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, Result};
 use datafusion::logical_expr::{
@@ -81,6 +81,18 @@ impl Op {
         }
     }
 
+    /// Apply to two `i32` operands, returning `None` on overflow — Spark's `int` `try_*` (a 32-bit
+    /// overflow yields NULL, not a widened `bigint`).
+    fn apply_i32(self, a: i32, b: i32) -> Option<i32> {
+        match self {
+            Op::Add => a.checked_add(b),
+            Op::Subtract => a.checked_sub(b),
+            Op::Multiply => a.checked_mul(b),
+            Op::Divide => None,
+            Op::Mod => a.checked_rem(b),
+        }
+    }
+
     /// Apply to two `f64` operands, returning `None` where Spark yields `NULL`
     /// (division / modulo by zero).
     fn apply_f64(self, a: f64, b: f64) -> Option<f64> {
@@ -110,6 +122,16 @@ impl TryBinary {
         }
     }
 
+    /// Whether both operands are exactly `Int32` (Spark `int`) for an integral op. Then we compute
+    /// in 32-bit checked arithmetic and type the result `int` — matching Spark, where `int OP int`
+    /// stays `int` and a 32-bit overflow yields NULL. (weft's `spark_int_literals` retypes in-range
+    /// integer literals to `Int32`, so `try_add(1, 1)` reaches this UDF as `Int32, Int32`.)
+    fn both_i32(&self, arg_types: &[DataType]) -> bool {
+        !self.op.forces_float()
+            && arg_types.len() == 2
+            && arg_types.iter().all(|t| matches!(t, DataType::Int32))
+    }
+
     /// Whether both operands stay integral for this op (only then do we produce `Int64`).
     fn integral(&self, arg_types: &[DataType]) -> bool {
         !self.op.forces_float()
@@ -137,7 +159,9 @@ impl ScalarUDFImpl for TryBinary {
         &self.signature
     }
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(if self.integral(arg_types) {
+        Ok(if self.both_i32(arg_types) {
+            DataType::Int32
+        } else if self.integral(arg_types) {
             DataType::Int64
         } else {
             DataType::Float64
@@ -156,7 +180,20 @@ impl ScalarUDFImpl for TryBinary {
         let lhs = args.args[0].clone().into_array(n)?;
         let rhs = args.args[1].clone().into_array(n)?;
 
-        if self.integral(&arg_types) {
+        if self.both_i32(&arg_types) {
+            let a = cast_i32(&lhs)?;
+            let b = cast_i32(&rhs)?;
+            let out: Int32Array = (0..n)
+                .map(|i| {
+                    if a.is_null(i) || b.is_null(i) {
+                        None
+                    } else {
+                        self.op.apply_i32(a.value(i), b.value(i))
+                    }
+                })
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(out)))
+        } else if self.integral(&arg_types) {
             let a = cast_i64(&lhs)?;
             let b = cast_i64(&rhs)?;
             let out: Int64Array = (0..n)
@@ -344,6 +381,15 @@ fn cast_i64(arr: &ArrayRef) -> Result<Int64Array> {
         .clone())
 }
 
+/// Cast any Arrow array to `Int32`, preserving nulls; invalid input errors (see [`cast_strict`]).
+fn cast_i32(arr: &ArrayRef) -> Result<Int32Array> {
+    Ok(cast_strict(arr, &DataType::Int32)?
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("cast to Int32 yields Int32Array")
+        .clone())
+}
+
 /// Cast any Arrow array to `Float64`, preserving nulls; invalid input errors (see [`cast_strict`]).
 fn cast_f64(arr: &ArrayRef) -> Result<Float64Array> {
     Ok(cast_strict(arr, &DataType::Float64)?
@@ -393,6 +439,16 @@ mod tests {
                 .await,
             "NULL"
         );
+    }
+
+    #[tokio::test]
+    async fn try_int32_overflow_is_null_and_keeps_int() {
+        // int OP int stays `int`: a 32-bit overflow yields NULL (Spark), not a widened bigint.
+        assert_eq!(cell("SELECT try_add(2147483647, 1) AS x").await, "NULL");
+        assert_eq!(cell("SELECT try_subtract(-2147483648, 1) AS x").await, "NULL");
+        assert_eq!(cell("SELECT try_multiply(2147483647, 2) AS x").await, "NULL");
+        // In-range int arithmetic stays exact.
+        assert_eq!(cell("SELECT try_add(1, 1) AS x").await, "2");
     }
 
     #[tokio::test]
