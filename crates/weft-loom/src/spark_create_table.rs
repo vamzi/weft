@@ -149,7 +149,8 @@ impl<'a> Tok<'a> {
             // Block comment.
             if self.i + 1 < n && b[self.i] == b'/' && b[self.i + 1] == b'*' {
                 self.i += 2;
-                while self.i < n && !(b[self.i] == b'*' && self.i + 1 < n && b[self.i + 1] == b'/') {
+                while self.i < n && !(b[self.i] == b'*' && self.i + 1 < n && b[self.i + 1] == b'/')
+                {
                     self.i += 1;
                 }
                 self.i = (self.i + 2).min(n);
@@ -344,7 +345,11 @@ mod tests {
             "ddl was: {}",
             l.ddl
         );
-        assert!(l.ddl.contains("LOCATION '/tmp/wh/t1/'"), "ddl was: {}", l.ddl);
+        assert!(
+            l.ddl.contains("LOCATION '/tmp/wh/t1/'"),
+            "ddl was: {}",
+            l.ddl
+        );
         assert_eq!(l.table_dir, w.join("t1"));
     }
 
@@ -356,7 +361,13 @@ mod tests {
             w,
         )
         .expect("should lower");
-        assert!(l.ddl.contains("IF NOT EXISTS decimals_test (id int, a decimal(38,18), b decimal(38,18))"), "ddl: {}", l.ddl);
+        assert!(
+            l.ddl.contains(
+                "IF NOT EXISTS decimals_test (id int, a decimal(38,18), b decimal(38,18))"
+            ),
+            "ddl: {}",
+            l.ddl
+        );
         assert!(l.ddl.contains("STORED AS PARQUET"));
     }
 
@@ -368,7 +379,9 @@ mod tests {
             w,
         )
         .expect("should lower");
-        assert!(l.ddl.starts_with("CREATE EXTERNAL TABLE t (a int) STORED AS CSV"));
+        assert!(l
+            .ddl
+            .starts_with("CREATE EXTERNAL TABLE t (a int) STORED AS CSV"));
         assert!(!l.ddl.contains("COMMENT"));
         assert!(!l.ddl.contains("TBLPROPERTIES"));
     }
@@ -376,10 +389,12 @@ mod tests {
     #[test]
     fn case_insensitive_format() {
         let w = Path::new("/tmp/wh");
-        assert!(lower_create_table_using("create table t(a int) using JSON", w)
-            .unwrap()
-            .ddl
-            .contains("STORED AS JSON"));
+        assert!(
+            lower_create_table_using("create table t(a int) using JSON", w)
+                .unwrap()
+                .ddl
+                .contains("STORED AS JSON")
+        );
     }
 
     #[test]
@@ -389,9 +404,7 @@ mod tests {
         assert!(lower_create_table_using("CREATE TABLE t(a INT)", w).is_none());
         assert!(lower_create_table_using("select 1", w).is_none());
         // CTAS deferred this iteration.
-        assert!(
-            lower_create_table_using("create table t using parquet as select 1", w).is_none()
-        );
+        assert!(lower_create_table_using("create table t using parquet as select 1", w).is_none());
         assert!(
             lower_create_table_using("create table t(a int) using parquet as select 1", w)
                 .is_none()
@@ -408,11 +421,10 @@ mod tests {
             w
         )
         .is_none());
-        assert!(lower_create_table_using(
-            "create table t(a int) using parquet location '/x'",
-            w
-        )
-        .is_none());
+        assert!(
+            lower_create_table_using("create table t(a int) using parquet location '/x'", w)
+                .is_none()
+        );
         // IDENTIFIER(...) function-form name deferred.
         assert!(
             lower_create_table_using("CREATE TABLE IDENTIFIER('tab')(c1 INT) USING CSV", w)
@@ -428,9 +440,11 @@ mod tests {
         let l = lower_create_table_using("CREATE TABLE s.tab(c1 INT) USING CSV", w).unwrap();
         assert!(l.ddl.contains("CREATE EXTERNAL TABLE s.tab (c1 INT)"));
         assert_eq!(l.table_dir, w.join("s_tab"));
-        let l2 = lower_create_table_using("CREATE TABLE `weird name`(c1 INT) USING parquet", w)
-            .unwrap();
-        assert!(l2.ddl.contains("CREATE EXTERNAL TABLE `weird name` (c1 INT)"));
+        let l2 =
+            lower_create_table_using("CREATE TABLE `weird name`(c1 INT) USING parquet", w).unwrap();
+        assert!(l2
+            .ddl
+            .contains("CREATE EXTERNAL TABLE `weird name` (c1 INT)"));
     }
 
     #[test]

@@ -445,8 +445,14 @@ mod tests {
     async fn try_int32_overflow_is_null_and_keeps_int() {
         // int OP int stays `int`: a 32-bit overflow yields NULL (Spark), not a widened bigint.
         assert_eq!(cell("SELECT try_add(2147483647, 1) AS x").await, "NULL");
-        assert_eq!(cell("SELECT try_subtract(-2147483648, 1) AS x").await, "NULL");
-        assert_eq!(cell("SELECT try_multiply(2147483647, 2) AS x").await, "NULL");
+        assert_eq!(
+            cell("SELECT try_subtract(-2147483648, 1) AS x").await,
+            "NULL"
+        );
+        assert_eq!(
+            cell("SELECT try_multiply(2147483647, 2) AS x").await,
+            "NULL"
+        );
         // In-range int arithmetic stays exact.
         assert_eq!(cell("SELECT try_add(1, 1) AS x").await, "2");
     }

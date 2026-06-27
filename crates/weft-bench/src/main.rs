@@ -291,7 +291,11 @@ async fn run_clickbench(rows: usize) {
 async fn run_clickbench_grpc(rows: usize, data: Option<String>) {
     // Boot the real Spark Connect server in-process.
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port: GRPC_PORT, ..Default::default() }).await;
+        let _ = serve(ServerConfig {
+            port: GRPC_PORT,
+            ..Default::default()
+        })
+        .await;
     });
     let endpoint = format!("http://127.0.0.1:{GRPC_PORT}");
     let mut client = connect_retry(&endpoint).await;
@@ -551,7 +555,11 @@ async fn run_correctness(rows: usize) {
     write_parquet(&parquet, &batch);
     let parquet_abs = parquet.canonicalize().expect("canonicalize");
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port: GRPC_PORT, ..Default::default() }).await;
+        let _ = serve(ServerConfig {
+            port: GRPC_PORT,
+            ..Default::default()
+        })
+        .await;
     });
     let mut client = connect_retry(&format!("http://127.0.0.1:{GRPC_PORT}")).await;
     exec_sql_grpc_batches(

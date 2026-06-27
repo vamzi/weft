@@ -78,7 +78,13 @@ impl ClusterBackend for K8sBackend {
         let list: Value = json!({ "apiVersion": "v1", "kind": "List", "items": items });
         let body = serde_json::to_vec(&list).map_err(|e| format!("serialize manifests: {e}"))?;
         self.run(
-            &["apply", "--server-side", "--field-manager=weft-gateway", "-f", "-"],
+            &[
+                "apply",
+                "--server-side",
+                "--field-manager=weft-gateway",
+                "-f",
+                "-",
+            ],
             Some(&body),
         )
         .await

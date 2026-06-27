@@ -103,7 +103,14 @@ pub async fn ddb_put(table: String, pk: String, body: String) {
     }
     let file_arg = format!("file://{}", path.display());
     let res = aws(
-        &["dynamodb", "put-item", "--table-name", &table, "--item", &file_arg],
+        &[
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            &table,
+            "--item",
+            &file_arg,
+        ],
         None,
     )
     .await;

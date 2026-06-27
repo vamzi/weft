@@ -21,14 +21,12 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int32Array, ListArray, MapArray,
-};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, ListArray, MapArray};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::{cast, concat, SortOptions};
-use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::{exec_err, DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -86,9 +84,7 @@ impl ScalarUDFImpl for ArraySize {
                     .collect()
             }
             other => {
-                return exec_err!(
-                    "array_size: argument 1 requires the ARRAY type, got {other:?}"
-                )
+                return exec_err!("array_size: argument 1 requires the ARRAY type, got {other:?}")
             }
         };
         Ok(ColumnarValue::Array(Arc::new(out)))
@@ -157,7 +153,10 @@ impl ScalarUDFImpl for SortArray {
             // Spark requires a foldable (constant) order flag; we read row 0. If it is NULL,
             // the entire result is NULL.
             if flag.is_null(0) {
-                return Ok(ColumnarValue::Array(arrow_null_list(&in_dt, args.number_rows)?));
+                return Ok(ColumnarValue::Array(arrow_null_list(
+                    &in_dt,
+                    args.number_rows,
+                )?));
             }
             ascending = flag.value(0);
         }
@@ -291,9 +290,8 @@ impl ScalarUDFImpl for MapContainsKey {
         // `DATATYPE_MISMATCH` rather than implicitly coercing across the string/numeric boundary,
         // even though DataFusion's `comparison_coercion` would happily pick a common type. Reject
         // that cross-family case up front so we match Spark instead of silently answering.
-        let is_str = |t: &DataType| {
-            matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
-        };
+        let is_str =
+            |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
         let cross_family = (is_str(key_type) && probe_type.is_numeric())
             || (is_str(probe_type) && key_type.is_numeric());
         let common = comparison_coercion(key_type, probe_type)
@@ -368,9 +366,9 @@ impl ScalarUDFImpl for TryElementAt {
                 DataType::Struct(fields) if fields.len() == 2 => Ok(fields[1].data_type().clone()),
                 other => exec_err!("try_element_at: malformed map entries type {other:?}"),
             },
-            other => exec_err!(
-                "try_element_at: first argument must be an array or a map, got {other:?}"
-            ),
+            other => {
+                exec_err!("try_element_at: first argument must be an array or a map, got {other:?}")
+            }
         }
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -380,8 +378,8 @@ impl ScalarUDFImpl for TryElementAt {
             DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
                 let list = datafusion::arrow::array::cast::as_list_array(&container);
                 // Index must be an integer; cast to Int64 for uniform handling.
-                let idx = datafusion::arrow::compute::cast(&idx, &DataType::Int64)
-                    .map_err(arrow_err)?;
+                let idx =
+                    datafusion::arrow::compute::cast(&idx, &DataType::Int64).map_err(arrow_err)?;
                 let idx = datafusion::common::cast::as_int64_array(&idx)?;
                 let value_type = list.value_type();
                 let mut picked: Vec<Option<ArrayRef>> = Vec::with_capacity(args.number_rows);
@@ -424,9 +422,9 @@ impl ScalarUDFImpl for TryElementAt {
                 let out = concat_or_null(&picked, &value_type)?;
                 Ok(ColumnarValue::Array(out))
             }
-            other => exec_err!(
-                "try_element_at: first argument must be an array or a map, got {other:?}"
-            ),
+            other => {
+                exec_err!("try_element_at: first argument must be an array or a map, got {other:?}")
+            }
         }
     }
 }
@@ -479,8 +477,12 @@ mod tests {
     #[tokio::test]
     async fn array_size_matches_spark() {
         assert!(run("SELECT array_size(array()) AS a").await.contains("| 0"));
-        assert!(run("SELECT array_size(array(true)) AS a").await.contains("| 1"));
-        assert!(run("SELECT array_size(array(2, 1)) AS a").await.contains("| 2"));
+        assert!(run("SELECT array_size(array(true)) AS a")
+            .await
+            .contains("| 1"));
+        assert!(run("SELECT array_size(array(2, 1)) AS a")
+            .await
+            .contains("| 2"));
         // NULL input -> NULL output (rendered as an empty cell).
         assert!(run("SELECT array_size(NULL) AS a").await.contains("|   |"));
         // map argument is a type error.
@@ -520,8 +522,7 @@ mod tests {
         let desc = run("SELECT sort_array(array(2, CAST(NULL AS INT), 1), false) AS a").await;
         assert!(desc.contains("[2, 1, ]"), "desc null-last: {desc}");
         // A NULL boolean order flag => NULL result.
-        let nullflag =
-            run("SELECT sort_array(array('b', 'd'), CAST(NULL AS BOOLEAN)) AS a").await;
+        let nullflag = run("SELECT sort_array(array('b', 'd'), CAST(NULL AS BOOLEAN)) AS a").await;
         assert!(nullflag.contains("|   |"), "null flag => null: {nullflag}");
     }
 
@@ -534,12 +535,16 @@ mod tests {
             .await
             .contains("true"));
         // Spark coerces probe and keys to a common comparison type: int key vs double probe.
-        assert!(run("SELECT map_contains_key(map(1, 'a', 2, 'b'), 1.0) AS a")
-            .await
-            .contains("true"));
-        assert!(run("SELECT map_contains_key(map(1.0, 'a', 2, 'b'), 1) AS a")
-            .await
-            .contains("true"));
+        assert!(
+            run("SELECT map_contains_key(map(1, 'a', 2, 'b'), 1.0) AS a")
+                .await
+                .contains("true")
+        );
+        assert!(
+            run("SELECT map_contains_key(map(1.0, 'a', 2, 'b'), 1) AS a")
+                .await
+                .contains("true")
+        );
         // No common comparison type (string keys vs int probe) -> analysis error, like Spark.
         let engine = Engine::new();
         assert!(engine

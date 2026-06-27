@@ -56,8 +56,18 @@ use datafusion::prelude::SessionContext;
 /// The Spark cast-alias constructor names (used by [`crate::spark_names`] to render their column
 /// names as the child's, like an explicit `CAST`). Kept in sync with [`register`].
 pub(crate) const CAST_ALIAS_NAMES: &[&str] = &[
-    "boolean", "tinyint", "smallint", "int", "bigint", "float", "double", "string", "binary",
-    "date", "timestamp", "decimal",
+    "boolean",
+    "tinyint",
+    "smallint",
+    "int",
+    "bigint",
+    "float",
+    "double",
+    "string",
+    "binary",
+    "date",
+    "timestamp",
+    "decimal",
 ];
 
 /// Register the cast-alias constructors and `positive` into `ctx`.
@@ -142,7 +152,10 @@ impl ScalarUDFImpl for CastAlias {
         let Some(arg) = args.pop() else {
             return Ok(ExprSimplifyResult::Original(args));
         };
-        Ok(ExprSimplifyResult::Simplified(cast(arg, self.target.clone())))
+        Ok(ExprSimplifyResult::Simplified(cast(
+            arg,
+            self.target.clone(),
+        )))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         // Fallback only (the `simplify` lowering is the real path); evaluate the cast with the same
@@ -358,7 +371,11 @@ mod tests {
             ("decimal(1)", "decimal(10,0)", "1"),
         ] {
             assert_eq!(typ(expr).await, ty, "type of {expr}");
-            assert_eq!(cell(&format!("SELECT {expr} AS x")).await, val, "value of {expr}");
+            assert_eq!(
+                cell(&format!("SELECT {expr} AS x")).await,
+                val,
+                "value of {expr}"
+            );
         }
     }
 
@@ -391,7 +408,10 @@ mod tests {
         // weft's literal typing, which is a separate (pre-existing) concern.
         assert_eq!(typ("positive(1)").await, "int");
         assert_eq!(cell("SELECT positive(1) AS x").await, "1");
-        assert_eq!(typ("positive(cast(-1.11 as decimal(3,2)))").await, "decimal(3,2)");
+        assert_eq!(
+            typ("positive(cast(-1.11 as decimal(3,2)))").await,
+            "decimal(3,2)"
+        );
         assert_eq!(cell("SELECT positive(-1.11) AS x").await, "-1.11");
         // String input coerces to double (Spark).
         assert_eq!(typ("positive('-1.11')").await, "double");
@@ -408,10 +428,18 @@ mod tests {
     async fn boolean_string_matches_spark() {
         // Accepted true/false spellings (trimmed, case-insensitive).
         for s in ["t", "true", "y", "yes", "1", "TRUE", "  Yes  "] {
-            assert_eq!(cell(&format!("SELECT boolean('{s}') AS x")).await, "true", "{s}");
+            assert_eq!(
+                cell(&format!("SELECT boolean('{s}') AS x")).await,
+                "true",
+                "{s}"
+            );
         }
         for s in ["f", "false", "n", "no", "0", "False", "   f   "] {
-            assert_eq!(cell(&format!("SELECT boolean('{s}') AS x")).await, "false", "{s}");
+            assert_eq!(
+                cell(&format!("SELECT boolean('{s}') AS x")).await,
+                "false",
+                "{s}"
+            );
         }
         // Spark rejects these (DataFusion's cast would wrongly accept on/off or return NULL).
         let engine = Engine::new();
