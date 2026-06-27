@@ -32,6 +32,9 @@ mod spark_datetime;
 // `pub(crate)` (unlike the other internal submodules): `SparkDividePlanner` in `lib.rs` embeds the
 // `spark_divide` UDF directly via `spark_divide::udf()` when lowering a literal-zero integral `/`.
 pub(crate) mod spark_divide;
+// `pub(crate)` (like `spark_divide`): `SparkDividePlanner` in `lib.rs` embeds the
+// `spark_nonzero_divisor` guard UDF directly via `spark_nonzero_divisor::udf()` when lowering a
+// decimal `/` or `%` so a zero decimal divisor raises Spark's ANSI DIVIDE_BY_ZERO.
 mod spark_datetime2;
 mod spark_datetime3;
 mod spark_encoding;
@@ -40,6 +43,7 @@ mod spark_if;
 mod spark_json;
 mod spark_math;
 mod spark_misc;
+pub(crate) mod spark_nonzero_divisor;
 mod spark_regex_misc;
 mod spark_strings;
 mod try_arithmetic;
@@ -60,6 +64,7 @@ pub fn register(ctx: &SessionContext) {
     spark_from_json::register(ctx);
     spark_if::register(ctx);
     spark_divide::register(ctx);
+    spark_nonzero_divisor::register(ctx);
     spark_checked_mul::register(ctx);
     spark_math::register(ctx);
     spark_misc::register(ctx);
