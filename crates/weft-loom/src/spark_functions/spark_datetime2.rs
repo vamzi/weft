@@ -212,12 +212,43 @@ fn emit_field(
     count: usize,
     out: &mut String,
 ) -> std::result::Result<(), String> {
+    // Spark v4.0.0 (default timeParserPolicy) rejects over-length pattern fields for the
+    // supported formatting letters, raising
+    // INCONSISTENT_BEHAVIOR_CROSS_VERSION.DATETIME_PATTERN_RECOGNITION. Each cap below is the
+    // largest run-length Spark accepts for that letter (taken byte-for-byte from the committed
+    // VALID datetime-formatting golden); anything longer is a pattern Spark also rejects, so
+    // erroring here cannot regress a currently-correct row. The bare 'u' letter (and any other
+    // letter not listed) falls through to the existing error branches.
+    let max_count = match letter {
+        'G' => 4,
+        'y' => 6,
+        'M' => 4,
+        'L' => 4,
+        'E' => 4,
+        'd' => 2,
+        'D' => 3,
+        'H' => 2,
+        'h' => 2,
+        'k' => 2,
+        'K' => 2,
+        'm' => 2,
+        's' => 2,
+        'S' => 9,
+        'a' => 1,
+        _ => usize::MAX,
+    };
+    if count > max_count {
+        return Err(format!(
+            "date_format: pattern field '{letter}' repeated {count} times exceeds Spark's \
+             accepted maximum of {max_count} (DATETIME_PATTERN_RECOGNITION)"
+        ));
+    }
     match letter {
         // Era.
         'G' => out.push_str(if c.year > 0 { "AD" } else { "BC" }),
         // Year. `yy` => last two digits zero-padded; otherwise zero-pad to `count`.
-        'y' | 'u' => {
-            let y = if letter == 'y' { c.year.abs() } else { c.year };
+        'y' => {
+            let y = c.year.abs();
             if count == 2 {
                 out.push_str(&format!("{:02}", (y.unsigned_abs() % 100)));
             } else {

@@ -1,27 +1,27 @@
 {
   "blocks_total": 12641,
   "buckets": {
-    "correctness": 277,
+    "correctness": 252,
     "datetime": 13,
-    "decimal-precision": 189,
+    "decimal-precision": 173,
     "engine-panic": 3,
-    "error-parity": 2409,
+    "error-parity": 2432,
     "exec-error": 1093,
     "feature-unsupported": 482,
     "function-missing": 695,
-    "missing-error": 163,
+    "missing-error": 140,
     "missing-relation": 900,
     "nondeterministic": 4,
     "null-semantics": 69,
-    "ordering": 48,
+    "ordering": 17,
     "parser-unsupported": 1239,
-    "pass": 2952,
+    "pass": 2990,
     "requires-udf-registration": 87,
-    "schema-only": 2018
+    "schema-only": 2052
   },
   "files_skipped": 63,
   "files_total": 303,
-  "semantic_pass": 7427,
+  "semantic_pass": 7491,
   "spark_version": "v4.0.0",
-  "strict_pass": 2951
+  "strict_pass": 2989
 }

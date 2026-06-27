@@ -267,11 +267,24 @@ fn looks_like_unimplemented(msg: &str) -> bool {
 }
 
 fn looks_decimalish(s: &str) -> bool {
-    s.split(['\t', '\n']).any(|c| {
-        c.contains('.')
-            && c.chars()
-                .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '-')
-    })
+    s.split(['\t', '\n']).any(is_decimalish_cell)
+}
+
+/// Whether a single output cell reads as a (possibly scientific-notation) decimal number. A cell
+/// "looks decimalish" if it carries a fractional point or an exponent marker and is otherwise made
+/// only of the characters a decimal/scientific number uses. This recognizes BOTH plain decimals
+/// (`1004.3`) and Java/Spark scientific notation (`1.2345678901234E200`, `9.223372036854776E18`),
+/// so a numeric value-precision difference is attributed to `decimal-precision` regardless of which
+/// notation the formatter picked — the bucket no longer flips to `correctness` purely because a
+/// double crossed Java's `1e7`/`1e-3` threshold into `E`-notation. Dates (`2024-01-01`) and
+/// timestamps (which carry `:`/space) are excluded since they contain characters outside the set,
+/// and a sign-only or all-symbol token is excluded by requiring at least one digit.
+fn is_decimalish_cell(c: &str) -> bool {
+    let has_marker = c.contains('.') || c.contains('e') || c.contains('E');
+    has_marker
+        && c.chars().any(|ch| ch.is_ascii_digit())
+        && c.chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+' | 'e' | 'E'))
 }
 
 fn looks_datetimeish(s: &str) -> bool {

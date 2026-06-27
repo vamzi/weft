@@ -143,7 +143,7 @@ fn fmt_cell(array: &dyn Array, row: usize, nested: bool) -> String {
                 .downcast_ref::<Float32Array>()
                 .unwrap()
                 .value(row);
-            fmt_f64(v as f64)
+            fmt_f32(v)
         }
         DataType::Float64 => {
             let v = array
@@ -388,9 +388,18 @@ fn leaf(array: &dyn Array, row: usize) -> String {
     }
 }
 
-/// Java `Double.toString`-style rendering: finite integral values keep a trailing `.0`,
-/// non-finite values use Java's spellings. Rust's `{}` already does shortest round-trip,
-/// so for non-integral finite values it matches Spark in the common case.
+/// Java `Double.toString`-style rendering — the exact spelling Spark's `Double` columns use.
+///
+/// Spark prints a `double` via Java's `Double.toString`, whose rules differ from Rust's `{}` in two
+/// load-bearing ways: (1) Java switches to "computerized scientific notation" (`d.dddEexp`, capital
+/// `E`, no `+`, no leading zero on the exponent) once `|x| >= 1e7` or `|x| < 1e-3`, where Rust's
+/// `{}` always prints plain decimal (`9223372036854776000` instead of `9.223372036854776E18`);
+/// (2) Java always keeps at least one fraction digit (`1.0`, `1.0E7`).
+///
+/// We reproduce Java exactly. The *digits* come from Rust's `{:e}`, which — like Java's
+/// `FloatingDecimal` — emits the unique shortest decimal string that round-trips back to the same
+/// `f64`, so the digit sequence is identical to Java's; only the *placement* of the decimal point /
+/// exponent differs, and that we port by hand below.
 fn fmt_f64(v: f64) -> String {
     if v.is_nan() {
         return "NaN".into();
@@ -402,12 +411,94 @@ fn fmt_f64(v: f64) -> String {
             "-Infinity".into()
         };
     }
-    let s = format!("{v}");
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{s}.0")
+    if v == 0.0 {
+        // Preserve Java's signed zero (`Double.toString(-0.0)` is `"-0.0"`).
+        return if v.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
     }
+    // `{:e}` yields the shortest round-tripping form `d[.ddd]e<exp>` (e.g. `9.223372036854776e18`).
+    java_float_string(v < 0.0, &format!("{:e}", v.abs()))
+}
+
+/// Java `Float.toString`-style rendering — the exact spelling Spark's `Float` columns use.
+///
+/// A Spark `float` column is printed via Java's `Float.toString`, which uses the *float* (not
+/// double) shortest round-trip digits and the same notation thresholds as `Double.toString`. So a
+/// `float` value carries fewer significant digits than its `double` widening: `1.2345678901234e20`
+/// stored as a `float` prints `1.2345679E20`, not the 17-digit double expansion. We therefore must
+/// format from the `f32` itself (whose `{:e}` is the float shortest round-trip), never from a
+/// widened `f64`.
+fn fmt_f32(v: f32) -> String {
+    if v.is_nan() {
+        return "NaN".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
+    }
+    java_float_string(v < 0.0, &format!("{:e}", v.abs()))
+}
+
+/// Shared Java `Float`/`Double.toString` notation, given a sign and Rust's `{:e}` form of `|x|`
+/// (`d[.ddd]e<exp>`). Both Java methods use identical notation rules — plain decimal for
+/// `1e-3 <= |x| < 1e7`, scientific (`d.dddE<exp>`) otherwise — differing only in the digit width of
+/// the shortest round-trip, which the caller's `{:e}` already encodes. `|x| != 0` here.
+fn java_float_string(neg: bool, sci: &str) -> String {
+    let (mant, exp_str) = sci.split_once('e').expect("`{:e}` always contains `e`");
+    let exp: i32 = exp_str.parse().expect("`{:e}` exponent is a valid integer");
+    // Significant digits with the point removed; the first digit is non-zero (|x| != 0).
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    // Java uses plain decimal for `1e-3 <= |x| < 1e7` (i.e. `exp` in `-3..=6`), scientific otherwise.
+    if (-3..=6).contains(&exp) {
+        if exp >= 0 {
+            let int_len = (exp + 1) as usize;
+            if int_len >= digits.len() {
+                // All significant digits are in the integer part; pad with zeros, fraction is `0`.
+                out.push_str(&digits);
+                out.extend(std::iter::repeat('0').take(int_len - digits.len()));
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            }
+        } else {
+            // `0.00…d` — `(-exp - 1)` leading zeros after the point before the first digit.
+            out.push_str("0.");
+            out.extend(std::iter::repeat('0').take((-exp - 1) as usize));
+            out.push_str(&digits);
+        }
+    } else {
+        // Scientific: `d.ddddE<exp>`, always at least one fraction digit, capital `E`, signed exp.
+        out.push_str(&digits[..1]);
+        out.push('.');
+        if digits.len() > 1 {
+            out.push_str(&digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push_str(&exp.to_string());
+    }
+    out
 }
 
 /// Map a [`TimeUnit`] to the number of sub-second digits Spark prints. (Kept for the
@@ -436,6 +527,41 @@ mod tests {
         assert_eq!(fmt_f64(f64::NAN), "NaN");
         assert_eq!(fmt_f64(f64::INFINITY), "Infinity");
         assert_eq!(fmt_f64(f64::NEG_INFINITY), "-Infinity");
+    }
+
+    /// `Double.toString` notation: plain decimal in `[1e-3, 1e7)`, scientific (`d.dddE<exp>`,
+    /// capital `E`, signed exponent, no `+`/leading zero) outside it; always >=1 fraction digit.
+    /// Goldens are the exact strings Spark prints (postgreSQL/int8.sql, float8.sql).
+    #[test]
+    fn double_to_string_matches_java_notation() {
+        // The int8 `bigint(min) / -1` rows: 9223372036854775808.0 as a double.
+        assert_eq!(fmt_f64(9223372036854775808.0), "9.223372036854776E18");
+        assert_eq!(fmt_f64(1.2345678901234e200), "1.2345678901234E200");
+        assert_eq!(fmt_f64(1.2345678901234e-200), "1.2345678901234E-200");
+        assert_eq!(fmt_f64(-34.84), "-34.84");
+        assert_eq!(fmt_f64(1004.3), "1004.3");
+        // Threshold boundaries: 1e7 switches to scientific, 9_999_999 stays decimal.
+        assert_eq!(fmt_f64(1e7), "1.0E7");
+        assert_eq!(fmt_f64(9_999_999.0), "9999999.0");
+        assert_eq!(fmt_f64(0.001), "0.001");
+        assert_eq!(fmt_f64(0.0005), "5.0E-4");
+        assert_eq!(fmt_f64(0.0), "0.0");
+        assert_eq!(fmt_f64(-0.0), "-0.0");
+        assert_eq!(fmt_f64(150.0), "150.0");
+        assert_eq!(fmt_f64(0.5), "0.5");
+    }
+
+    /// `Float.toString` uses the *float* shortest round-trip (fewer digits than the widened double):
+    /// a `float` `1.2345678901234e20` prints `1.2345679E20`, not the 17-digit double expansion.
+    #[test]
+    fn float_to_string_uses_float_precision() {
+        assert_eq!(fmt_f32(1.2345679e20_f32), "1.2345679E20");
+        assert_eq!(fmt_f32(1.2345679e-20_f32), "1.2345679E-20");
+        assert_eq!(fmt_f32(1004.3_f32), "1004.3");
+        assert_eq!(fmt_f32(-34.84_f32), "-34.84");
+        assert_eq!(fmt_f32(0.0_f32), "0.0");
+        assert_eq!(fmt_f32(1.0_f32), "1.0");
+        assert_eq!(fmt_f32(f32::INFINITY), "Infinity");
     }
 
     #[test]
