@@ -56,7 +56,8 @@ pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(UnixEpoch::new(EpochOut::Millis)));
     ctx.register_udf(ScalarUDF::from(UnixDate::new()));
     ctx.register_udf(ScalarUDF::from(DateFromUnixDate::new()));
-    ctx.register_udf(ScalarUDF::from(DateAdd::new()));
+    ctx.register_udf(ScalarUDF::from(DateAdd::new("date_add", 1)));
+    ctx.register_udf(ScalarUDF::from(DateAdd::new("date_sub", -1)));
 }
 
 fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
@@ -758,28 +759,33 @@ impl ScalarUDFImpl for DateFromUnixDate {
 // date_add (2-arg: date + numDays)
 // ---------------------------------------------------------------------------
 
-/// `date_add(startDate, numDays)` — `startDate` plus `numDays` days, returned as `date`.
-/// DataFusion-54 ships no `date_add`/`dateadd` builtin, so we provide it. The first argument is cast
-/// to `date` (string/timestamp accepted in non-ANSI mode); the day count is cast to `int`. A NULL in
-/// either argument yields NULL. (Only the 2-argument form is implemented — the 3-argument
-/// `date_add(unit, num, ts)` form has distinct unit semantics and is left unregistered rather than
-/// answered wrongly.)
+/// `date_add(startDate, numDays)` / `date_sub(startDate, numDays)` — `startDate` plus/minus
+/// `numDays` days, returned as `date`. DataFusion-54 ships no `date_add`/`date_sub`/`dateadd`
+/// builtin, so we provide them (`sign = +1` for add, `-1` for sub — `date_sub(d, n) = d - n`, and a
+/// negative `n` adds). The first argument is cast to `date` (string/timestamp accepted in non-ANSI
+/// mode); the day count is cast to `int`. A NULL in either argument yields NULL. (Only the
+/// 2-argument form is implemented — the 3-argument `date_add(unit, num, ts)` form has distinct unit
+/// semantics and is left unregistered rather than answered wrongly.)
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct DateAdd {
     signature: Signature,
+    name: &'static str,
+    sign: i32,
 }
 
 impl DateAdd {
-    fn new() -> Self {
+    fn new(name: &'static str, sign: i32) -> Self {
         Self {
             signature: Signature::any(2, Volatility::Immutable),
+            name,
+            sign,
         }
     }
 }
 
 impl ScalarUDFImpl for DateAdd {
     fn name(&self) -> &str {
-        "date_add"
+        self.name
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -789,6 +795,28 @@ impl ScalarUDFImpl for DateAdd {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
+        // Spark's `date_add`/`date_sub` accept an INT day count and implicitly coerce narrower ints
+        // and strings to it, but a `bigint`/`double`/`decimal` is a type error, NOT an implicit cast
+        // — Spark *rejects* `date_sub('2011-11-11', 1L)` and `'… 1.0'` (verified vs date.sql.out:
+        // AnalysisException), while accepting `'1'` (→ 1) and `null` (→ NULL). Reject exactly those
+        // wider-numeric types so weft doesn't silently accept a query Spark refuses. (A bare `1`
+        // reaches here as `int` — the Spark integer-literal default — so valid calls are unaffected.)
+        let day_ty = args.args[1].data_type();
+        if matches!(
+            day_ty,
+            DataType::Int64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+        ) {
+            return exec_err!(
+                "[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] the second argument of `{}` requires \
+                 the int type, however '{day_ty}' has the type that does not match",
+                self.name
+            );
+        }
         // Strict cast of the date operand: an invalid date string raises CAST_INVALID_INPUT in Spark
         // (not NULL), so surface a cast failure as an error.
         let date_in = args.args[0].clone().into_array(n)?;
@@ -816,7 +844,7 @@ impl ScalarUDFImpl for DateAdd {
             if dates.is_null(i) || days.is_null(i) {
                 out.append_null();
             } else {
-                out.append_value(dates.value(i) + days.value(i));
+                out.append_value(dates.value(i) + self.sign * days.value(i));
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
