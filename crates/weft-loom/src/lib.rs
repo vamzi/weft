@@ -14,8 +14,9 @@
 //! The strategy: tie Sail on the ~33 cheap queries (DataFusion parity), beat it 1.5–2× on
 //! the ~10 expensive ones. Winning those *is* winning the total.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::prelude::SessionContext;
 use weft_common::{Error, Result};
@@ -476,8 +477,7 @@ fn rewrite_spark_typed_literals(sql: &str) -> Option<String> {
                 }
             }
             let num = &sql[num_start..i];
-            let after_ok =
-                |k: usize| k >= n || !(b[k].is_ascii_alphanumeric() || b[k] == b'_');
+            let after_ok = |k: usize| k >= n || !(b[k].is_ascii_alphanumeric() || b[k] == b'_');
 
             // `BD` → DECIMAL (only without an exponent, where precision/scale are well-defined).
             if i + 1 < n
@@ -581,6 +581,57 @@ fn strip_temporary_view(query: &str) -> Option<String> {
     Some(format!("{ws}{head}{}", &rest[cur..]))
 }
 
+/// Parsed shape of a `CREATE [OR REPLACE] [GLOBAL] [TEMP[ORARY]] VIEW` statement, used to enforce
+/// Spark's SPARK-29628 rule that a persistent view may not reference a session-temporary view.
+struct CreateViewInfo {
+    /// Lowercased, unqualified view name (last identifier component).
+    name: String,
+    /// True for `TEMPORARY` / `TEMP` (incl. `GLOBAL TEMPORARY`) views.
+    temporary: bool,
+    /// Lowercased, unqualified names of every relation referenced in the view body.
+    relations: Vec<String>,
+}
+
+/// Recognize a `CREATE VIEW` statement and extract its name, temporary-ness, and the relations its
+/// body references. Returns `None` for any non-`CREATE VIEW` statement (and for anything sqlparser
+/// cannot parse), in which case the caller leaves engine behavior completely unchanged. Parsing
+/// uses the same Databricks dialect the engine plans with, so the AST matches what DataFusion sees.
+fn analyze_create_view(query: &str) -> Option<CreateViewInfo> {
+    use datafusion::sql::sqlparser::ast::{visit_relations, ObjectName, Statement};
+    use datafusion::sql::sqlparser::dialect::DatabricksDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+
+    let stmts = Parser::parse_sql(&DatabricksDialect {}, query).ok()?;
+    let [stmt] = stmts.as_slice() else {
+        return None;
+    };
+    let Statement::CreateView(cv) = stmt else {
+        return None;
+    };
+    let last_part = |on: &ObjectName| -> Option<String> {
+        on.0.last()?
+            .as_ident()
+            .map(|i| i.value.to_ascii_lowercase())
+    };
+    let name = last_part(&cv.name)?;
+    // Collect every relation referenced in the view body. `visit_relations` only visits
+    // table-position object names (FROM / JOIN / subquery relations), never the view's own name,
+    // so the new view name can never spuriously match itself.
+    let mut relations = Vec::new();
+    let _ = visit_relations(cv.query.as_ref(), |on| {
+        if let Some(part) = last_part(on) {
+            relations.push(part);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    Some(CreateViewInfo {
+        name,
+        temporary: cv.temporary,
+        relations,
+    })
+}
+
 /// Register Spark function names that DataFusion already implements under a *different* name, as
 /// faithful aliases — same implementation, extra invocation name. Purely additive and zero-risk:
 /// it can only make more Spark SQL resolve, never change an existing result (DataFusion's
@@ -667,21 +718,64 @@ impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
         >,
     > {
         use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::expr::ScalarFunction;
         use datafusion::logical_expr::planner::PlannerResult;
-        use datafusion::logical_expr::{cast, Expr, ExprSchemable};
+        use datafusion::logical_expr::{cast, BinaryExpr, Expr, ExprSchemable, Operator};
         use datafusion::sql::sqlparser::ast::BinaryOperator;
 
-        // Spark `/` only. (Spark integer division `DIV` is `Operator::IntegerDivide`, never `/`.)
-        if !matches!(expr.op, BinaryOperator::Divide) {
+        // We rewrite Spark `/` (true division) and, for a decimal divisor, `%` (modulo). (Spark
+        // integer division `DIV` is `Operator::IntegerDivide`, never `/`.)
+        let is_divide = matches!(expr.op, BinaryOperator::Divide);
+        let is_modulo = matches!(expr.op, BinaryOperator::Modulo);
+        if !is_divide && !is_modulo {
             return Ok(PlannerResult::Original(expr));
         }
         // Resolve operand types against the input schema; if either is unresolvable (e.g. a bare
         // placeholder), defer to the default planner unchanged.
-        let (Ok(left_ty), Ok(right_ty)) =
-            (expr.left.get_type(schema), expr.right.get_type(schema))
+        let (Ok(left_ty), Ok(right_ty)) = (expr.left.get_type(schema), expr.right.get_type(schema))
         else {
             return Ok(PlannerResult::Original(expr));
         };
+        // Decimal/float divisor: Spark ANSI `/` and `%` raise DIVIDE_BY_ZERO on *any* non-null zero
+        // divisor — including decimal (`a / b`, `a % b` over `SELECT 1.0 a, 0.0 b`, where weft types
+        // the decimal literals as `Float64`) and floating-point (Spark's `Divide`/`Remainder` share
+        // one `failOnError` zero-check across every numeric type; non-ANSI it returns NULL, ANSI it
+        // throws — Spark never yields Infinity/NaN from a zero divisor). DataFusion's native decimal/
+        // float divide/modulo instead produce a value (Infinity/NaN/null) and silently drop that
+        // error — a forbidden missing-error gap. Wrap the divisor in the identity guard
+        // `spark_nonzero_divisor`: every non-zero/null row passes through byte-identical (so the
+        // divide/modulo keeps DataFusion's exact result type and value, and the Spark column name is
+        // unchanged — see `spark_names`), and only a non-null zero divisor raises, converting
+        // missing-error→error-parity, never pass→fail. The integral `/` path below covers integral
+        // zero divisors via `spark_divide`.
+        if matches!(
+            right_ty,
+            DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+        ) {
+            let guarded_right = Expr::ScalarFunction(ScalarFunction::new_udf(
+                crate::spark_functions::spark_nonzero_divisor::udf(),
+                vec![expr.right],
+            ));
+            let op = if is_divide {
+                Operator::Divide
+            } else {
+                Operator::Modulo
+            };
+            let planned = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(expr.left),
+                op,
+                Box::new(guarded_right),
+            ));
+            return Ok(PlannerResult::Planned(planned));
+        }
+        // Beyond the decimal-divisor guard, only the integral `/` true-division lowering applies.
+        if !is_divide {
+            return Ok(PlannerResult::Original(expr));
+        }
         // Both operands must be integral. Anything else is left exactly as DataFusion/Spark handle
         // it (decimal precision, already-double float, string/binary/bool/date/timestamp errors).
         if !is_integral(&left_ty) || !is_integral(&right_ty) {
@@ -699,7 +793,6 @@ impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
         // `double` and print `1.0`; those dead branches never hit the error (the constant-guard
         // `CASE`/`coalesce` is pruned by the simplifier before the UDF runs, and a dynamic branch is
         // evaluated only on matching rows). See `spark_functions::spark_divide`.
-        use datafusion::logical_expr::expr::ScalarFunction;
         let planned = Expr::ScalarFunction(ScalarFunction::new_udf(
             crate::spark_functions::spark_divide::udf(),
             vec![
@@ -734,7 +827,139 @@ impl datafusion::logical_expr::planner::ExprPlanner for SparkDividePlanner {
 /// [`NamePreserver`], like the literal-retype pass) so no by-name reference breaks, and the
 /// per-node schema is recomputed; any node that cannot be re-validated aborts the rewrite back to
 /// the original plan (never an error, never a partial plan).
-fn lower_checked_multiply(plan: datafusion::logical_expr::LogicalPlan) -> datafusion::logical_expr::LogicalPlan {
+/// Faithful TIGHTEN-to-REJECT for `IN`-lists that mix a constant string with a temporal operand.
+///
+/// Spark's `InTypeCoercion` casts every `IN` operand to the list's common type. When the operands
+/// mix a `STRING` with a `DATE`/`TIMESTAMP`, the common type is the *temporal* one, so the string
+/// side is ANSI-cast to it. For a constant string that can't parse as that temporal (e.g. `'1'`,
+/// `'2'` — the values of `cast(1 as string)` / `cast(2 as string)`) that ANSI cast **fails at
+/// runtime** with `CAST_INVALID_INPUT`, so the whole query errors. DataFusion's
+/// `string_temporal_coercion` instead unifies the pair and silently produces a value, so weft
+/// accepts a query Spark rejects (`missing-error`).
+///
+/// This pass walks the **raw** (pre-analysis) plan — where the `Expr::InList` is still intact and
+/// each operand still carries its explicit `CAST(… AS <type>)` — and returns an error exactly when
+/// a *constant* string operand provably cannot ANSI-cast to the list's temporal common type. It is
+/// conservative on purpose:
+/// - only fires when at least one operand is temporal AND at least one string operand is a constant;
+/// - only rejects on a string constant whose cast to the temporal type yields NULL (parse failure) —
+///   a *valid* temporal string (which Spark would accept) casts successfully and is left alone;
+/// - non-constant string operands (columns) are never used to reject (Spark's per-row runtime error
+///   can't be decided statically), so no currently-correct query is turned into an error.
+///
+/// Whenever it rejects, Spark also rejects the same query, so this can only move
+/// `missing-error → error-parity`.
+mod spark_in_temporal {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::{Expr, LogicalPlan};
+    use weft_common::{Error, Result};
+
+    fn is_temporal(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+        )
+    }
+
+    /// A numeric (integral / floating / decimal) type — the set Spark deems type-incompatible with a
+    /// temporal in an `IN` predicate (`DATATYPE_MISMATCH.DATA_DIFF_TYPES`).
+    fn is_numeric(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+        )
+    }
+
+    /// The top-level result type of an operand we can classify statically (an explicit `CAST`, or a
+    /// bare literal). Anything else (a column ref, an arbitrary expression) returns `None` and is
+    /// ignored — we never reject based on it, so a non-constant operand can never drive a rejection.
+    fn operand_result_type(expr: &Expr) -> Option<DataType> {
+        match expr {
+            Expr::Cast(c) => Some(c.field.data_type().clone()),
+            Expr::Literal(sv, _) => Some(sv.data_type()),
+            _ => None,
+        }
+    }
+
+    /// Spark rejects an `IN` predicate whose operands mix a *numeric* type with a *temporal*
+    /// (DATE/TIMESTAMP) type as `DATATYPE_MISMATCH.DATA_DIFF_TYPES` — the two type families are not
+    /// comparable. DataFusion, however, will happily coerce e.g. `INT IN (DATE)` (Date32 shares
+    /// Int32's physical layout) and silently produce a value, so weft is too lenient (missing-error).
+    /// When we can prove statically (every relevant operand is an explicit `CAST`/literal) that the
+    /// list mixes the two families, return the rejection message. Whenever this fires, Spark also
+    /// rejects the same query, so it can only move `missing-error → error-parity`.
+    fn check_inlist(inlist: &InList) -> Option<String> {
+        let operands = std::iter::once(inlist.expr.as_ref()).chain(inlist.list.iter());
+
+        let mut temporal: Option<DataType> = None;
+        let mut numeric: Option<DataType> = None;
+        for op in operands {
+            if let Some(dt) = operand_result_type(op) {
+                if is_temporal(&dt) {
+                    temporal.get_or_insert(dt);
+                } else if is_numeric(&dt) {
+                    numeric.get_or_insert(dt);
+                }
+            }
+        }
+        match (temporal, numeric) {
+            (Some(t), Some(n)) => Some(format!(
+                "[DATATYPE_MISMATCH.DATA_DIFF_TYPES] IN predicate mixes incompatible types {n} and \
+                 {t} (Apache Spark rejects this query)"
+            )),
+            _ => None,
+        }
+    }
+
+    /// Walk every expression in the plan and reject the first numeric/temporal `IN`-list.
+    pub fn reject_invalid_in_temporal(plan: &LogicalPlan) -> Result<()> {
+        let mut rejection: Option<String> = None;
+        // `apply` over plan nodes; for each node scan its expressions for an offending `InList`.
+        let _ = plan.apply(|node| {
+            for expr in node.expressions() {
+                let _ = expr.apply(|e| {
+                    if let Expr::InList(inlist) = e {
+                        if let Some(msg) = check_inlist(inlist) {
+                            rejection = Some(msg);
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                });
+                if rejection.is_some() {
+                    break;
+                }
+            }
+            if rejection.is_some() {
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        });
+        match rejection {
+            Some(msg) => Err(Error::Plan(msg)),
+            None => Ok(()),
+        }
+    }
+}
+
+fn lower_checked_multiply(
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> datafusion::logical_expr::LogicalPlan {
     use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -777,14 +1002,21 @@ fn lower_checked_multiply(plan: datafusion::logical_expr::LogicalPlan) -> datafu
 fn rewrite_mul_expr(
     expr: datafusion::logical_expr::Expr,
     schema: &datafusion::common::DFSchema,
-) -> datafusion::common::Result<datafusion::common::tree_node::Transformed<datafusion::logical_expr::Expr>> {
+) -> datafusion::common::Result<
+    datafusion::common::tree_node::Transformed<datafusion::logical_expr::Expr>,
+> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{cast, BinaryExpr, Expr, ExprSchemable, Operator};
 
     expr.transform_up(|e| {
-        let Expr::BinaryExpr(BinaryExpr { left, op: Operator::Multiply, right }) = &e else {
+        let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Multiply,
+            right,
+        }) = &e
+        else {
             return Ok(Transformed::no(e));
         };
         let (Ok(lt), Ok(rt)) = (left.get_type(schema), right.get_type(schema)) else {
@@ -899,14 +1131,28 @@ fn lower_like_quantifier_expr(
             expr,
             pattern,
             escape_char,
-        } => (*negated, *any, expr.as_ref(), pattern.as_ref(), escape_char, false),
+        } => (
+            *negated,
+            *any,
+            expr.as_ref(),
+            pattern.as_ref(),
+            escape_char,
+            false,
+        ),
         Expr::ILike {
             negated,
             any,
             expr,
             pattern,
             escape_char,
-        } => (*negated, *any, expr.as_ref(), pattern.as_ref(), escape_char, true),
+        } => (
+            *negated,
+            *any,
+            expr.as_ref(),
+            pattern.as_ref(),
+            escape_char,
+            true,
+        ),
         _ => return None,
     };
 
@@ -930,7 +1176,13 @@ fn lower_like_quantifier_expr(
     };
     let mut folded: Option<Expr> = None;
     for p in patterns {
-        let one = make_like(case_insensitive, negated, left.clone(), p, escape_char.clone());
+        let one = make_like(
+            case_insensitive,
+            negated,
+            left.clone(),
+            p,
+            escape_char.clone(),
+        );
         folded = Some(match folded {
             None => one,
             Some(acc) => Expr::BinaryOp {
@@ -1034,6 +1286,162 @@ fn make_like(
     }
 }
 
+/// Cheap text pre-check: could `sql` contain an ordered-set / window percentile shape that Spark
+/// rejects but DataFusion would happily plan? Mirrors [`contains_like_quantifier`] — a false
+/// positive only costs one extra parse + AST walk, and a false negative is impossible for the
+/// shapes [`unsupported_percentile_shape`] rejects, because every one of them lexes either
+/// `within group` or an `over`-decorated `median`/`percentile_cont`/`percentile_disc` call.
+fn contains_percentile_reject_precheck(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("within group") {
+        return true;
+    }
+    lower.contains("over")
+        && (lower.contains("median")
+            || lower.contains("percentile_cont")
+            || lower.contains("percentile_disc"))
+}
+
+/// Spark rejects several ordered-set / window percentile shapes that DataFusion accepts and plans.
+/// If `stmt` contains one, return the matching Spark error text so [`Engine::create_logical_plan_spark`]
+/// can surface an `Err` (turning a silent missing-error / engine-panic into error-parity). Every
+/// shape below is a faithful rejection — Apache Spark v4.0.0 also errors on it, so no currently
+/// correct result can change:
+///
+/// - `WITHIN GROUP (ORDER BY ...)` on any function other than `percentile_cont` / `percentile_disc`
+///   / `mode` / `listagg` (`string_agg`) — Spark: `INVALID_SQL_SYNTAX.FUNCTION_WITH_UNSUPPORTED_SYNTAX`.
+/// - `DISTINCT` inside a `WITHIN GROUP` aggregate — Spark: `INVALID_WITHIN_GROUP_EXPRESSION.DISTINCT_UNSUPPORTED`.
+/// - `median` / `percentile_cont` / `percentile_disc` used as a *window* function whose resolved
+///   frame is not the whole partition — i.e. it carries an `ORDER BY` (a running frame) or an
+///   explicit frame other than `UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`. Spark:
+///   `INVALID_WINDOW_SPEC_FOR_AGGREGATION_FUNC`.
+fn unsupported_percentile_shape(
+    stmt: &datafusion::sql::sqlparser::ast::Statement,
+) -> Option<String> {
+    use datafusion::sql::sqlparser::ast::{
+        Expr, NamedWindowExpr, Select, Visit, Visitor, WindowSpec,
+    };
+    use std::collections::HashMap;
+    use std::ops::ControlFlow;
+
+    struct PercentileRejectVisitor {
+        // Maps a named window (lowercased) to its spec, so `OVER w` can be resolved against the
+        // enclosing `SELECT`'s `WINDOW w AS (...)` clause. `pre_visit_select` runs before the
+        // select's projection expressions, so the map is populated before any `OVER w` is checked.
+        named_windows: HashMap<String, WindowSpec>,
+    }
+    impl Visitor for PercentileRejectVisitor {
+        type Break = String;
+        fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<String> {
+            for def in &select.named_window {
+                if let NamedWindowExpr::WindowSpec(spec) = &def.1 {
+                    self.named_windows
+                        .insert(def.0.value.to_ascii_lowercase(), spec.clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<String> {
+            if let Expr::Function(func) = expr {
+                if let Some(msg) = check_percentile_function(func, &self.named_windows) {
+                    return ControlFlow::Break(msg);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = PercentileRejectVisitor {
+        named_windows: HashMap::new(),
+    };
+    match stmt.visit(&mut visitor) {
+        ControlFlow::Break(msg) => Some(msg),
+        ControlFlow::Continue(()) => None,
+    }
+}
+
+/// Inspect a single function-call node for a Spark-rejected percentile/ordered-set shape (see
+/// [`unsupported_percentile_shape`] for the catalogue). `named_windows` resolves an `OVER w`
+/// reference to its `WINDOW w AS (...)` spec.
+fn check_percentile_function(
+    func: &datafusion::sql::sqlparser::ast::Function,
+    named_windows: &std::collections::HashMap<String, datafusion::sql::sqlparser::ast::WindowSpec>,
+) -> Option<String> {
+    use datafusion::sql::sqlparser::ast::{
+        DuplicateTreatment, FunctionArguments, ObjectNamePart, WindowType,
+    };
+    let name = match func.name.0.last() {
+        Some(ObjectNamePart::Identifier(ident)) => ident.value.to_ascii_lowercase(),
+        _ => return None,
+    };
+
+    // Shapes 1 + 2: `WITHIN GROUP (ORDER BY ...)` decorations.
+    if !func.within_group.is_empty() {
+        const WITHIN_GROUP_ALLOWED: [&str; 5] = [
+            "percentile_cont",
+            "percentile_disc",
+            "mode",
+            "listagg",
+            "string_agg",
+        ];
+        if !WITHIN_GROUP_ALLOWED.contains(&name.as_str()) {
+            return Some(format!(
+                "[INVALID_SQL_SYNTAX.FUNCTION_WITH_UNSUPPORTED_SYNTAX] The function `{name}` does not support the WITHIN GROUP (ORDER BY ...) clause."
+            ));
+        }
+        // `DISTINCT` inside a WITHIN GROUP aggregate is unconditionally rejected by Spark only for
+        // the percentile/mode ordered-set aggregates. `listagg`/`string_agg` *do* accept DISTINCT
+        // (Spark only errors when the ordering key disagrees with the distinct input — a different,
+        // value-dependent check we deliberately don't reproduce), so they are excluded here.
+        const DISTINCT_FORBIDDEN: [&str; 3] = ["percentile_cont", "percentile_disc", "mode"];
+        if DISTINCT_FORBIDDEN.contains(&name.as_str()) {
+            if let FunctionArguments::List(list) = &func.args {
+                if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+                    return Some(format!(
+                        "[INVALID_WITHIN_GROUP_EXPRESSION.DISTINCT_UNSUPPORTED] DISTINCT is not supported inside the WITHIN GROUP aggregate `{name}`."
+                    ));
+                }
+            }
+        }
+    }
+
+    // Shape 3: `median` / `percentile_cont` / `percentile_disc` as a window function whose resolved
+    // frame is not the whole partition.
+    const WINDOW_FAMILY: [&str; 3] = ["median", "percentile_cont", "percentile_disc"];
+    if WINDOW_FAMILY.contains(&name.as_str()) {
+        let spec = match &func.over {
+            Some(WindowType::WindowSpec(spec)) => Some(spec.clone()),
+            Some(WindowType::NamedWindow(ident)) => named_windows
+                .get(&ident.value.to_ascii_lowercase())
+                .cloned(),
+            None => None,
+        };
+        if let Some(spec) = spec {
+            if !window_frame_is_full_partition(&spec) {
+                return Some(format!(
+                    "[INVALID_WINDOW_SPEC_FOR_AGGREGATION_FUNC] The window function `{name}` requires the window to span the whole partition (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)."
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `spec`'s *resolved* frame spans the entire partition — Spark's only valid frame for
+/// ordered-set / median window aggregates. With no explicit frame, the frame is the whole partition
+/// only when there is also no `ORDER BY` (an `ORDER BY` without an explicit frame resolves to the
+/// running `RANGE UNBOUNDED PRECEDING .. CURRENT ROW`, which is *not* full).
+fn window_frame_is_full_partition(spec: &datafusion::sql::sqlparser::ast::WindowSpec) -> bool {
+    use datafusion::sql::sqlparser::ast::WindowFrameBound;
+    match &spec.window_frame {
+        None => spec.order_by.is_empty(),
+        Some(frame) => {
+            matches!(frame.start_bound, WindowFrameBound::Preceding(None))
+                && matches!(frame.end_bound, Some(WindowFrameBound::Following(None)))
+        }
+    }
+}
+
 /// Monotonic counter giving each [`Engine`] a unique managed-warehouse subdirectory (combined
 /// with the process id) so concurrent engines never share table storage.
 static WAREHOUSE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1047,6 +1455,13 @@ pub struct Engine {
     /// `<fmt>` files under here (see [`spark_create_table`]). One directory per `Engine` isolates
     /// otherwise-colliding table names across files and is removed on `Drop`.
     warehouse: PathBuf,
+    /// Lowercased names of the session-temporary views created so far in this engine's lifetime
+    /// (`CREATE [GLOBAL] TEMP[ORARY] VIEW <name>`). Spark forbids a *persistent* `CREATE VIEW` from
+    /// referencing any of these (SPARK-29628 / `INVALID_TEMP_OBJ_REFERENCE`); DataFusion has no
+    /// temp/permanent distinction and would silently accept it, so we track the temp set ourselves
+    /// and reject the offending persistent view to keep error-parity with Spark. A name is removed
+    /// when a later persistent view re-uses it (DataFusion's single namespace would shadow it).
+    temp_views: Mutex<HashSet<String>>,
 }
 
 impl Engine {
@@ -1139,12 +1554,15 @@ impl Engine {
         // A process+atomic-unique managed warehouse dir for `CREATE TABLE … USING <fmt>` tables.
         // Created lazily (per-table `create_dir_all` in `Engine::sql`) and torn down on `Drop`.
         let id = WAREHOUSE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let warehouse = std::env::temp_dir()
-            .join("weft-warehouse")
-            .join(format!("{}-{}", std::process::id(), id));
+        let warehouse = std::env::temp_dir().join("weft-warehouse").join(format!(
+            "{}-{}",
+            std::process::id(),
+            id
+        ));
         Self {
             ctx: Arc::new(ctx),
             warehouse,
+            temp_views: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1153,6 +1571,26 @@ impl Engine {
     /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
     /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        // SPARK-29628 (`INVALID_TEMP_OBJ_REFERENCE`): a *persistent* `CREATE VIEW` may not reference
+        // a session-temporary view. DataFusion has no temp/permanent distinction (we strip the
+        // `TEMPORARY` keyword in `normalize_spark_sql` so it plans), so it would silently accept the
+        // body and weft would drop Spark's analysis error. Detect the offending shape up front and
+        // reject it so both engines reject (error-parity). `analyze_create_view` returns `None` for
+        // anything that isn't a parseable `CREATE VIEW`, leaving every other statement untouched.
+        let create_view = analyze_create_view(query);
+        if let Some(cv) = &create_view {
+            if !cv.temporary {
+                let temp = self.temp_views.lock().unwrap();
+                if let Some(referenced) = cv.relations.iter().find(|r| temp.contains(*r)) {
+                    return Err(Error::Plan(format!(
+                        "[INVALID_TEMP_OBJ_REFERENCE] Cannot create the persistent object \
+                         `{}` of the type VIEW because it references the temporary object \
+                         `{referenced}` of the type VIEW. SQLSTATE: 42K0F",
+                        cv.name
+                    )));
+                }
+            }
+        }
         // Faithful lowering of Spark's `CREATE TABLE … USING <fmt>` to a real, format-backed
         // `CREATE EXTERNAL TABLE` (genuine durable storage — NOT the forbidden MemTable shim). On
         // success the statement produces no result set, matching Spark's `struct<>`. If the lowered
@@ -1174,17 +1612,29 @@ impl Engine {
             return Ok(vec![]);
         }
         let df = self.plan_spark(query).await?;
-        df.collect()
+        let batches = df
+            .collect()
             .await
-            .map_err(|e| Error::Execution(e.to_string()))
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        // The view planned/created successfully — update the temp-view registry. A new temporary
+        // view is recorded; a persistent view with the same name removes any prior temp entry
+        // (DataFusion keeps a single namespace, so the persistent definition now shadows it).
+        if let Some(cv) = create_view {
+            let mut temp = self.temp_views.lock().unwrap();
+            if cv.temporary {
+                temp.insert(cv.name);
+            } else {
+                temp.remove(&cv.name);
+            }
+        }
+        Ok(batches)
     }
 
     /// Create the managed directory and run a lowered `CREATE EXTERNAL TABLE` DDL, materializing a
     /// real format-backed [`datafusion`] `ListingTable`. The directory must exist before any
     /// empty-table SELECT (which lists it), so we `create_dir_all` first.
     async fn run_create_external(&self, low: &spark_create_table::Lowered) -> Result<()> {
-        std::fs::create_dir_all(&low.table_dir)
-            .map_err(|e| Error::Execution(e.to_string()))?;
+        std::fs::create_dir_all(&low.table_dir).map_err(|e| Error::Execution(e.to_string()))?;
         let ddl = normalize_spark_sql(&low.ddl);
         self.ctx
             .sql(ddl.as_ref())
@@ -1216,6 +1666,12 @@ impl Engine {
         // any DDL / builds the lazy DataFrame). Under the default `SQLOptions` `ctx.sql()` uses,
         // all statement kinds are allowed, so this is behavior-equivalent plus the two rewrites.
         let plan = self.create_logical_plan_spark(query.as_ref()).await?;
+        // Faithful TIGHTEN-to-REJECT: Spark rejects an `IN`-list whose operands mix a numeric type
+        // with a temporal (DATE/TIMESTAMP) type as `DATATYPE_MISMATCH.DATA_DIFF_TYPES` (the two type
+        // families are incomparable, e.g. `cast(1 as int) IN (cast('…' as date))`). DataFusion
+        // instead coerces them (Date32 shares Int32's layout) and silently yields a value, so weft is
+        // too lenient (missing-error). Detect the mix on the raw plan and reject so both engines do.
+        spark_in_temporal::reject_invalid_in_temporal(&plan)?;
         // Order is load-bearing. `project_spark_names` runs FIRST, on the raw plan, so it sees the
         // bare (un-aliased) anonymous literal columns and renames them to their Spark names — its
         // outer projection then references the inner columns by their original DataFusion names.
@@ -1247,6 +1703,19 @@ impl Engine {
     ) -> Result<datafusion::logical_expr::LogicalPlan> {
         use datafusion::sql::parser::Statement as DFStatement;
         let state = self.ctx.state();
+        // Spark rejects several ordered-set / window percentile shapes (WITHIN GROUP on an
+        // unsupported function, DISTINCT inside WITHIN GROUP, a percentile/median window with a
+        // non-full-partition frame) that DataFusion would silently plan. Detect them up front and
+        // return an error so weft matches Spark's rejection (error-parity). The pre-check keeps the
+        // overwhelmingly common case on the untouched fast path below.
+        if contains_percentile_reject_precheck(query) {
+            let dialect = state.config().options().sql_parser.dialect;
+            if let Ok(DFStatement::Statement(inner)) = state.sql_to_statement(query, &dialect) {
+                if let Some(msg) = unsupported_percentile_shape(inner.as_ref()) {
+                    return Err(Error::Plan(msg));
+                }
+            }
+        }
         if !contains_like_quantifier(query) {
             return state
                 .create_logical_plan(query)
@@ -1698,8 +2167,14 @@ mod tests {
             "select 'Hello!'"
         );
         // `\%` / `\_` keep the backslash so downstream LIKE escaping still works (literals.sql).
-        assert_eq!(normalize_spark_sql(r"select 'no-pattern\%'"), r"select 'no-pattern\%'");
-        assert_eq!(normalize_spark_sql(r"select 'pattern\\\%'"), r"select 'pattern\\%'");
+        assert_eq!(
+            normalize_spark_sql(r"select 'no-pattern\%'"),
+            r"select 'no-pattern\%'"
+        );
+        assert_eq!(
+            normalize_spark_sql(r"select 'pattern\\\%'"),
+            r"select 'pattern\\%'"
+        );
         // `\'` (Spark's escaped quote) is re-emitted as `''` so the value survives the dialect switch.
         assert_eq!(normalize_spark_sql(r"select 'a\'b'"), "select 'a''b'");
         // Regex literal: `'\\d+'` reaches the planner as `\d+`, exactly what Spark hands its engine.
@@ -1709,11 +2184,11 @@ mod tests {
     #[test]
     fn normalize_leaves_backslash_free_and_protected_literals_untouched() {
         for q in [
-            "SELECT 'a' ILIKE 'b'",       // no backslash anywhere → byte-identical, borrowed
-            "SELECT 'it''s fine'",        // `''` quote-doubling preserved verbatim
-            "SELECT \"a\\nb\" AS s",      // Databricks `"…"` literal left to the parser
-            "SELECT 1 -- a\\nb keep\n",   // backslash inside a comment is not a literal
-            "SELECT `c\\d` FROM t",       // backtick identifier untouched
+            "SELECT 'a' ILIKE 'b'",     // no backslash anywhere → byte-identical, borrowed
+            "SELECT 'it''s fine'",      // `''` quote-doubling preserved verbatim
+            "SELECT \"a\\nb\" AS s",    // Databricks `"…"` literal left to the parser
+            "SELECT 1 -- a\\nb keep\n", // backslash inside a comment is not a literal
+            "SELECT `c\\d` FROM t",     // backtick identifier untouched
         ] {
             assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
         }
@@ -1822,40 +2297,71 @@ mod tests {
 
         // LIKE ALL = AND fold; LIKE ANY = OR fold.
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', '%go%')").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', '%go%')"
+            )
+            .await,
             vec!["google"]
         );
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company LIKE ANY ('%oo%', '%in', 'fa%')").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company LIKE ANY ('%oo%', '%in', 'fa%')"
+            )
+            .await,
             vec!["facebook", "google", "linkedin"]
         );
         // A column-valued pattern in the list evaluates per row.
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', pat)").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', pat)"
+            )
+            .await,
             vec!["facebook", "google"]
         );
         // 3VL: a NULL pattern makes ALL never-true → empty.
-        assert!(companies(&engine, "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', NULL)")
-            .await
-            .is_empty());
+        assert!(companies(
+            &engine,
+            "SELECT company FROM lt WHERE company LIKE ALL ('%oo%', NULL)"
+        )
+        .await
+        .is_empty());
         // 3VL: ANY is satisfied by a matching pattern; non-matchers become NULL (not false).
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company LIKE ANY ('%oo%', NULL)").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company LIKE ANY ('%oo%', NULL)"
+            )
+            .await,
             vec!["facebook", "google"]
         );
         // NOT LIKE ANY distributes NOT onto each pattern, keeps the OR connective.
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company NOT LIKE ANY ('%oo%', NULL)").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company NOT LIKE ANY ('%oo%', NULL)"
+            )
+            .await,
             vec!["linkedin"]
         );
         // An outer NOT over a LIKE ALL is the boolean negation of the whole AND fold.
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE NOT company LIKE ALL ('%oo%', 'fa%')").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE NOT company LIKE ALL ('%oo%', 'fa%')"
+            )
+            .await,
             vec!["google", "linkedin"]
         );
         // ILIKE ALL is case-insensitive.
         assert_eq!(
-            companies(&engine, "SELECT company FROM lt WHERE company ILIKE ALL ('%OO%', '%GO%')").await,
+            companies(
+                &engine,
+                "SELECT company FROM lt WHERE company ILIKE ALL ('%OO%', '%GO%')"
+            )
+            .await,
             vec!["google"]
         );
         // An ordinary LIKE is left untouched by the rewrite.

@@ -83,7 +83,10 @@ fn rewrite_expr(expr: Expr) -> Result<Transformed<Expr>> {
 /// typed `Int64` `NULL`); otherwise the column is left exactly as-is (so e.g. a column that mixes
 /// an `Int64` and a `Double` keeps DataFusion's common-type coercion).
 fn rewrite_values(values: Values) -> Transformed<LogicalPlan> {
-    let Values { schema, values: rows } = values;
+    let Values {
+        schema,
+        values: rows,
+    } = values;
     let ncols = schema.fields().len();
 
     let mut downcast = vec![false; ncols];
@@ -98,7 +101,10 @@ fn rewrite_values(values: Values) -> Transformed<LogicalPlan> {
         });
     }
     if !downcast.iter().any(|&b| b) {
-        return Transformed::no(LogicalPlan::Values(Values { schema, values: rows }));
+        return Transformed::no(LogicalPlan::Values(Values {
+            schema,
+            values: rows,
+        }));
     }
 
     // New schema: only the eligible columns' types change to Int32; names, qualifiers, nullability
@@ -118,10 +124,16 @@ fn rewrite_values(values: Values) -> Transformed<LogicalPlan> {
             (qualifier.cloned(), new_field)
         })
         .collect();
-    let new_schema = match DFSchema::new_with_metadata(qualified_fields, schema.metadata().clone()) {
+    let new_schema = match DFSchema::new_with_metadata(qualified_fields, schema.metadata().clone())
+    {
         Ok(s) => Arc::new(s),
         // Should never happen (we only changed types, not names), but never panic the engine.
-        Err(_) => return Transformed::no(LogicalPlan::Values(Values { schema, values: rows })),
+        Err(_) => {
+            return Transformed::no(LogicalPlan::Values(Values {
+                schema,
+                values: rows,
+            }))
+        }
     };
 
     let new_rows: Vec<Vec<Expr>> = rows

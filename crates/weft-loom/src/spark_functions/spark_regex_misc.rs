@@ -300,7 +300,10 @@ fn regex_pair(args: &ScalarFunctionArgs, func: &str) -> Result<(ArrayRef, ArrayR
         return exec_err!("{func}: expected 2 arguments");
     }
     let n = args.number_rows;
-    Ok((to_str_array(&args.args[0], n)?, to_str_array(&args.args[1], n)?))
+    Ok((
+        to_str_array(&args.args[0], n)?,
+        to_str_array(&args.args[1], n)?,
+    ))
 }
 
 /// Spark `regexp_count(str, regexp)` — the number of non-overlapping matches of `regexp` in `str`
@@ -784,11 +787,21 @@ mod tests {
     #[tokio::test]
     async fn regexp_substr_first_match_or_null() {
         // First whole match.
-        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+') AS x").await.contains("| 1 "));
-        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+(a|b|m)') AS x").await.contains("1a"));
+        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+') AS x")
+            .await
+            .contains("| 1 "));
+        assert!(
+            run("SELECT regexp_substr('1a 2b 14m', '\\\\d+(a|b|m)') AS x")
+                .await
+                .contains("1a")
+        );
         // No match → NULL (not empty string, which is what regexp_extract would give). Arrow's
         // pretty-format prints a null as blank, so assert nullness via `IS NULL`.
-        assert!(run("SELECT regexp_substr('1a 2b 14m', '\\\\d+ x') IS NULL AS x").await.contains("true"));
+        assert!(
+            run("SELECT regexp_substr('1a 2b 14m', '\\\\d+ x') IS NULL AS x")
+                .await
+                .contains("true")
+        );
     }
 
     #[tokio::test]
@@ -864,8 +877,10 @@ mod tests {
     #[tokio::test]
     async fn regexp_replace_is_global_and_unescapes_pattern() {
         // Global (both `*thy` matches replaced), and `\\w+thy` is unescaped to `\w+thy`.
-        let g = run("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something') AS x")
-            .await;
+        let g = run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something') AS x",
+        )
+        .await;
         assert!(g.contains("something, something, and wise"), "{g}");
     }
 
@@ -903,14 +918,17 @@ mod tests {
             .await
             .is_err());
         assert!(engine
-            .sql("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', -2)")
+            .sql(
+                "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', -2)"
+            )
             .await
             .is_err());
         // NULL position -> NULL output (the pretty-printer renders a null cell as blank, so the
         // tell is simply that no replacement happened).
-        let g =
-            run("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w', 'something', null) AS x")
-                .await;
+        let g = run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w', 'something', null) AS x",
+        )
+        .await;
         assert!(!g.contains("something"), "{g}");
     }
 
