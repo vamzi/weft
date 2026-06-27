@@ -325,8 +325,8 @@ async fn run_clickbench_grpc(rows: usize, data: Option<String>) {
         .expect("CREATE EXTERNAL TABLE hits_raw failed");
         exec_sql_grpc(
             &mut client,
-            "CREATE VIEW hits AS SELECT * EXCEPT (\"EventDate\"), \
-             CAST(CAST(\"EventDate\" AS INTEGER) AS DATE) AS \"EventDate\" FROM hits_raw",
+            "CREATE VIEW hits AS SELECT * EXCEPT (`EventDate`), \
+             CAST(CAST(`EventDate` AS INTEGER) AS DATE) AS `EventDate` FROM hits_raw",
         )
         .await
         .expect("CREATE VIEW hits failed");
@@ -616,7 +616,7 @@ async fn run_correctness(rows: usize) {
         eprintln!("anchor COUNT(*) FAIL: {:?}", normalize(&count));
     }
     let dates = engine
-        .sql("SELECT MIN(\"EventDate\"), MAX(\"EventDate\") FROM hits")
+        .sql("SELECT MIN(`EventDate`), MAX(`EventDate`) FROM hits")
         .await
         .expect("dates");
     if normalize(&dates) != vec!["2013-07-01|2013-07-31".to_string()] {
