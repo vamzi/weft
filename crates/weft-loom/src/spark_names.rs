@@ -73,15 +73,31 @@ pub fn project_spark_names(plan: LogicalPlan) -> LogicalPlan {
         let (qualifier, field) = schema.qualified_field(i);
         let col = Expr::Column(Column::new(qualifier.cloned(), field.name()));
         // Reference the existing output column; rename it only if it's anonymous and its Spark
-        // name differs. User-aliased columns keep their (already correct) name.
-        let out_name = if matches!(pe, Expr::Alias(_)) {
-            field.name().to_string()
-        } else {
-            let spark = render(pe, &agg);
-            if spark != *field.name() {
-                changed = true;
+        // name differs. A genuine *user* alias (`SELECT a AS foo`, `AS \`Simple WHEN\``,
+        // `AS \`NULLIF(a.i,b.i)\``) keeps its chosen name; DataFusion also wraps some anonymous
+        // projection items (notably scalar-function calls) in an *internal* alias to their own
+        // auto-name, which we must still rename. The robust discriminator (per the regression
+        // swarm): an internal auto-alias's name equals DataFusion's own auto-name of the inner expr
+        // — `a.name == a.expr.schema_name()`. The lone exception is an auto-alias whose name embeds
+        // a *nested* alias artifact (` AS `, e.g. our `array`→`make_array` rename inside
+        // `array_contains(c, array(1,2,3))`), which recomputed `schema_name` spells differently; a
+        // user alias never contains ` AS `, so that artifact is also a safe auto-alias signal.
+        let render_target = match pe {
+            Expr::Alias(a) => {
+                let is_auto = a.name == a.expr.schema_name().to_string() || a.name.contains(" AS ");
+                is_auto.then(|| a.expr.as_ref())
             }
-            spark
+            other => Some(other),
+        };
+        let out_name = match render_target {
+            None => field.name().to_string(),
+            Some(target) => {
+                let spark = render(target, &agg);
+                if spark != *field.name() {
+                    changed = true;
+                }
+                spark
+            }
         };
         // Duplicate output names would make `Projection::try_new` reject the plan — Spark permits
         // them but DataFusion doesn't, so bail and keep DataFusion's (distinct) names instead.
@@ -184,6 +200,24 @@ fn render(e: &Expr, agg: &AggMap) -> String {
         Expr::Not(x) => format!("NOT {}", render(x, agg)),
         Expr::IsNull(x) => format!("{} IS NULL", render(x, agg)),
         Expr::IsNotNull(x) => format!("{} IS NOT NULL", render(x, agg)),
+        // Spark names a `CASE` expression `CASE [<expr>] WHEN <c> THEN <v> … [ELSE <v>] END`, with
+        // each branch rendered Spark-style (literal wrappers stripped, binary ops parenthesized) —
+        // e.g. `CASE WHEN (1 < 2) THEN 1 ELSE (1 / 0) END`. DataFusion's own name keeps the
+        // `Int64(1)`-style wrappers, so without this the column stays in `schema-only`.
+        Expr::Case(c) => {
+            let mut s = String::from("CASE");
+            if let Some(operand) = &c.expr {
+                s.push_str(&format!(" {}", render(operand, agg)));
+            }
+            for (when, then) in &c.when_then_expr {
+                s.push_str(&format!(" WHEN {} THEN {}", render(when, agg), render(then, agg)));
+            }
+            if let Some(els) = &c.else_expr {
+                s.push_str(&format!(" ELSE {}", render(els, agg)));
+            }
+            s.push_str(" END");
+            s
+        }
         Expr::ScalarFunction(sf) => render_scalar_fn(sf, agg),
         // An aggregate reached directly (rare — projections normally reference it by column) renders
         // the same way; fall back to the DataFusion name if it's an unsupported aggregate shape.
@@ -450,3 +484,4 @@ mod tests {
         assert_eq!(render(&expr, &map), "(count(b) * 3)");
     }
 }
+

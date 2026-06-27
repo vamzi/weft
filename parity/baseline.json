@@ -13,15 +13,15 @@
     "missing-relation": 900,
     "nondeterministic": 4,
     "null-semantics": 63,
-    "ordering": 17,
+    "ordering": 15,
     "parser-unsupported": 1239,
-    "pass": 2999,
+    "pass": 3003,
     "requires-udf-registration": 87,
-    "schema-only": 2049
+    "schema-only": 2047
   },
   "files_skipped": 63,
   "files_total": 303,
-  "semantic_pass": 7501,
+  "semantic_pass": 7503,
   "spark_version": "v4.0.0",
-  "strict_pass": 2998
+  "strict_pass": 3001
 }
