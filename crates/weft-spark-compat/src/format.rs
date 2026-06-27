@@ -226,7 +226,11 @@ fn fmt_cell(array: &dyn Array, row: usize, nested: bool) -> String {
         // `to_binary('737472696E67','hex')` prints `string`.) `from_utf8_lossy` matches Java's
         // substitution behavior exactly.
         DataType::Binary => {
-            let v = array.as_any().downcast_ref::<BinaryArray>().unwrap().value(row);
+            let v = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(row);
             String::from_utf8_lossy(v).into_owned()
         }
         DataType::LargeBinary => {
@@ -606,7 +610,10 @@ mod tests {
         assert_eq!(fmt_interval_seconds(6_000_000), "6");
         assert_eq!(fmt_interval_seconds(-6_500_000), "-6.5");
         assert_eq!(fmt_interval_seconds(39_000), "0.039");
-        assert_eq!(spark_type(&DataType::Interval(IntervalUnit::MonthDayNano)), "interval");
+        assert_eq!(
+            spark_type(&DataType::Interval(IntervalUnit::MonthDayNano)),
+            "interval"
+        );
     }
 
     #[test]

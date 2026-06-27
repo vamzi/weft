@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use sc::spark_connect_service_client::SparkConnectServiceClient;
 use weft_connect::{serve, ServerConfig};
-use weft_loom::arrow::array::Int64Array;
+use weft_loom::arrow::array::Int32Array;
 use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_proto::spark::connect as sc;
 
@@ -15,7 +15,11 @@ async fn select_one_over_grpc_returns_1() {
 
     // Start the server in the background.
     tokio::spawn(async move {
-        let _ = serve(ServerConfig { port, ..Default::default() }).await;
+        let _ = serve(ServerConfig {
+            port,
+            ..Default::default()
+        })
+        .await;
     });
 
     // Wait for readiness (retry connect).
@@ -63,11 +67,13 @@ async fn select_one_over_grpc_returns_1() {
                     .expect("ipc reader");
                 for rb in reader {
                     let rb = rb.expect("decode batch");
+                    // `SELECT 1` is Spark `IntegerType` (Int32) — weft types integer literals as
+                    // Int32 to match Spark (real PySpark `SELECT 1` → IntegerType), not i64.
                     let col = rb
                         .column(0)
                         .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("int64 column");
+                        .downcast_ref::<Int32Array>()
+                        .expect("int32 column");
                     assert_eq!(col.value(0), 1);
                     saw_value = true;
                 }

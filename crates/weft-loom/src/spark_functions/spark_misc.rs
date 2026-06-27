@@ -44,8 +44,14 @@ pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(Unhex::new()));
     ctx.register_udf(ScalarUDF::from(ToBinary::new(false)));
     ctx.register_udf(ScalarUDF::from(ToBinary::new(true)));
-    ctx.register_udf(ScalarUDF::from(CurrentName::new("current_database", "default")));
-    ctx.register_udf(ScalarUDF::from(CurrentName::new("current_schema", "default")));
+    ctx.register_udf(ScalarUDF::from(CurrentName::new(
+        "current_database",
+        "default",
+    )));
+    ctx.register_udf(ScalarUDF::from(CurrentName::new(
+        "current_schema",
+        "default",
+    )));
     ctx.register_udf(ScalarUDF::from(CurrentName::new(
         "current_catalog",
         "spark_catalog",
@@ -147,8 +153,8 @@ impl ScalarUDFImpl for Hex {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64 => {
-                let casted = datafusion::arrow::compute::cast(&arr, &DataType::Int64)
-                    .map_err(arrow_err)?;
+                let casted =
+                    datafusion::arrow::compute::cast(&arr, &DataType::Int64).map_err(arrow_err)?;
                 let a = casted
                     .as_any()
                     .downcast_ref::<datafusion::arrow::array::Int64Array>()
@@ -163,8 +169,8 @@ impl ScalarUDFImpl for Hex {
                 }
             }
             DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-                let casted = datafusion::arrow::compute::cast(&arr, &DataType::Binary)
-                    .map_err(arrow_err)?;
+                let casted =
+                    datafusion::arrow::compute::cast(&arr, &DataType::Binary).map_err(arrow_err)?;
                 let a = casted.as_any().downcast_ref::<BinaryArray>().unwrap();
                 for i in 0..n {
                     if a.is_null(i) {
@@ -175,8 +181,8 @@ impl ScalarUDFImpl for Hex {
                 }
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)
-                    .map_err(arrow_err)?;
+                let casted =
+                    datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
                 let a = casted.as_any().downcast_ref::<StringArray>().unwrap();
                 for i in 0..n {
                     if a.is_null(i) {
@@ -232,8 +238,7 @@ impl ScalarUDFImpl for Unhex {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
         let arr = args.args[0].clone().into_array(n)?;
-        let casted =
-            datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
+        let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
         let a = casted.as_any().downcast_ref::<StringArray>().unwrap();
         let mut out = BinaryBuilder::new();
         for i in 0..n {
@@ -284,10 +289,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     // Strip ASCII whitespace (Spark trims spaces inside the token).
-    let cleaned: Vec<u8> = s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if cleaned.is_empty() {
         return Some(Vec::new());
     }
@@ -380,8 +382,7 @@ impl ScalarUDFImpl for ToBinary {
             return exec_err!("{}: expected 1 or 2 arguments, got {nargs}", self.name());
         }
         let input = args.args[0].clone().into_array(n)?;
-        let input =
-            datafusion::arrow::compute::cast(&input, &DataType::Utf8).map_err(arrow_err)?;
+        let input = datafusion::arrow::compute::cast(&input, &DataType::Utf8).map_err(arrow_err)?;
         let input = input.as_any().downcast_ref::<StringArray>().unwrap();
 
         let fmt_arr: Option<ArrayRef> = if nargs == 2 {
@@ -506,8 +507,8 @@ impl ScalarUDFImpl for AssertTrue {
             return exec_err!("assert_true: expected 1 or 2 arguments, got {nargs}");
         }
         let cond = args.args[0].clone().into_array(n)?;
-        let cond = datafusion::arrow::compute::cast(&cond, &DataType::Boolean)
-            .map_err(arrow_err)?;
+        let cond =
+            datafusion::arrow::compute::cast(&cond, &DataType::Boolean).map_err(arrow_err)?;
         let cond = datafusion::arrow::array::cast::as_boolean_array(&cond);
 
         // Optional message column.
@@ -622,8 +623,12 @@ mod tests {
     #[tokio::test]
     async fn hex_integral_string_binary() {
         // integral: two's-complement bigint, uppercase, no leading zeros.
-        assert!(run("SELECT hex(CAST(0 AS BIGINT)) AS x").await.contains("| 0"));
-        assert!(run("SELECT hex(CAST(255 AS BIGINT)) AS x").await.contains("FF"));
+        assert!(run("SELECT hex(CAST(0 AS BIGINT)) AS x")
+            .await
+            .contains("| 0"));
+        assert!(run("SELECT hex(CAST(255 AS BIGINT)) AS x")
+            .await
+            .contains("FF"));
         assert!(run("SELECT hex(CAST(-1 AS BIGINT)) AS x")
             .await
             .contains("FFFFFFFFFFFFFFFF"));
@@ -667,7 +672,9 @@ mod tests {
         // case-insensitive format.
         assert!(!run("SELECT to_binary('abc', 'Hex') AS x").await.is_empty());
         // NULL inputs.
-        assert!(run("SELECT to_binary('abc', NULL) AS x").await.contains("|   |"));
+        assert!(run("SELECT to_binary('abc', NULL) AS x")
+            .await
+            .contains("|   |"));
         assert!(run("SELECT to_binary(CAST(NULL AS STRING), 'utf-8') AS x")
             .await
             .contains("|   |"));
@@ -679,7 +686,9 @@ mod tests {
         assert!(engine.sql("SELECT to_binary('GG')").await.is_err());
         assert!(engine.sql("SELECT to_binary('a', 'base64')").await.is_err());
         // try_to_binary returns NULL instead.
-        assert!(run("SELECT try_to_binary('GG') AS x").await.contains("|   |"));
+        assert!(run("SELECT try_to_binary('GG') AS x")
+            .await
+            .contains("|   |"));
         assert!(run("SELECT try_to_binary('a', 'base64') AS x")
             .await
             .contains("|   |"));
@@ -687,8 +696,12 @@ mod tests {
 
     #[tokio::test]
     async fn current_names() {
-        assert!(run("SELECT current_database() AS x").await.contains("default"));
-        assert!(run("SELECT current_schema() AS x").await.contains("default"));
+        assert!(run("SELECT current_database() AS x")
+            .await
+            .contains("default"));
+        assert!(run("SELECT current_schema() AS x")
+            .await
+            .contains("default"));
         assert!(run("SELECT current_catalog() AS x")
             .await
             .contains("spark_catalog"));
@@ -700,7 +713,10 @@ mod tests {
         assert!(run("SELECT assert_true(true) AS x").await.contains("|   |"));
         let engine = Engine::new();
         assert!(engine.sql("SELECT assert_true(false)").await.is_err());
-        assert!(engine.sql("SELECT assert_true(CAST(NULL AS BOOLEAN))").await.is_err());
+        assert!(engine
+            .sql("SELECT assert_true(CAST(NULL AS BOOLEAN))")
+            .await
+            .is_err());
         // custom message.
         let e = engine
             .sql("SELECT assert_true(false, 'custom error message')")

@@ -58,7 +58,10 @@ impl ClusterSpec {
     /// ready). Stable DNS — no IP interpolation.
     pub fn endpoint(&self) -> String {
         let ns = namespace_name(&self.id);
-        format!("sc://weft-cl-{}.{ns}.svc.cluster.local:{}", self.id, self.port)
+        format!(
+            "sc://weft-cl-{}.{ns}.svc.cluster.local:{}",
+            self.id, self.port
+        )
     }
 }
 

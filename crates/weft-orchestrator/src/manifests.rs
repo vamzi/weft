@@ -280,8 +280,16 @@ fn quota_cpu(spec: &ClusterSpec) -> String {
 
 fn quota_mem(spec: &ClusterSpec) -> String {
     // Keep the unit; multiply the leading integer (e.g. "2Gi" × 3 pods → "6Gi").
-    let digits: String = spec.memory.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let unit: String = spec.memory.chars().skip_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = spec
+        .memory
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let unit: String = spec
+        .memory
+        .chars()
+        .skip_while(|c| c.is_ascii_digit())
+        .collect();
     let n: u32 = digits.parse().unwrap_or(2);
     format!("{}{}", n * (spec.worker_max + 1), unit)
 }
@@ -341,10 +349,16 @@ mod tests {
         for item in &items {
             if let Some(containers) = find_containers(item) {
                 for c in containers {
-                    assert_eq!(c["command"], json!(["weft"]), "container must exec weft via argv");
-                    assert!(c["command"].as_array().unwrap().iter().all(|a| a != "/bin/sh"
-                        && a != "sh"
-                        && a != "bash"));
+                    assert_eq!(
+                        c["command"],
+                        json!(["weft"]),
+                        "container must exec weft via argv"
+                    );
+                    assert!(c["command"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|a| a != "/bin/sh" && a != "sh" && a != "bash"));
                 }
             }
         }
@@ -378,14 +392,18 @@ mod tests {
             }
         }
         // IRSA role flows onto the ServiceAccount.
-        let sa = items.iter().find(|i| i["kind"] == "ServiceAccount").unwrap();
+        let sa = items
+            .iter()
+            .find(|i| i["kind"] == "ServiceAccount")
+            .unwrap();
         assert_eq!(
             sa["metadata"]["annotations"]["eks.amazonaws.com/role-arn"],
             "arn:aws:iam::123:role/weft-cl-c1"
         );
         // Default-deny NetworkPolicy present.
-        assert!(items.iter().any(|i| i["kind"] == "NetworkPolicy"
-            && i["metadata"]["name"] == "default-deny"));
+        assert!(items
+            .iter()
+            .any(|i| i["kind"] == "NetworkPolicy" && i["metadata"]["name"] == "default-deny"));
     }
 
     fn pod_spec(item: &Value) -> Option<&Value> {

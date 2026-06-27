@@ -378,10 +378,7 @@ mod tests {
         let a = Outcome::Err {
             message: "Error during planning: Invalid function 'udaf'.".into(),
         };
-        assert_eq!(
-            classify(&g, &a).bucket,
-            Bucket::RequiresUdfRegistration
-        );
+        assert_eq!(classify(&g, &a).bucket, Bucket::RequiresUdfRegistration);
     }
 
     #[test]

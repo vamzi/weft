@@ -28,12 +28,12 @@
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, plan_datafusion_err, plan_err, DataFusionError, Result};
+use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::type_coercion::other::get_coerce_type_for_case_expression;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use datafusion::logical_expr::expr::Case;
 use datafusion::prelude::SessionContext;
 
 /// Register Spark's `if` into `ctx`.
@@ -84,15 +84,22 @@ impl SparkIf {
         let is_temporal = |t: &DataType| matches!(t, Date32 | Date64 | Timestamp(..));
         let is_decimal = |t: &DataType| matches!(t, Decimal128(..) | Decimal256(..));
         let is_float = |t: &DataType| matches!(t, Float16 | Float32 | Float64);
-        let is_int =
-            |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64);
+        let is_int = |t: &DataType| {
+            matches!(
+                t,
+                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+            )
+        };
         let is_numeric = |t: &DataType| is_int(t) || is_float(t) || is_decimal(t);
         let is_string = |t: &DataType| matches!(t, Utf8 | LargeUtf8 | Utf8View);
         let inexact = |t: &DataType| is_float(t) || is_decimal(t);
 
-        (is_temporal(a) && is_numeric(b)) || (is_numeric(a) && is_temporal(b))
-            || (is_decimal(a) && is_float(b)) || (is_float(a) && is_decimal(b))
-            || (is_string(a) && inexact(b)) || (inexact(a) && is_string(b))
+        (is_temporal(a) && is_numeric(b))
+            || (is_numeric(a) && is_temporal(b))
+            || (is_decimal(a) && is_float(b))
+            || (is_float(a) && is_decimal(b))
+            || (is_string(a) && inexact(b))
+            || (inexact(a) && is_string(b))
     }
 
     /// Error returned (matching Spark's rejection) when the branches can't be unified.
@@ -195,6 +202,9 @@ mod tests {
     async fn if_selects_else() {
         let engine = Engine::new();
         let got = one(&engine, "SELECT if(false, 1, 2) AS x").await;
-        assert!(got.contains('2') && !got.contains('1'), "want 2, got:\n{got}");
+        assert!(
+            got.contains('2') && !got.contains('1'),
+            "want 2, got:\n{got}"
+        );
     }
 }

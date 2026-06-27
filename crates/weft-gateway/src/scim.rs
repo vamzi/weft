@@ -29,13 +29,12 @@ const ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
 
 /// Bearer-token gate for `/scim/*`. 503 if `WEFT_SCIM_TOKEN` is unset (SCIM disabled); 401 if the
 /// `Authorization: Bearer <token>` is absent or doesn't match.
-pub async fn scim_guard(
-    State(st): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn scim_guard(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let Some(expected) = st.scim_token().as_ref().clone() else {
-        return scim_error(StatusCode::SERVICE_UNAVAILABLE, "SCIM provisioning is not enabled");
+        return scim_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SCIM provisioning is not enabled",
+        );
     };
     let presented = req
         .headers()
@@ -178,7 +177,10 @@ pub async fn list_users(State(st): State<AppState>, Query(q): Query<ListQuery>) 
             .filter(|(u, _)| *u == value)
             .map(|(u, g)| user_resource(&u, &g))
             .collect(),
-        _ => all.into_iter().map(|(u, g)| user_resource(&u, &g)).collect(),
+        _ => all
+            .into_iter()
+            .map(|(u, g)| user_resource(&u, &g))
+            .collect(),
     };
     Json(list_response(filtered)).into_response()
 }
@@ -318,7 +320,10 @@ pub async fn list_groups(State(st): State<AppState>, Query(q): Query<ListQuery>)
             .filter(|(n, _)| *n == value)
             .map(|(n, m)| group_resource(&n, &m))
             .collect(),
-        _ => all.into_iter().map(|(n, m)| group_resource(&n, &m)).collect(),
+        _ => all
+            .into_iter()
+            .map(|(n, m)| group_resource(&n, &m))
+            .collect(),
     };
     Json(list_response(filtered)).into_response()
 }
@@ -379,7 +384,7 @@ fn apply_member_op(members: &mut Vec<String>, op: &Value) {
 
     let values_in_op: Vec<String> = op
         .get("value")
-        .map(|v| extract_member_values(v))
+        .map(extract_member_values)
         .unwrap_or_default();
 
     match kind.as_str() {
@@ -402,7 +407,10 @@ fn apply_member_op(members: &mut Vec<String>, op: &Value) {
                 }
             }
             // `remove` on the whole `members` path with no filter clears it.
-            if path == "members" && member_from_remove_path(path).is_none() && op.get("value").is_none() {
+            if path == "members"
+                && member_from_remove_path(path).is_none()
+                && op.get("value").is_none()
+            {
                 members.clear();
             }
         }

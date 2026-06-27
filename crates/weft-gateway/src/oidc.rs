@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::response::{IntoResponse, Redirect, Response};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Json};
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::{
@@ -323,7 +323,10 @@ pub fn extract_identity(
 /// endpoints from discovery and `set_redirect_uri` marks the redirect set, so the result is a fully
 /// usable client — but its concrete type differs from the bare [`CoreClient`] alias, which is why we
 /// let it infer through `impl Trait`-style returns rather than naming it.
-async fn discover_metadata(st: &AppState, cfg: &OidcConfig) -> Result<CoreProviderMetadata, String> {
+async fn discover_metadata(
+    st: &AppState,
+    cfg: &OidcConfig,
+) -> Result<CoreProviderMetadata, String> {
     let cached = { st.oidc_meta().lock().unwrap().clone() };
     if let Some(m) = cached {
         return Ok(m);
@@ -465,7 +468,9 @@ async fn callback_inner(st: &AppState, q: CallbackQuery) -> Result<String, Strin
         .take(&state)
         .ok_or("invalid_state")?;
 
-    let metadata = discover_metadata(st, &cfg).await.map_err(|_| "provider_error")?;
+    let metadata = discover_metadata(st, &cfg)
+        .await
+        .map_err(|_| "provider_error")?;
     let client = oidc_client!(metadata, cfg).map_err(|_| "provider_error")?;
     let http = http_client().map_err(|_| "provider_error")?;
 
@@ -477,8 +482,7 @@ async fn callback_inner(st: &AppState, q: CallbackQuery) -> Result<String, Strin
         .await
         .map_err(|_| "exchange_failed")?;
 
-    let id_token =
-        openidconnect::TokenResponse::id_token(&token_response).ok_or("no_id_token")?;
+    let id_token = openidconnect::TokenResponse::id_token(&token_response).ok_or("no_id_token")?;
     let verifier = client.id_token_verifier();
     // openidconnect performs the security-critical validation here: issuer, audience, nonce, expiry,
     // and the JWKS signature. We bind to the default (empty) additional-claims type for validation,
@@ -488,8 +492,8 @@ async fn callback_inner(st: &AppState, q: CallbackQuery) -> Result<String, Strin
         .claims(&verifier, &Nonce::new(pending.nonce))
         .map_err(|_| "id_token_invalid")?;
     let raw_claims = decode_jwt_payload(&id_token.to_string()).ok_or("id_token_invalid")?;
-    let identity =
-        extract_identity(&raw_claims, &cfg.username_claim, &cfg.groups_claim).ok_or("no_username")?;
+    let identity = extract_identity(&raw_claims, &cfg.username_claim, &cfg.groups_claim)
+        .ok_or("no_username")?;
 
     // Upsert the federated user + groups into the shared store, then persist.
     st.upsert_sso_user(&identity.username, &identity.groups);
@@ -605,9 +609,12 @@ pub async fn put_sso(
     );
 
     // Validate the issuer by actually discovering it (the same path login uses), uncached.
-    discover_uncached(&cfg)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("could not discover OIDC issuer: {e}")))?;
+    discover_uncached(&cfg).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("could not discover OIDC issuer: {e}"),
+        )
+    })?;
 
     // Swap into the live config, invalidate the cached metadata, persist.
     *st.oidc().write().unwrap() = Some(cfg.clone());

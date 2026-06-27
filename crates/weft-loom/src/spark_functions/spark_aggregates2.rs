@@ -100,7 +100,12 @@ impl AggregateUDFImpl for TrySum {
         Ok(vec![
             Field::new(format_state_name(args.name, "sum"), acc_ty, true).into(),
             // `seen_any` (have we observed a non-null) and `overflowed` flags.
-            Field::new(format_state_name(args.name, "seen"), DataType::Boolean, true).into(),
+            Field::new(
+                format_state_name(args.name, "seen"),
+                DataType::Boolean,
+                true,
+            )
+            .into(),
             Field::new(
                 format_state_name(args.name, "overflow"),
                 DataType::Boolean,
@@ -582,7 +587,9 @@ mod tests {
             .filter(|l| l.starts_with('|') && !l.contains('s'))
             .collect();
         assert!(
-            datarow.iter().all(|l| !l.chars().any(|c| c.is_ascii_digit())),
+            datarow
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_ascii_digit())),
             "want NULL, got:\n{got}"
         );
     }
@@ -601,7 +608,9 @@ mod tests {
             .filter(|l| l.starts_with('|') && !l.contains('s'))
             .collect();
         assert!(
-            datarow.iter().all(|l| !l.chars().any(|c| c.is_ascii_digit())),
+            datarow
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_ascii_digit())),
             "want NULL on overflow, got:\n{got}"
         );
     }
@@ -667,7 +676,9 @@ mod tests {
             .filter(|l| l.starts_with('|') && !l.contains('a'))
             .collect();
         assert!(
-            datarow.iter().all(|l| !l.chars().any(|c| c.is_ascii_digit())),
+            datarow
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_ascii_digit())),
             "want NULL, got:\n{got}"
         );
     }
@@ -685,7 +696,9 @@ mod tests {
             .filter(|l| l.starts_with('|') && !l.contains('a'))
             .collect();
         assert!(
-            datarow.iter().all(|l| !l.chars().any(|c| c.is_ascii_digit())),
+            datarow
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_ascii_digit())),
             "want NULL on overflow, got:\n{got}"
         );
     }
@@ -699,7 +712,10 @@ mod tests {
             "SELECT skewness(a) AS s FROM VALUES (1),(1),(2),(2),(3),(3),(3) AS t(a)",
         )
         .await;
-        assert!(got.contains("-0.272380105814572"), "want ~-0.27238, got:\n{got}");
+        assert!(
+            got.contains("-0.272380105814572"),
+            "want ~-0.27238, got:\n{got}"
+        );
     }
 
     #[tokio::test]
@@ -711,7 +727,10 @@ mod tests {
             "SELECT skewness(a) AS s FROM VALUES (1),(2),(3),(4),(5) AS t(a)",
         )
         .await;
-        assert!(got.contains(" 0 ") || got.contains("0.0"), "want 0, got:\n{got}");
+        assert!(
+            got.contains(" 0 ") || got.contains("0.0"),
+            "want 0, got:\n{got}"
+        );
     }
 
     #[tokio::test]
@@ -727,7 +746,9 @@ mod tests {
             .filter(|l| l.starts_with('|') && !l.contains('s'))
             .collect();
         assert!(
-            datarow.iter().all(|l| !l.chars().any(|c| c.is_ascii_digit())),
+            datarow
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_ascii_digit())),
             "want NULL, got:\n{got}"
         );
     }
@@ -745,4 +766,3 @@ mod tests {
         assert!(got.contains("| 1 |"), "missing k=1 row, got:\n{got}");
     }
 }
-

@@ -298,7 +298,7 @@ impl AppState {
             .to_string();
         let nb_uri = format!("{ws_prefix}/notebooks.json");
         let q_uri = format!("{ws_prefix}/queries.json");
-        let st = Self {
+        Self {
             clusters: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(HashMap::new())),
@@ -332,8 +332,7 @@ impl AppState {
                     .ok()
                     .filter(|s| !s.is_empty()),
             ),
-        };
-        st
+        }
     }
 
     // ── SSO / SCIM accessors (let the `oidc`/`scim` modules reach private state) ──
@@ -423,7 +422,11 @@ impl AppState {
     pub(crate) fn save_users(&self) {
         let snapshot: HashMap<String, UserRecord> = self.users.lock().unwrap().clone();
         let body = serde_json::to_string(&snapshot).unwrap_or_default();
-        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "users".into(), body));
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "users".into(),
+            body,
+        ));
     }
 
     /// Persist the group store (DynamoDB key `groups`).
@@ -445,7 +448,11 @@ impl AppState {
             None => StoredOidc::disabled(),
         };
         let body = serde_json::to_string(&stored).unwrap_or_default();
-        tokio::spawn(cloud::ddb_put((*self.ddb_table).clone(), "sso".into(), body));
+        tokio::spawn(cloud::ddb_put(
+            (*self.ddb_table).clone(),
+            "sso".into(),
+            body,
+        ));
     }
 
     // ── SSO / SCIM store mutations (shared by the `oidc` + `scim` modules) ──
@@ -498,14 +505,20 @@ impl AppState {
 
     /// SCIM: the user's groups, or `None` if no such user.
     pub(crate) fn scim_get_user(&self, username: &str) -> Option<Vec<String>> {
-        self.users.lock().unwrap().get(username).map(|u| u.groups.clone())
+        self.users
+            .lock()
+            .unwrap()
+            .get(username)
+            .map(|u| u.groups.clone())
     }
 
     /// SCIM: all users as `(username, groups)`, sorted by username.
     pub(crate) fn scim_list_users(&self) -> Vec<(String, Vec<String>)> {
         let users = self.users.lock().unwrap();
-        let mut out: Vec<(String, Vec<String>)> =
-            users.iter().map(|(u, r)| (u.clone(), r.groups.clone())).collect();
+        let mut out: Vec<(String, Vec<String>)> = users
+            .iter()
+            .map(|(u, r)| (u.clone(), r.groups.clone()))
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -521,7 +534,10 @@ impl AppState {
 
     /// SCIM: create/replace a group's membership (and reflect it into each member's `groups`).
     pub(crate) fn scim_set_group(&self, name: &str, members: Vec<String>) {
-        self.groups.lock().unwrap().insert(name.to_string(), members.clone());
+        self.groups
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), members.clone());
         // Reflect membership into the user records: add for members, remove for non-members.
         let mut users = self.users.lock().unwrap();
         for (uname, rec) in users.iter_mut() {
@@ -804,7 +820,9 @@ pub fn app(state: AppState) -> Router {
         .route("/api/admin/groups", get(list_groups).post(create_group))
         .route(
             "/api/admin/sso",
-            get(oidc::get_sso).put(oidc::put_sso).delete(oidc::delete_sso),
+            get(oidc::get_sso)
+                .put(oidc::put_sso)
+                .delete(oidc::delete_sso),
         )
         .route(
             "/api/grants",
@@ -1132,7 +1150,10 @@ async fn provision_k8s(st: AppState, id: String) {
             // the RUNNING transition on EndpointSlice readiness. The endpoint is stable Service DNS.
             let endpoint = spec.endpoint();
             st.set_state(&id, Phase::Running, Some(endpoint.clone()));
-            st.add_event(&id, format!("Cluster RUNNING — Spark Connect endpoint {endpoint}"));
+            st.add_event(
+                &id,
+                format!("Cluster RUNNING — Spark Connect endpoint {endpoint}"),
+            );
         }
         Err(e) => {
             st.set_state(&id, Phase::Error, None);
@@ -1208,8 +1229,9 @@ async fn provision_ec2(st: AppState, id: String) {
     // Private clusters get no public IP — the in-VPC gateway reaches them by private IP.
     args.push("--associate-public-ip-address".into());
     if cfg.private {
-        args.last_mut()
-            .map(|s| *s = "--no-associate-public-ip-address".into());
+        if let Some(s) = args.last_mut() {
+            *s = "--no-associate-public-ip-address".into();
+        }
     }
 
     let instance_id = match run_aws(&cfg.aws_bin, &args).await {
@@ -1498,7 +1520,10 @@ async fn stop_cluster(
 async fn kill_runtime(st: &AppState, id: &str) {
     if orchestrator_is_k8s() {
         use weft_orchestrator::ClusterBackend;
-        if let Err(e) = weft_orchestrator::K8sBackend::from_env().terminate(id).await {
+        if let Err(e) = weft_orchestrator::K8sBackend::from_env()
+            .terminate(id)
+            .await
+        {
             st.add_event(id, format!("Kubernetes teardown error: {e}"));
         }
     }
@@ -1571,7 +1596,13 @@ fn sql_error(msg: impl Into<String>) -> SqlResponse {
 /// (safe). The input is the translated SQL.
 fn forbidden_construct(sql: &str) -> Option<&'static str> {
     let s = sql.to_ascii_lowercase();
-    for f in ["read_parquet", "read_csv", "read_json", "read_avro", "read_ndjson"] {
+    for f in [
+        "read_parquet",
+        "read_csv",
+        "read_json",
+        "read_avro",
+        "read_ndjson",
+    ] {
         if s.contains(&format!("{f}(")) || s.contains(&format!("{f} (")) {
             return Some("file-scan table functions are not permitted");
         }
@@ -2124,7 +2155,9 @@ fn validate_connection(
                     "region" if is_aws_region(v) => {}
                     "region" => return bad("region"),
                     other => {
-                        return Err(format!("unsupported glue option `{other}` (allowed: region)"))
+                        return Err(format!(
+                            "unsupported glue option `{other}` (allowed: region)"
+                        ))
                     }
                 }
             }
@@ -2381,7 +2414,9 @@ async fn save_notebook(
         }
     }
     st.save_notebooks();
-    Ok(Json(serde_json::json!({ "ok": true, "savedAt": doc.updated_at })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "savedAt": doc.updated_at }),
+    ))
 }
 
 async fn delete_notebook(
@@ -2484,7 +2519,9 @@ async fn save_query(
         }
     }
     st.save_queries();
-    Ok(Json(serde_json::json!({ "ok": true, "savedAt": q.updated_at })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "savedAt": q.updated_at }),
+    ))
 }
 
 async fn delete_query(
@@ -2509,7 +2546,6 @@ async fn delete_query(
         StatusCode::NOT_FOUND
     }
 }
-
 
 /// A column in the catalog browser.
 #[derive(Debug, Serialize)]
@@ -2608,7 +2644,10 @@ async fn get_catalog(State(st): State<AppState>) -> Json<Vec<CatalogNamespace>> 
                     columns,
                 });
             }
-            schemas.push(CatalogSchema { name: db, tables: tbls });
+            schemas.push(CatalogSchema {
+                name: db,
+                tables: tbls,
+            });
         }
         if !schemas.is_empty() {
             out.push(CatalogNamespace {
@@ -2823,7 +2862,9 @@ mod tests {
     /// the governance test has a table in a named (non-default) catalog to authorize. Main's engine
     /// seeds no local data (catalogs come from Glue), so the test sets up exactly what it needs.
     fn seed_governed_table(st: &AppState) {
-        use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider};
+        use datafusion::catalog::{
+            CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+        };
         use datafusion::datasource::MemTable;
         use weft_loom::arrow::array::{Float64Array, StringArray};
         use weft_loom::arrow::datatypes::{DataType, Field, Schema};
@@ -3008,7 +3049,10 @@ mod tests {
         // Without a grant, carol cannot read the governed table (fail-closed).
         let j = run(carol.clone(), "SELECT * FROM main.sales.monthly_revenue").await;
         assert!(
-            j["error"].as_str().unwrap_or("").contains("permission denied"),
+            j["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("permission denied"),
             "expected denial, got {j:?}"
         );
         // File-scan TVFs are blocked for non-admins (can't read raw files with engine creds).
@@ -3036,10 +3080,17 @@ mod tests {
             "SELECT region, sum(revenue) r FROM main.sales.monthly_revenue GROUP BY region",
         )
         .await;
-        assert!(j["error"].is_null(), "expected success after grant, got {j:?}");
+        assert!(
+            j["error"].is_null(),
+            "expected success after grant, got {j:?}"
+        );
 
         // Admin is never blocked (owns the metastore).
-        let j = run(admin.clone(), "SELECT * FROM main.sales.monthly_revenue LIMIT 1").await;
+        let j = run(
+            admin.clone(),
+            "SELECT * FROM main.sales.monthly_revenue LIMIT 1",
+        )
+        .await;
         assert!(j["error"].is_null(), "admin query failed: {j:?}");
     }
 
@@ -3086,7 +3137,9 @@ mod tests {
 
         // IDOR: Bob cannot read Alice's notebook by id (404, not 403 — no existence leak).
         assert_eq!(
-            get(bob.clone(), format!("/api/notebooks/{id}")).await.status(),
+            get(bob.clone(), format!("/api/notebooks/{id}"))
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
         // Bob's listing doesn't include it.
@@ -3197,7 +3250,6 @@ mod tests {
         assert!(j["error"].is_null());
     }
 
-
     #[tokio::test]
     async fn grant_create_and_list() {
         let st = state();
@@ -3286,11 +3338,14 @@ mod tests {
 
     /// Serialize tests that mutate process-global env (`WEFT_SCIM_TOKEN`, OIDC vars) so they don't
     /// race other env-touching tests in this binary.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // `tokio::sync::Mutex` (not `std`) so the guard can be held across the `.oneshot(...).await`
+    // request below without tripping `clippy::await_holding_lock` — these tests must hold the lock
+    // for their whole body to serialize process-global env mutation (`WEFT_SCIM_TOKEN`/OIDC vars).
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn auth_config_reports_sso_disabled_by_default() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var("WEFT_OIDC_ISSUER");
         let st = state();
         let resp = app(st)
@@ -3309,7 +3364,7 @@ mod tests {
 
     #[tokio::test]
     async fn sso_login_503_when_disabled() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var("WEFT_OIDC_ISSUER");
         let st = state();
         let resp = app(st)
@@ -3338,15 +3393,11 @@ mod tests {
 
     #[tokio::test]
     async fn scim_disabled_returns_503() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var("WEFT_SCIM_TOKEN");
         let st = state();
         let resp = app(st)
-            .oneshot(
-                Request::get("/scim/v2/Users")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/scim/v2/Users").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -3354,15 +3405,11 @@ mod tests {
 
     #[tokio::test]
     async fn scim_requires_bearer_token() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         let st = scim_state("scim-secret");
         // No token → 401.
         let resp = app(st.clone())
-            .oneshot(
-                Request::get("/scim/v2/Users")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/scim/v2/Users").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3381,7 +3428,7 @@ mod tests {
 
     #[tokio::test]
     async fn scim_user_provisioning_round_trip() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         let st = scim_state("scim-secret");
         let auth = "Bearer scim-secret";
 
@@ -3469,7 +3516,7 @@ mod tests {
 
     #[tokio::test]
     async fn scim_group_patch_add_member() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         let st = scim_state("scim-secret");
         let auth = "Bearer scim-secret";
 
@@ -3554,7 +3601,7 @@ mod tests {
 
     #[tokio::test]
     async fn sso_config_default_disabled_and_put_bogus_issuer_400() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().await;
         std::env::remove_var("WEFT_OIDC_ISSUER");
         std::env::remove_var("WEFT_PUBLIC_BASE");
         let st = state();
@@ -3575,10 +3622,17 @@ mod tests {
         let j = body_json(resp).await;
         assert_eq!(j["enabled"], false);
         assert_eq!(j["has_secret"], false);
-        assert!(j["callback_url"].as_str().unwrap().ends_with("/api/auth/callback"));
+        assert!(j["callback_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/api/auth/callback"));
 
         let resp = app(st.clone())
-            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(body_json(resp).await["sso_enabled"], false);
@@ -3629,7 +3683,11 @@ mod tests {
         ));
         // Public config reports it enabled.
         let resp = app(st.clone())
-            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(body_json(resp).await["sso_enabled"], true);
@@ -3650,7 +3708,11 @@ mod tests {
         // Now disabled both at the live RwLock and the public config endpoint.
         assert!(st.oidc().read().unwrap().is_none());
         let resp = app(st.clone())
-            .oneshot(Request::get("/api/auth/config").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(body_json(resp).await["sso_enabled"], false);

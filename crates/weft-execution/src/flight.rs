@@ -323,7 +323,7 @@ pub async fn pull_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_loom::arrow::array::Int64Array;
+    use weft_loom::arrow::array::Int32Array;
 
     #[tokio::test]
     async fn distributed_single_stage_roundtrip() {
@@ -347,11 +347,13 @@ mod tests {
         let batches = batches.expect("worker did not become ready / query failed");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
+        // `21 + 21` is Spark `IntegerType` (Int32) — weft types integer literals as Int32 to match
+        // Spark (real PySpark `SELECT 21 + 21` → IntegerType), not DataFusion's native i64.
         let v = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64")
+            .downcast_ref::<Int32Array>()
+            .expect("int32")
             .value(0);
         assert_eq!(v, 42);
     }
