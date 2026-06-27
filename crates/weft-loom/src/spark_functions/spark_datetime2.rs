@@ -562,7 +562,26 @@ impl ScalarUDFImpl for FromUnixtime {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
         let secs = args.args[0].clone().into_array(n)?;
-        let secs = datafusion::arrow::compute::cast(&secs, &DataType::Int64).map_err(arrow_err)?;
+        // Spark ANSI-casts the seconds argument to BIGINT; a non-numeric string ('aa',
+        // '2018-01-01') raises CAST_INVALID_INPUT rather than yielding NULL. A safe
+        // (NULL-on-failure) cast would silently mask that, so a string input uses a strict cast
+        // while numeric inputs keep the infallible safe cast (their behaviour is unchanged).
+        let secs = if matches!(
+            args.arg_fields[0].data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            datafusion::arrow::compute::cast_with_options(
+                &secs,
+                &DataType::Int64,
+                &datafusion::arrow::compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                },
+            )
+            .map_err(arrow_err)?
+        } else {
+            datafusion::arrow::compute::cast(&secs, &DataType::Int64).map_err(arrow_err)?
+        };
         let secs = secs.as_any().downcast_ref::<Int64Array>().unwrap();
 
         // Optional format column.
@@ -720,8 +739,16 @@ impl ScalarUDFImpl for UnixTimestamp {
             }
             match parse_pattern(strs.value(i), fmt) {
                 Some(micros) => out.append_value(micros.div_euclid(1_000_000)),
-                // Non-ANSI Spark: unparseable input -> NULL.
-                None => out.append_null(),
+                // Spark 4.0 ANSI raises on an unparseable non-null input (1-arg:
+                // CANNOT_PARSE_TIMESTAMP; 2-arg fmt mismatch: DATETIME_PATTERN_RECOGNITION)
+                // rather than yielding NULL.
+                None => {
+                    return exec_err!(
+                        "[CANNOT_PARSE_TIMESTAMP] could not parse '{}' for {}",
+                        strs.value(i),
+                        self.name
+                    )
+                }
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -849,11 +876,12 @@ mod tests {
             cell("SELECT to_unix_timestamp('2008-12-25 15:30:00') AS x").await,
             "1230219000"
         );
-        // Unparseable -> NULL (non-ANSI).
-        assert_eq!(
-            cell("SELECT unix_timestamp('not a date') AS x").await,
-            "NULL"
-        );
+        // Spark 4.0 ANSI raises on an unparseable input rather than yielding NULL.
+        let engine = Engine::new();
+        assert!(engine
+            .sql("SELECT unix_timestamp('not a date') AS x")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
