@@ -56,17 +56,13 @@ jobs:
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
 
-  # ClickBench / correctness coverage on small synthetic data. ADVISORY — this job is
-  # `continue-on-error` so it never blocks a PR: the synthetic-ClickBench harness currently fails
-  # 19/43 queries on a pre-existing DataFusion-54-era query/optimizer issue (identical on a clean
-  # `main`, unrelated to engine correctness or Spark parity). See
-  # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md. The real coverage signal is the self-hosted
-  # 14.78 GB ClickBench (bench.yml) plus the Spark parity ratchet below. Drop `continue-on-error`
-  # to restore this as a required gate once the ClickBench harness bug is fixed (43/43).
+  # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
+  # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
+  # they are parsed as identifiers (not string literals) under the Databricks dialect. See
+  # bench/clickbench/COVERAGE_GATE_KNOWN_ISSUES.md for the historical context.
   coverage:
-    name: coverage gates (advisory)
+    name: coverage gates
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
