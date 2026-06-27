@@ -191,7 +191,12 @@ fn render(e: &Expr, agg: &AggMap) -> String {
         Expr::Literal(v, _) => render_literal(v),
         // Spark fully parenthesizes binary operations, including nested ones.
         Expr::BinaryExpr(b) => {
-            format!("({} {} {})", render(&b.left, agg), b.op, render(&b.right, agg))
+            format!(
+                "({} {} {})",
+                render(&b.left, agg),
+                b.op,
+                render(&b.right, agg)
+            )
         }
         // Spark (like Postgres) omits coercion casts from the column name.
         Expr::Cast(c) => render(&c.expr, agg),
@@ -210,7 +215,11 @@ fn render(e: &Expr, agg: &AggMap) -> String {
                 s.push_str(&format!(" {}", render(operand, agg)));
             }
             for (when, then) in &c.when_then_expr {
-                s.push_str(&format!(" WHEN {} THEN {}", render(when, agg), render(then, agg)));
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    render(when, agg),
+                    render(then, agg)
+                ));
             }
             if let Some(els) = &c.else_expr {
                 s.push_str(&format!(" ELSE {}", render(els, agg)));
@@ -279,20 +288,35 @@ fn render_scalar_fn(sf: &ScalarFunction, agg: &AggMap) -> String {
             .join(", ");
         return format!("(IF({args}))");
     }
+    // weft wraps the divisor of a decimal/float `/` or `%` in the internal identity guard
+    // `spark_nonzero_divisor` so a zero divisor raises DIVIDE_BY_ZERO like Spark ANSI. The guard is a
+    // pure pass-through, so it is invisible in the Spark column name — render it as just its argument,
+    // making the enclosing `(left / right)` / `(left % right)` name byte-identical to the unwrapped op.
+    if sf.func.name() == "spark_nonzero_divisor" && sf.args.len() == 1 {
+        return render(&sf.args[0], agg);
+    }
     // weft lowers a Spark literal-zero integral `/` (e.g. `1/0`) to the internal `spark_divide`
     // UDF so the column is statically DOUBLE while still raising DIVIDE_BY_ZERO on an actual zero
     // divisor. Spark names it as the ordinary `(left / right)` division it was written as, so
     // render it that way — the operand coercion casts are stripped by `render`, exactly as for a
     // plain `BinaryExpr` divide.
     if sf.func.name() == "spark_divide" && sf.args.len() == 2 {
-        return format!("({} / {})", render(&sf.args[0], agg), render(&sf.args[1], agg));
+        return format!(
+            "({} / {})",
+            render(&sf.args[0], agg),
+            render(&sf.args[1], agg)
+        );
     }
     // weft lowers an integral `*` with a `bigint` result to the internal `spark_checked_mul` UDF so
     // an Int64 overflow raises ARITHMETIC_OVERFLOW like Spark ANSI. Spark names it as the ordinary
     // `(left * right)` multiply it was written as, so render it that way — the operand coercion casts
     // are stripped by `render`, exactly as for a plain `BinaryExpr` multiply.
     if sf.func.name() == "spark_checked_mul" && sf.args.len() == 2 {
-        return format!("({} * {})", render(&sf.args[0], agg), render(&sf.args[1], agg));
+        return format!(
+            "({} * {})",
+            render(&sf.args[0], agg),
+            render(&sf.args[1], agg)
+        );
     }
     // Spark names `from_json`'s output column with *only* the JSON argument — the schema string and
     // the optional options map are dropped (`JsonToStructs.prettyName`): `from_json({"a":1})`.
@@ -484,4 +508,3 @@ mod tests {
         assert_eq!(render(&expr, &map), "(count(b) * 3)");
     }
 }
-
