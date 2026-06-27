@@ -12,16 +12,16 @@
     "missing-error": 130,
     "missing-relation": 900,
     "nondeterministic": 4,
-    "null-semantics": 69,
-    "ordering": 16,
+    "null-semantics": 63,
+    "ordering": 17,
     "parser-unsupported": 1239,
-    "pass": 2990,
+    "pass": 2999,
     "requires-udf-registration": 87,
-    "schema-only": 2053
+    "schema-only": 2049
   },
   "files_skipped": 63,
   "files_total": 303,
-  "semantic_pass": 7491,
+  "semantic_pass": 7501,
   "spark_version": "v4.0.0",
-  "strict_pass": 2989
+  "strict_pass": 2998
 }
