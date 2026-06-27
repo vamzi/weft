@@ -52,6 +52,16 @@ pub enum Bucket {
     /// can never byte-match a fixed golden and its verdict would otherwise flip run-to-run. Scored
     /// as neither pass nor fail so the parity numbers (and the CI ratchet) stay deterministic.
     Nondeterministic,
+    /// The query calls a function that exists *only* because Spark's Scala `SQLQueryTestSuite`
+    /// registered it before running the file (the `udaf` Scala UDAF, the `default.myDoubleAvg` /
+    /// `udaf1` Hive JVM-class functions, the `udtf` / `UDTF*` Python table functions). These are
+    /// test scaffolding, not SQL a real weft user runs — exactly like the whole-file
+    /// `requires-udf-registration` skip already applied to `inputs/udf/*` (which wrap every column
+    /// in the registered `udf(...)`). weft can never resolve them here, so they are unmeasurable
+    /// and scored as neither pass nor fail (like `Nondeterministic`). This is *not* used for
+    /// `CREATE FUNCTION … RETURN` SQL UDFs (e.g. `sql-udf.sql`'s `foo*`): those are SQL-defined and
+    /// remain a genuine, counted weft feature gap.
+    RequiresUdfRegistration,
 }
 
 impl Bucket {
@@ -85,6 +95,26 @@ pub struct Verdict {
 fn is_nondeterministic(sql: &str) -> bool {
     let lower = sql.to_lowercase();
     ["rand(", "rand ", "random(", "randn(", "uuid(", "shuffle("]
+        .iter()
+        .any(|f| lower.contains(f))
+}
+
+/// Does the query invoke a function that exists only because Spark's Scala `SQLQueryTestSuite`
+/// registers it in the harness before running the file? Such functions are *never* defined by the
+/// SQL the file runs, so weft (a SQL engine, not the JVM test harness) can never resolve them — the
+/// failure is test scaffolding, not a weft SQL-parity gap. The set is closed and audited:
+///
+/// - `udaf(` — the Scala `UDAF` registered for `udaf/*.sql` (never created via SQL in the file).
+/// - `udaf1(` / `mydoubleavg(` — Hive JVM-class functions (`CREATE FUNCTION … AS 'class'`) whose
+///   bodies live in a test JAR (`test.org.apache.spark.sql.MyDoubleAvg`), absent from any weft run.
+/// - `udtf` — the Python `udtf` / `UDTF*` table functions in `udtf/udtf.sql`.
+///
+/// Each token is corpus-verified to appear (as a call) *only* in those fixture files, so this never
+/// matches a real query. Deliberately excluded: `CREATE FUNCTION … RETURN` SQL UDFs (`sql-udf.sql`'s
+/// `foo*`) — those are SQL-defined and a *genuine* weft feature gap that must stay counted.
+fn references_test_registered_udf(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    ["udaf(", "udaf1(", "mydoubleavg(", "udtf"]
         .iter()
         .any(|f| lower.contains(f))
 }
@@ -124,7 +154,14 @@ pub fn classify(golden: &GoldenBlock, actual: &Outcome) -> Verdict {
             let bucket = if looks_like_missing_relation(message) {
                 Bucket::MissingRelation
             } else if looks_like_missing_function(message) {
-                Bucket::FunctionMissing
+                // A "missing function" that is really a Scala/JVM/Python test fixture (udaf, udtf,
+                // myDoubleAvg…) is unmeasurable scaffolding, not a weft gap — file it in the
+                // excluded `requires-udf-registration` bucket instead of inflating function-missing.
+                if references_test_registered_udf(&golden.sql) {
+                    Bucket::RequiresUdfRegistration
+                } else {
+                    Bucket::FunctionMissing
+                }
             } else if looks_like_parse_error(message) {
                 Bucket::ParserUnsupported
             } else if looks_like_unimplemented(message) {
@@ -319,6 +356,44 @@ mod tests {
             message: "Invalid function 'weird': function not found".into(),
         };
         assert_eq!(classify(&g, &a).bucket, Bucket::FunctionMissing);
+    }
+
+    #[test]
+    fn scala_registered_udaf_is_requires_udf_registration() {
+        // `udaf` is a Scala UDAF the test harness registers — not a weft gap.
+        let g = golden("SELECT udaf(b) FROM testData", "struct<x:int>", "3");
+        let a = Outcome::Err {
+            message: "Error during planning: Invalid function 'udaf'.".into(),
+        };
+        assert_eq!(
+            classify(&g, &a).bucket,
+            Bucket::RequiresUdfRegistration
+        );
+    }
+
+    #[test]
+    fn sql_defined_create_function_udf_stays_function_missing() {
+        // `sql-udf.sql`'s `foo*` are SQL-defined via CREATE FUNCTION … RETURN: a real weft gap.
+        let g = golden("SELECT foo1a0()", "struct<x:int>", "1");
+        let a = Outcome::Err {
+            message: "Error during planning: Invalid function 'foo1a0'.".into(),
+        };
+        assert_eq!(classify(&g, &a).bucket, Bucket::FunctionMissing);
+    }
+
+    #[test]
+    fn expected_error_udtf_stays_error_parity() {
+        // A udtf row whose golden *expects* an error must remain a semantic pass (error-parity),
+        // never get re-bucketed into the excluded category.
+        let g = golden(
+            "SELECT * FROM UDTFForwardStateFromAnalyzeWithKwargs(1, 2)",
+            "struct<>",
+            "org.apache.spark.sql.AnalysisException\n{}",
+        );
+        let a = Outcome::Err {
+            message: "Error during planning: table function not found".into(),
+        };
+        assert_eq!(classify(&g, &a).bucket, Bucket::ErrorParity);
     }
 
     #[test]
