@@ -38,15 +38,19 @@ impl GlueCatalog {
         }
     }
 
-    /// Build from a flat options map (`region`, optional `aws_bin`) — the shape used by both the
-    /// gateway connection request and the `spark.sql.catalog.<name>.*` startup config. `region`
-    /// defaults to `us-west-2`.
+    /// Build from a flat options map (`region` only) — the shape used by both the gateway connection
+    /// request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to `us-west-2`.
+    ///
+    /// SECURITY: the AWS CLI path is **never** taken from `options` (which can be attacker-supplied
+    /// via `POST /api/connections`). It is sourced only from the operator-controlled `WEFT_AWS_BIN`
+    /// env var, defaulting to `aws` on `$PATH`. Honoring a request-supplied `aws_bin` here was an
+    /// arbitrary-executable RCE (`Command::new(options["aws_bin"])`) on the gateway host.
     pub fn from_config(name: &str, options: &HashMap<String, String>) -> Self {
         let region = options
             .get("region")
             .cloned()
             .unwrap_or_else(|| "us-west-2".to_string());
-        let aws_bin = options.get("aws_bin").cloned();
+        let aws_bin = std::env::var("WEFT_AWS_BIN").ok();
         Self::new(name, region, aws_bin)
     }
 

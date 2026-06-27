@@ -1,0 +1,17 @@
+# Per-Dockerfile BuildKit ignore. Unlike the connect-server one this KEEPS web/
+# source (the gateway image builds the SPA in a node stage) but drops its
+# node_modules / dist so npm ci runs clean.
+**/target/
+.git/
+**/node_modules/
+web/dist/
+bench/
+site/
+docs/
+deploy/
+python/
+.github/
+scratchpad/
+**/*.parquet
+**/*.tbl
+**/.DS_Store

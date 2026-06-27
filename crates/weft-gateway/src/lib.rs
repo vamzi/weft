@@ -10,6 +10,7 @@
 //! current-principal, and cluster-lifecycle endpoints against an in-memory store today, with
 //! persistence/auth/Spark-Connect-routing layering on top of the same surface.
 
+pub mod authz;
 pub mod cloud;
 pub mod cluster_client;
 pub mod oidc;

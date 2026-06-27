@@ -1,0 +1,49 @@
+Weft control-plane gateway installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Gateway service:
+  {{ include "weft.gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.gateway.service.port }}
+
+Port-forward to reach it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "weft.gateway.fullname" . }} {{ .Values.gateway.service.port }}:{{ .Values.gateway.service.port }}
+  curl http://localhost:{{ .Values.gateway.service.port }}/healthz
+
+{{- if not .Values.gateway.jwt.existingSecret }}
+
+  ====================================================================================
+  ACTION REQUIRED: gateway.jwt.existingSecret is not set.
+  The gateway reads its JWT signing key from Secret "{{ include "weft.gateway.jwtSecretName" . }}"
+  (key "{{ .Values.gateway.jwt.secretKey }}"), which this chart did NOT create. Create it, then
+  restart the Deployment:
+
+    kubectl -n {{ .Release.Namespace }} create secret generic {{ include "weft.gateway.jwtSecretName" . }} \
+      --from-literal={{ .Values.gateway.jwt.secretKey }}="$(openssl rand -hex 32)"
+    kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "weft.gateway.fullname" . }}
+
+  Recommended: reference a pre-created Secret via --set gateway.jwt.existingSecret=<name>.
+  ====================================================================================
+{{- end }}
+
+Security envelope:
+{{- if .Values.rbac.create }}
+  * RBAC: the gateway has a standing grant only over Namespaces (+ namespace bootstrap) and
+    `bind` on ClusterRole "{{ include "weft.clusterManageRoleName" . }}". It has NO get/list/watch
+    on Secrets anywhere. It self-grants per-namespace workload RBAC at cluster-create time.
+{{- else }}
+  * RBAC: rbac.create=false — you are managing the gateway's ClusterRoles/bindings out-of-band.
+{{- end }}
+{{- if .Values.admissionPolicy.enabled }}
+  * Admission: ValidatingAdmissionPolicy "{{ include "weft.fullname" . }}-namespace-prefix" restricts
+    the gateway SA to creating/deleting namespaces prefixed "{{ .Values.admissionPolicy.namespacePrefix }}"
+    (requires Kubernetes >= 1.30). Verify it is recognized:
+      kubectl get validatingadmissionpolicybinding {{ include "weft.fullname" . }}-namespace-prefix
+{{- else }}
+  * Admission: admissionPolicy.enabled=false — the namespace-prefix guard is NOT installed.
+{{- end }}
+
+Per-cluster compute namespaces (weft-cl-<id>) are created by the gateway at runtime, NOT by Helm.
+Inspect the exact, fully-hardened shape the gateway applies:
+
+  helm template {{ .Release.Name }} {{ .Chart.Name }} --set clusterReference.render=true \
+    -s templates/cluster-reference.yaml
+
+or read deploy/helm/weft/examples/cluster-namespace.yaml.
