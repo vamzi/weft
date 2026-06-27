@@ -43,6 +43,10 @@ use regex::Regex;
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(RegexpExtract::new()));
     ctx.register_udf(ScalarUDF::from(RegexpExtractAll::new()));
+    // Shadows DataFusion's builtin `regexp_replace`, whose semantics diverge from Spark on three
+    // counts (no `\\`→`\` unescape, first-match-only, and a `flags` 4th arg where Spark has a
+    // 1-based `position`). `RegexpReplace` reimplements Spark's documented contract faithfully.
+    ctx.register_udf(ScalarUDF::from(RegexpReplace::new()));
     ctx.register_udf(ScalarUDF::from(SubstringIndex::new()));
     ctx.register_udf(ScalarUDF::from(FindInSet::new()));
 }
@@ -59,33 +63,16 @@ fn to_i32_array(cv: &ColumnarValue, n: usize) -> Result<ArrayRef> {
     Ok(datafusion::arrow::compute::cast(&a, &DataType::Int32)?)
 }
 
-/// Collapse the doubled backslashes that Spark's SQL string-literal parser would have already
-/// removed before the function ever saw the pattern. DataFusion's parser keeps a SQL literal
-/// `'\\d+'` as the four chars `\`,`\`,`d`,`+`, whereas Spark hands the regex engine `\`,`d`,`+`.
-/// We mirror Spark by turning every `\\` into a single `\` (a lone trailing `\` is left as-is, so
-/// the regex engine reports it as an invalid pattern, matching Spark's `PATTERN` error).
-fn spark_unescape_pattern(pat: &str) -> String {
-    let bytes = pat.as_bytes();
-    let mut out = String::with_capacity(pat.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-            out.push('\\');
-            i += 2;
-        } else {
-            // Push the full UTF-8 char starting at `i`.
-            let ch = pat[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
 /// Compile a Spark regex, mapping a compile failure onto Spark's `PATTERN` error wording.
+///
+/// The pattern arrives already decoded: Spark unescapes string literals at parse time, which weft
+/// reproduces in `normalize_spark_sql`'s `unescape_spark_string_literals` (so a SQL literal `'\\d+'`
+/// reaches here as `\d+`, exactly what Spark's regex engine sees). A pattern sourced from a column is
+/// runtime data that Spark does *not* unescape, so it is likewise used verbatim. We therefore do
+/// **no** backslash collapsing here: doing it a second time would corrupt a pattern that
+/// legitimately contains an escaped backslash (`\\`, i.e. a literal backslash).
 fn compile_pattern(func: &str, pat: &str) -> Result<Regex> {
-    let unescaped = spark_unescape_pattern(pat);
-    Regex::new(&unescaped).map_err(|_| {
+    Regex::new(pat).map_err(|_| {
         datafusion::common::DataFusionError::Execution(format!(
             "[INVALID_PARAMETER_VALUE.PATTERN] The value of parameter(s) `regexp` in `{func}` is \
              invalid: '{pat}'"
@@ -302,6 +289,109 @@ impl ScalarUDFImpl for RegexpExtractAll {
             builder.append(true);
         }
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// regexp_replace(str, regex, rep [, position])
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegexpReplace {
+    signature: Signature,
+}
+
+impl RegexpReplace {
+    fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(3), TypeSignature::Any(4)],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for RegexpReplace {
+    fn name(&self) -> &str {
+        "regexp_replace"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+    /// Spark's `regexp_replace(str, regex, rep [, position])`:
+    /// - **global** replacement (every non-overlapping match, not just the first — DataFusion's
+    ///   builtin replaces only the first unless a `g` flag is passed);
+    /// - the regex is Spark-unescaped (`\\d` → `\d`) before compiling, mirroring how Spark's SQL
+    ///   literal parser would have unescaped it (weft's `sqlparser` does not);
+    /// - the optional 1-based `position` starts matching at the `position`-th character, leaving the
+    ///   prefix before it untouched (Spark `Matcher.region(position-1, len)` + `appendReplacement`,
+    ///   which preserves text before the region). `position <= 0` is rejected
+    ///   (`DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE`); `position > len` returns the string unchanged;
+    ///   a NULL `str` / `regex` / `rep` / `position` yields NULL.
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        if !(3..=4).contains(&args.args.len()) {
+            return exec_err!("regexp_replace: expected 3 or 4 arguments");
+        }
+        let strs = to_str_array(&args.args[0], n)?;
+        let pats = to_str_array(&args.args[1], n)?;
+        let reps = to_str_array(&args.args[2], n)?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().unwrap();
+        let pats = pats.as_any().downcast_ref::<StringArray>().unwrap();
+        let reps = reps.as_any().downcast_ref::<StringArray>().unwrap();
+        let poss = match args.args.get(3) {
+            Some(a) => Some(to_i32_array(a, n)?),
+            None => None,
+        };
+        let poss = poss
+            .as_ref()
+            .map(|a| a.as_any().downcast_ref::<Int32Array>().unwrap());
+
+        let mut out = StringBuilder::new();
+        for row in 0..n {
+            // Any NULL operand propagates to NULL.
+            if strs.is_null(row) || pats.is_null(row) || reps.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let pos = match poss {
+                Some(a) if a.is_null(row) => {
+                    out.append_null();
+                    continue;
+                }
+                Some(a) => a.value(row),
+                None => 1,
+            };
+            if pos < 1 {
+                return exec_err!(
+                    "[DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE] The value of parameter(s) `position` in \
+                     `regexp_replace` is out of range: expected a value in (0, 2147483647], got {pos}"
+                );
+            }
+            let re = compile_pattern("regexp_replace", pats.value(row))?;
+            let source = strs.value(row);
+            let rep = reps.value(row);
+            let pos0 = (pos - 1) as usize;
+            let chars_len = source.chars().count();
+            let replaced = if pos0 == 0 || pos0 < chars_len {
+                // Keep the prefix before `position` verbatim; replace globally in the suffix.
+                let byte_off = source
+                    .char_indices()
+                    .nth(pos0)
+                    .map(|(b, _)| b)
+                    .unwrap_or_else(|| source.len());
+                let (prefix, suffix) = source.split_at(byte_off);
+                format!("{}{}", prefix, re.replace_all(suffix, rep))
+            } else {
+                source.to_string()
+            };
+            out.append_value(replaced);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -533,6 +623,59 @@ mod tests {
         // Optional group, every other match empty.
         let g = run("SELECT regexp_extract_all('1a 2b 14m', '(\\\\d+)?', 1) AS x").await;
         assert!(g.contains("[1, , , 2, , , 14, , ]"), "{g}");
+    }
+
+    #[tokio::test]
+    async fn regexp_replace_is_global_and_unescapes_pattern() {
+        // Global (both `*thy` matches replaced), and `\\w+thy` is unescaped to `\w+thy`.
+        let g = run("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something') AS x")
+            .await;
+        assert!(g.contains("something, something, and wise"), "{g}");
+    }
+
+    #[tokio::test]
+    async fn regexp_replace_position_keeps_prefix() {
+        // position 2 keeps the leading "h"; position 8 keeps "healthy".
+        assert!(run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', 2) AS x"
+        )
+        .await
+        .contains("hsomething, something, and wise"));
+        assert!(run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', 8) AS x"
+        )
+        .await
+        .contains("healthy, something, and wise"));
+        // position 26 replaces only the final char; position past the end leaves it unchanged.
+        assert!(run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w', 'something', 26) AS x"
+        )
+        .await
+        .contains("healthy, wealthy, and wissomething"));
+        assert!(run(
+            "SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w', 'something', 27) AS x"
+        )
+        .await
+        .contains("healthy, wealthy, and wise"));
+    }
+
+    #[tokio::test]
+    async fn regexp_replace_position_out_of_range_errors_and_null_propagates() {
+        let engine = Engine::new();
+        assert!(engine
+            .sql("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', 0)")
+            .await
+            .is_err());
+        assert!(engine
+            .sql("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w+thy', 'something', -2)")
+            .await
+            .is_err());
+        // NULL position -> NULL output (the pretty-printer renders a null cell as blank, so the
+        // tell is simply that no replacement happened).
+        let g =
+            run("SELECT regexp_replace('healthy, wealthy, and wise', '\\\\w', 'something', null) AS x")
+                .await;
+        assert!(!g.contains("something"), "{g}");
     }
 
     #[tokio::test]
