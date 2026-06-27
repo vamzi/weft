@@ -20,6 +20,7 @@ use datafusion::prelude::SessionContext;
 mod spark_aggregates;
 mod spark_aggregates2;
 mod spark_array;
+mod spark_bitshift;
 // `pub(crate)` so `crate::spark_names` can reuse the cast-alias name list for column naming.
 pub(crate) mod spark_cast_constructors;
 mod spark_convert;
@@ -60,6 +61,7 @@ pub fn register(ctx: &SessionContext) {
     spark_array::register(ctx);
     spark_aggregates::register(ctx);
     spark_aggregates2::register(ctx);
+    spark_bitshift::register(ctx);
 }
 
 /// `typeof(expr)` — Spark returns the *type name* of the argument (e.g. `int`, `string`,
