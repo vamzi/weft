@@ -67,7 +67,13 @@ export interface Cluster {
   runtime: string;
   creator: string;
   createdAt: string;
-  /** `sc://host:port` the user points PySpark at — only set once RUNNING. */
+  /** The weft engine image the cluster's driver + worker pods run. */
+  image: string | null;
+  /** User tags applied to the cluster's pods (cost-allocation / identification). */
+  tags: Record<string, string>;
+  /** Idle minutes before the cluster auto-terminates; null = never. Editable while stopped. */
+  autoTerminateMinutes: number | null;
+  /** `sc://host:port` — internal SQL routing only; not surfaced in the UI. */
   connect_endpoint: string | null;
 }
 
@@ -83,6 +89,8 @@ export interface CreateClusterInput {
   size: ClusterSize;
   minWorkers: number;
   maxWorkers: number;
+  tags?: Record<string, string>;
+  autoTerminateMinutes?: number | null;
 }
 
 export type CatalogKind = "catalog" | "schema" | "table" | "view";
@@ -890,6 +898,10 @@ export const api = {
       worker_min: input.minWorkers,
       worker_max: input.maxWorkers,
       worker_size: input.size,
+      ...(input.tags && Object.keys(input.tags).length > 0 ? { tags: input.tags } : {}),
+      ...(input.autoTerminateMinutes != null
+        ? { auto_terminate_minutes: input.autoTerminateMinutes }
+        : {}),
     });
     return fromGatewayCluster(raw);
   },
@@ -897,6 +909,14 @@ export const api = {
   /** POST /api/clusters/:id/start */
   async startCluster(id: string): Promise<Cluster> {
     const raw = await request<GatewayCluster>("POST", `/api/clusters/${id}/start`);
+    return fromGatewayCluster(raw);
+  },
+
+  /** POST /api/clusters/:id/config — edit auto-terminate (only allowed while stopped). */
+  async updateClusterConfig(id: string, autoTerminateMinutes: number | null): Promise<Cluster> {
+    const raw = await request<GatewayCluster>("POST", `/api/clusters/${id}/config`, {
+      auto_terminate_minutes: autoTerminateMinutes,
+    });
     return fromGatewayCluster(raw);
   },
 
@@ -986,8 +1006,9 @@ export const api = {
    * (namespace → schema → table → columns). Goes through `request()`, which
    * attaches the bearer token.
    */
-  async getCatalog(): Promise<CatalogNamespace[]> {
-    return request("GET", "/api/catalog");
+  async getCatalog(clusterId?: string): Promise<CatalogNamespace[]> {
+    const q = clusterId ? `?cluster=${encodeURIComponent(clusterId)}` : "";
+    return request("GET", `/api/catalog${q}`);
   },
 
   /** GET /api/catalog */
@@ -1355,6 +1376,9 @@ interface GatewayCluster {
   worker_min: number;
   worker_max: number;
   worker_size: string;
+  image?: string | null;
+  tags?: Record<string, string> | null;
+  auto_terminate_minutes?: number | null;
   connect_endpoint?: string | null;
 }
 
@@ -1387,6 +1411,9 @@ function fromGatewayCluster(c: GatewayCluster): Cluster {
     runtime: "weft (Spark Connect)",
     creator: "—",
     createdAt: new Date().toISOString(),
+    image: c.image ?? null,
+    tags: c.tags ?? {},
+    autoTerminateMinutes: c.auto_terminate_minutes ?? null,
     connect_endpoint: c.connect_endpoint ?? null,
   };
 }

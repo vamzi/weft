@@ -93,6 +93,13 @@ export function ClustersPage() {
     setShowForm(false);
   }
 
+  async function onSaveAutoTerminate(id: string, mins: number | null) {
+    await withBusy(id, async () => {
+      const updated = await api.updateClusterConfig(id, mins);
+      setClusters((cs) => cs.map((c) => (c.id === id ? updated : c)));
+    });
+  }
+
   return (
     <Page
       title="Clusters"
@@ -124,6 +131,7 @@ export function ClustersPage() {
               onStart={() => onStart(c.id)}
               onStop={() => onStop(c.id)}
               onDelete={() => onDelete(c.id)}
+              onSaveAutoTerminate={(mins) => onSaveAutoTerminate(c.id, mins)}
             />
           ))}
         </div>
@@ -140,6 +148,7 @@ function ClusterCard({
   onStart,
   onStop,
   onDelete,
+  onSaveAutoTerminate,
 }: {
   cluster: Cluster;
   busy: boolean;
@@ -148,8 +157,15 @@ function ClusterCard({
   onStart: () => void;
   onStop: () => void;
   onDelete: () => void;
+  onSaveAutoTerminate: (mins: number | null) => Promise<void>;
 }) {
   const isRunning = cluster.state === "running";
+  const isStopped = cluster.state === "stopped";
+  const [editTerm, setEditTerm] = useState(false);
+  const [termValue, setTermValue] = useState<string>(
+    cluster.autoTerminateMinutes != null ? String(cluster.autoTerminateMinutes) : "",
+  );
+  const tagEntries = Object.entries(cluster.tags ?? {});
   return (
     <div className="weft-card overflow-hidden">
       <div className="flex flex-wrap items-center gap-4 px-5 py-4">
@@ -191,11 +207,71 @@ function ClusterCard({
             <span>{cluster.runtime}</span>
             <span>by {cluster.creator}</span>
           </div>
-          {isRunning && cluster.connect_endpoint && (
-            <div className="mt-2.5">
-              <EndpointChip endpoint={cluster.connect_endpoint} />
+          {cluster.image && (
+            <div className="mt-2.5 flex items-center gap-2 text-xs text-muted">
+              <span className="shrink-0">image</span>
+              <EndpointChip endpoint={cluster.image} />
             </div>
           )}
+          {tagEntries.length > 0 && (
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-xs text-muted">
+              <span className="shrink-0">tags</span>
+              {tagEntries.map(([k, v]) => (
+                <span key={k} className="rounded-full bg-bg-subtle px-2 py-0.5 font-mono text-[11px]">
+                  {k}={v}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="mt-2.5 flex items-center gap-2 text-xs text-muted">
+            <span className="shrink-0">auto-terminate</span>
+            {editTerm ? (
+              <>
+                <input
+                  type="number"
+                  min={1}
+                  className="weft-input h-7 w-24 text-xs"
+                  placeholder="never"
+                  value={termValue}
+                  onChange={(e) => setTermValue(e.target.value)}
+                />
+                <span>min</span>
+                <button
+                  type="button"
+                  className="text-accent hover:underline"
+                  disabled={busy}
+                  onClick={async () => {
+                    const mins = termValue.trim() === "" ? null : Math.max(1, Number(termValue));
+                    await onSaveAutoTerminate(mins);
+                    setEditTerm(false);
+                  }}
+                >
+                  Save
+                </button>
+                <button type="button" className="hover:underline" onClick={() => setEditTerm(false)}>
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="font-mono">
+                  {cluster.autoTerminateMinutes != null
+                    ? `${cluster.autoTerminateMinutes} min idle`
+                    : "never"}
+                </span>
+                {isStopped && (
+                  <button
+                    type="button"
+                    className="text-accent hover:underline"
+                    onClick={() => setEditTerm(true)}
+                  >
+                    Edit
+                  </button>
+                )}
+                {!isStopped && <span className="text-[11px]">(editable when stopped)</span>}
+              </>
+            )}
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -364,16 +440,30 @@ function CreateClusterForm({
   const [size, setSize] = useState<ClusterSize>("medium");
   const [minWorkers, setMinWorkers] = useState(1);
   const [maxWorkers, setMaxWorkers] = useState(4);
+  const [autoTerminate, setAutoTerminate] = useState<string>("");
+  const [tagRows, setTagRows] = useState<{ key: string; value: string }[]>([
+    { key: "", value: "" },
+  ]);
   const [submitting, setSubmitting] = useState(false);
 
   const valid = name.trim().length > 0 && minWorkers >= 1 && maxWorkers >= minWorkers;
+
+  function setTag(i: number, field: "key" | "value", v: string) {
+    setTagRows((rows) => rows.map((r, idx) => (idx === i ? { ...r, [field]: v } : r)));
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!valid) return;
     setSubmitting(true);
     try {
-      await onSubmit({ name: name.trim(), size, minWorkers, maxWorkers });
+      const tags: Record<string, string> = {};
+      for (const { key, value } of tagRows) {
+        const k = key.trim();
+        if (k) tags[k] = value.trim();
+      }
+      const mins = autoTerminate.trim() === "" ? null : Math.max(1, Number(autoTerminate));
+      await onSubmit({ name: name.trim(), size, minWorkers, maxWorkers, tags, autoTerminateMinutes: mins });
     } finally {
       setSubmitting(false);
     }
@@ -439,6 +529,57 @@ function CreateClusterForm({
               value={maxWorkers}
               onChange={(e) => setMaxWorkers(Math.max(1, Number(e.target.value)))}
             />
+          </div>
+        </div>
+        <div>
+          <label className="weft-label" htmlFor="cl-autoterm">
+            Auto-terminate (idle minutes)
+          </label>
+          <input
+            id="cl-autoterm"
+            type="number"
+            min={1}
+            className="weft-input"
+            placeholder="never"
+            value={autoTerminate}
+            onChange={(e) => setAutoTerminate(e.target.value)}
+          />
+          <p className="mt-1 text-xs text-muted">Leave blank to never auto-terminate.</p>
+        </div>
+        <div className="sm:col-span-2">
+          <label className="weft-label">Tags (applied to cluster pods)</label>
+          <div className="flex flex-col gap-2">
+            {tagRows.map((row, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <input
+                  className="weft-input font-mono text-xs"
+                  placeholder="key (e.g. team)"
+                  value={row.key}
+                  onChange={(e) => setTag(i, "key", e.target.value)}
+                />
+                <input
+                  className="weft-input font-mono text-xs"
+                  placeholder="value (e.g. analytics)"
+                  value={row.value}
+                  onChange={(e) => setTag(i, "value", e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="shrink-0 rounded-weft-sm px-2 py-1 text-xs text-muted hover:bg-bg-subtle"
+                  onClick={() => setTagRows((rows) => rows.filter((_, idx) => idx !== i))}
+                  aria-label="Remove tag"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="self-start text-xs text-accent hover:underline"
+              onClick={() => setTagRows((rows) => [...rows, { key: "", value: "" }])}
+            >
+              + Add tag
+            </button>
           </div>
         </div>
       </div>

@@ -44,8 +44,27 @@ RUN cargo build --release --locked -p weft-cli --bin weft \
 # in-cluster via fsGroup). /tmp already exists in the distroless base.
 RUN install -d -o 65532 -g 65532 /rootfs/var/lib/weft/spill
 
-# ---- runtime: distroless cc (glibc + libgcc; zstd/ring are linked in) ---------
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+# ---- awscli: the engine resolves Glue (and HMS) catalogs by shelling out to `aws`
+# (weft-catalog-glue). Bundle it so a *cluster* can list/read the catalog itself —
+# arch-correct via TARGETARCH (don't default it; that pinned amd64 on arm64 builds).
+FROM debian:bookworm-slim AS awscli
+ARG TARGETARCH
+RUN set -eux; \
+    apt-get update; apt-get install -y --no-install-recommends curl unzip ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "${TARGETARCH}" in amd64) A=x86_64 ;; arm64) A=aarch64 ;; *) echo "bad arch ${TARGETARCH}"; exit 1 ;; esac; \
+    curl -fsSLo /tmp/awscli.zip "https://awscli.amazonaws.com/awscli-exe-linux-${A}.zip"; \
+    unzip -q /tmp/awscli.zip -d /tmp; \
+    /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin; \
+    /usr/local/bin/aws --version
+
+# ---- runtime: debian-slim (the AWS CLI v2 bundle needs libs distroless omits) ---
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd -g 65532 nonroot \
+ && useradd -u 65532 -g 65532 -m -d /home/nonroot -s /usr/sbin/nologin nonroot
 
 LABEL org.opencontainers.image.title="weft-connect-server" \
       org.opencontainers.image.description="Weft Spark Connect server (per-user cluster driver)" \
@@ -67,9 +86,11 @@ USER 65532:65532
 ENV TMPDIR=/tmp \
     HOME=/tmp \
     WEFT_SPILL_DIR=/var/lib/weft/spill \
+    WEFT_AWS_BIN=/usr/local/aws-cli/v2/current/bin/aws \
     RUST_BACKTRACE=1
 
 COPY --from=builder /build/target/release/weft /usr/local/bin/weft
+COPY --from=awscli /usr/local/aws-cli /usr/local/aws-cli
 COPY --from=builder --chown=65532:65532 /rootfs/var/lib/weft/spill /var/lib/weft/spill
 
 # Default command; the orchestrator overrides command/args per cluster but keeps
