@@ -14,7 +14,7 @@
 //! The strategy: tie Sail on the ~33 cheap queries (DataFusion parity), beat it 1.5–2× on
 //! the ~10 expensive ones. Winning those *is* winning the total.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -1462,6 +1462,11 @@ pub struct Engine {
     /// and reject the offending persistent view to keep error-parity with Spark. A name is removed
     /// when a later persistent view re-uses it (DataFusion's single namespace would shadow it).
     temp_views: Mutex<HashSet<String>>,
+    /// The external [`weft_catalog::CatalogProvider`]s registered via [`Engine::register_catalog`],
+    /// keyed by their registered name. Held alongside the DataFusion bridge so the engine can answer
+    /// `SHOW DATABASES`/`SHOW TABLES IN …` authoritatively (the bridge only exposes a best-effort,
+    /// already-materialized listing). See the SHOW interception in [`Engine::sql`].
+    weft_catalogs: Mutex<HashMap<String, Arc<dyn weft_catalog::CatalogProvider>>>,
 }
 
 impl Engine {
@@ -1563,6 +1568,7 @@ impl Engine {
             ctx: Arc::new(ctx),
             warehouse,
             temp_views: Mutex::new(HashSet::new()),
+            weft_catalogs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1571,6 +1577,15 @@ impl Engine {
     /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
     /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        // Catalog-listing statements (`SHOW DATABASES`/`SHOW SCHEMAS`[ IN <cat>],
+        // `SHOW TABLES IN <cat>[.<db>]`) are served straight from the registered weft catalogs —
+        // DataFusion's parser rejects most of these shapes and its bridge can only see
+        // already-materialized listings, so we answer them here before any planning. `parse_show`
+        // returns `None` for anything that isn't one of these forms, leaving every other statement
+        // (including bare `SHOW TABLES`) to flow through unchanged.
+        if let Some(show) = parse_show(query) {
+            return self.run_show(&show).await;
+        }
         // SPARK-29628 (`INVALID_TEMP_OBJ_REFERENCE`): a *persistent* `CREATE VIEW` may not reference
         // a session-temporary view. DataFusion has no temp/permanent distinction (we strip the
         // `TEMPORARY` keyword in `normalize_spark_sql` so it plans), so it would silently accept the
@@ -1918,11 +1933,112 @@ impl Engine {
     /// `SELECT … FROM {name}.namespace.table` (and `spark.read.table("{name}.ns.t")`) resolve
     /// **lazily** — the catalog is hit only when a query first references one of its tables.
     pub fn register_catalog(&self, name: &str, provider: Arc<dyn weft_catalog::CatalogProvider>) {
+        // Keep the raw weft provider so the engine can answer catalog-listing SQL (`SHOW DATABASES`,
+        // `SHOW TABLES IN …`) authoritatively — the DataFusion bridge below only surfaces a
+        // best-effort, already-materialized snapshot.
+        self.weft_catalogs
+            .lock()
+            .expect("weft_catalogs poisoned")
+            .insert(name.to_string(), provider.clone());
         let bridge = Arc::new(catalog_bridge::WeftCatalogProvider::new(
             provider,
             self.ctx.clone(),
         ));
         self.ctx.register_catalog(name, bridge);
+    }
+
+    /// Serve a parsed catalog-listing statement directly from the registered weft catalogs.
+    ///
+    /// The output column names are load-bearing — a downstream gateway parser keys off them:
+    /// - `SHOW DATABASES`/`SHOW SCHEMAS`[ `IN <cat>`] → one `namespace` (Utf8) column;
+    /// - `SHOW TABLES IN <cat>[.<db>]` → three columns `namespace` (Utf8), `tableName` (Utf8),
+    ///   `isTemporary` (Boolean, always false), matching Spark.
+    ///
+    /// An unknown catalog yields an empty (0-row) result of the right shape rather than an error.
+    async fn run_show(&self, show: &ShowStmt) -> Result<Vec<RecordBatch>> {
+        match show {
+            ShowStmt::Databases { catalog: None } => {
+                // Union of every registered catalog's top-level namespaces.
+                let cats: Vec<Arc<dyn weft_catalog::CatalogProvider>> = self
+                    .weft_catalogs
+                    .lock()
+                    .expect("weft_catalogs poisoned")
+                    .values()
+                    .cloned()
+                    .collect();
+                let mut namespaces = Vec::new();
+                for cat in cats {
+                    let nss = cat
+                        .list_namespaces(&[])
+                        .await
+                        .map_err(|e| Error::Execution(e.to_string()))?;
+                    for ns in nss {
+                        namespaces.push(ns.join("."));
+                    }
+                }
+                Ok(vec![namespace_batch(namespaces)?])
+            }
+            ShowStmt::Databases { catalog: Some(cat) } => {
+                let provider = self.weft_catalog(cat);
+                let namespaces = match provider {
+                    Some(p) => p
+                        .list_namespaces(&[])
+                        .await
+                        .map_err(|e| Error::Execution(e.to_string()))?
+                        .into_iter()
+                        .map(|ns| ns.join("."))
+                        .collect(),
+                    // Unknown catalog → empty result, not an error.
+                    None => Vec::new(),
+                };
+                Ok(vec![namespace_batch(namespaces)?])
+            }
+            ShowStmt::Tables { catalog, database } => {
+                let provider = self.weft_catalog(catalog);
+                let mut rows: Vec<(String, String)> = Vec::new();
+                if let Some(p) = provider {
+                    match database {
+                        // `SHOW TABLES IN <cat>.<db>` — tables directly in that namespace.
+                        Some(db) => {
+                            let tables = p
+                                .list_tables(std::slice::from_ref(db))
+                                .await
+                                .map_err(|e| Error::Execution(e.to_string()))?;
+                            for t in tables {
+                                rows.push((db.clone(), t));
+                            }
+                        }
+                        // `SHOW TABLES IN <cat>` — union across the catalog's top-level namespaces.
+                        None => {
+                            let nss = p
+                                .list_namespaces(&[])
+                                .await
+                                .map_err(|e| Error::Execution(e.to_string()))?;
+                            for ns in nss {
+                                let tables = p
+                                    .list_tables(&ns)
+                                    .await
+                                    .map_err(|e| Error::Execution(e.to_string()))?;
+                                let ns_label = ns.join(".");
+                                for t in tables {
+                                    rows.push((ns_label.clone(), t));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(vec![tables_batch(rows)?])
+            }
+        }
+    }
+
+    /// Look up a registered weft catalog by name (case-sensitive, as registered).
+    fn weft_catalog(&self, name: &str) -> Option<Arc<dyn weft_catalog::CatalogProvider>> {
+        self.weft_catalogs
+            .lock()
+            .expect("weft_catalogs poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Access the underlying DataFusion context (e.g. to register tables/Parquet).
@@ -1959,6 +2075,113 @@ impl Engine {
             .default_catalog
             .clone()
     }
+}
+
+/// A parsed catalog-listing statement (see [`parse_show`]).
+#[derive(Debug, PartialEq, Eq)]
+enum ShowStmt {
+    /// `SHOW DATABASES`/`SHOW SCHEMAS`, optionally `IN <catalog>`.
+    Databases { catalog: Option<String> },
+    /// `SHOW TABLES IN <catalog>[.<database>]`.
+    Tables {
+        catalog: String,
+        database: Option<String>,
+    },
+}
+
+/// Recognize the catalog-listing `SHOW` statements weft answers itself, returning `None` for
+/// anything else (so it flows through normal planning untouched). Tolerant by design: keywords are
+/// case-insensitive, identifiers may be backtick-quoted or bare, a trailing `;` and extra
+/// whitespace are ignored. Deliberately does NOT match bare `SHOW TABLES` (no `IN`) — that has no
+/// unambiguous cross-catalog meaning and is left to the normal path.
+fn parse_show(query: &str) -> Option<ShowStmt> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("show") {
+        return None;
+    }
+    let kind = words.next()?;
+    let rest: Vec<&str> = words.collect();
+    if kind.eq_ignore_ascii_case("databases") || kind.eq_ignore_ascii_case("schemas") {
+        match rest.as_slice() {
+            [] => Some(ShowStmt::Databases { catalog: None }),
+            [in_kw, name] if in_kw.eq_ignore_ascii_case("in") => {
+                // `SHOW DATABASES IN <cat>` — take the first segment as the catalog name.
+                let segs = parse_qualified_name(name);
+                segs.into_iter().next().map(|catalog| ShowStmt::Databases {
+                    catalog: Some(catalog),
+                })
+            }
+            _ => None,
+        }
+    } else if kind.eq_ignore_ascii_case("tables") {
+        match rest.as_slice() {
+            [in_kw, name] if in_kw.eq_ignore_ascii_case("in") => {
+                let mut segs = parse_qualified_name(name).into_iter();
+                let catalog = segs.next()?;
+                let database = segs.next();
+                Some(ShowStmt::Tables { catalog, database })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Split a (possibly backtick-quoted) dotted identifier like `glue.clickbench` or
+/// `` `glue`.`my db` `` into its segments, stripping the backtick quoting.
+fn parse_qualified_name(name: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in name.chars() {
+        match ch {
+            '`' => in_quote = !in_quote,
+            '.' if !in_quote => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    segments.push(current);
+    segments.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// Single-column `namespace` (Utf8) batch for the `SHOW DATABASES`/`SHOW SCHEMAS` forms.
+fn namespace_batch(namespaces: Vec<String>) -> Result<RecordBatch> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "namespace",
+        DataType::Utf8,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(namespaces))])
+        .map_err(|e| Error::Execution(e.to_string()))
+}
+
+/// Three-column `namespace`/`tableName`/`isTemporary` batch matching Spark's `SHOW TABLES`.
+fn tables_batch(rows: Vec<(String, String)>) -> Result<RecordBatch> {
+    use arrow::array::{BooleanArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("namespace", DataType::Utf8, false),
+        Field::new("tableName", DataType::Utf8, false),
+        Field::new("isTemporary", DataType::Boolean, false),
+    ]));
+    let namespaces: Vec<String> = rows.iter().map(|(ns, _)| ns.clone()).collect();
+    let names: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
+    let temp: Vec<bool> = vec![false; rows.len()];
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(namespaces)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(BooleanArray::from(temp)),
+        ],
+    )
+    .map_err(|e| Error::Execution(e.to_string()))
 }
 
 /// Build a DataFusion [`ListingTable`] over `urls` — the one place the Parquet/Delta/Iceberg

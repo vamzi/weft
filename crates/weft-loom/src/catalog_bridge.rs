@@ -413,6 +413,77 @@ mod tests {
         assert!(format!("{err}").to_lowercase().contains("not"));
     }
 
+    #[tokio::test]
+    async fn show_databases_in_catalog_lists_namespaces() {
+        use datafusion::arrow::array::{Array, StringArray};
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: "file:///nonexistent".to_string(),
+            }),
+        );
+        let batches = engine.sql("SHOW DATABASES IN fake").await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "namespace");
+        let ns = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..ns.len()).map(|i| ns.value(i)).collect();
+        assert_eq!(got, vec!["ns"]);
+    }
+
+    #[tokio::test]
+    async fn show_tables_in_namespace_lists_tables() {
+        use datafusion::arrow::array::{Array, StringArray};
+        use datafusion::arrow::datatypes::DataType;
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: "file:///nonexistent".to_string(),
+            }),
+        );
+        let batches = engine.sql("SHOW TABLES IN fake.ns").await.unwrap();
+        assert_eq!(batches.len(), 1);
+        // Exact 3-column Spark schema, names + types.
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "namespace");
+        assert_eq!(schema.field(1).name(), "tableName");
+        assert_eq!(schema.field(2).name(), "isTemporary");
+        assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert_eq!(got, vec!["orders"]);
+    }
+
+    #[tokio::test]
+    async fn show_databases_includes_registered_catalog() {
+        use datafusion::arrow::array::{Array, StringArray};
+        let engine = crate::Engine::new();
+        engine.register_catalog(
+            "fake",
+            Arc::new(FakeCatalog {
+                location: "file:///nonexistent".to_string(),
+            }),
+        );
+        let batches = engine.sql("SHOW DATABASES").await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "namespace");
+        let ns = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..ns.len()).map(|i| ns.value(i)).collect();
+        assert!(got.contains(&"ns"), "expected `ns` in {got:?}");
+    }
+
     /// A fake catalog whose single table `mixed` lives at a fixed location with an *optionally*
     /// declared schema — the lever the coercion test flips.
     struct SchemaCatalog {
