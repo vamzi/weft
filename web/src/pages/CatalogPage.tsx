@@ -10,6 +10,7 @@ import {
   api,
   type CatalogNamespace,
   type CatalogTable,
+  type Cluster,
   type Connection,
   type ConnectionKind,
   type ConnectionOptions,
@@ -27,10 +28,69 @@ export function CatalogPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [showConnect, setShowConnect] = useState(false);
+  // The catalog is ALWAYS browsed THROUGH a cluster — its engine resolves it (required for an
+  // external HMS reachable only from the cluster). Defaults to a running cluster, else the first
+  // available one (which is auto-started below). Swappable via the picker.
+  const [clusterId, setClusterId] = useState<string>("");
+  const [clusters, setClusters] = useState<Cluster[]>([]);
+  const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    void api
+      .listClusters()
+      .then((cs) => {
+        setClusters(cs);
+        // Prefer a running cluster; otherwise pick the first one so it can be auto-started.
+        setClusterId(
+          (cur) => cur || cs.find((c) => c.state === "running")?.id || cs[0]?.id || "",
+        );
+      })
+      .catch(() => setClusters([]));
+  }, []);
+
+  const selectedState = clusters.find((c) => c.id === clusterId)?.state;
+
+  // Auto-start the selected cluster if it's stopped — the catalog can only resolve through a
+  // running engine. Polls until it reports RUNNING, then reloadCatalog (below) refires.
+  useEffect(() => {
+    if (!clusterId || starting) return;
+    if (selectedState !== "stopped" && selectedState !== "error") return;
+    setStarting(true);
+    let cancelled = false;
+    void (async () => {
+      try {
+        await api.startCluster(clusterId);
+        for (let i = 0; i < 80 && !cancelled; i++) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const cs = await api.listClusters();
+          if (cancelled) return;
+          setClusters(cs);
+          const cur = cs.find((c) => c.id === clusterId);
+          if (cur?.state === "running") break;
+          if (cur?.state === "error") {
+            setError(`Cluster ${clusterId} failed to start.`);
+            break;
+          }
+        }
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Failed to start cluster");
+      } finally {
+        if (!cancelled) setStarting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [clusterId, selectedState, starting]);
 
   const reloadCatalog = useCallback(async () => {
+    if (!clusterId || selectedState !== "running") {
+      // Catalog only resolves through a RUNNING cluster (a stopped one is auto-started above).
+      setCatalog(null);
+      return;
+    }
     try {
-      const cat = await api.getCatalog();
+      const cat = await api.getCatalog(clusterId);
       setCatalog(cat);
       setError(null);
       // Open the first catalog + its first schema by default.
@@ -46,7 +106,7 @@ export function CatalogPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load catalog");
     }
-  }, []);
+  }, [clusterId, selectedState]);
 
   useEffect(() => {
     void reloadCatalog();
@@ -137,10 +197,30 @@ export function CatalogPage() {
       title="Catalog"
       subtitle="Browse governed catalogs, schemas, and tables."
       actions={
-        <button type="button" className="weft-btn-ghost" onClick={() => setShowConnect(true)}>
-          <PlugIcon width={15} height={15} />
-          Connections
-        </button>
+        <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1.5 text-xs text-muted">
+            <DatabaseIcon width={14} height={14} />
+            cluster
+            <select
+              className="weft-input text-xs"
+              value={clusterId}
+              onChange={(e) => setClusterId(e.target.value)}
+              title="Browse the catalog through this cluster's engine"
+            >
+              {clusters.length === 0 && <option value="">No clusters</option>}
+              {clusters.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.id})
+                  {c.state !== "running" ? ` — ${c.state}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button type="button" className="weft-btn-ghost" onClick={() => setShowConnect(true)}>
+            <PlugIcon width={15} height={15} />
+            Connections
+          </button>
+        </div>
       }
     >
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_1fr]">
@@ -148,6 +228,14 @@ export function CatalogPage() {
           {error ? (
             <p className="px-2 py-3 text-sm" style={{ color: "var(--weft-danger)" }}>
               {error}
+            </p>
+          ) : !clusterId ? (
+            <p className="px-2 py-3 text-sm text-muted">
+              No cluster available. Create a cluster to browse the catalog.
+            </p>
+          ) : starting || (selectedState && selectedState !== "running") ? (
+            <p className="px-2 py-3 text-sm text-muted">
+              Starting cluster {clusterId}… the catalog loads once it's running.
             </p>
           ) : catalog === null ? (
             <p className="px-2 py-3 text-sm text-muted">Loading catalog…</p>
