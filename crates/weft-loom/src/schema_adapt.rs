@@ -36,7 +36,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::compute::can_cast_types;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::metadata::FieldMetadata;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{exec_err, Result as DfResult, ScalarValue};
@@ -146,6 +146,23 @@ impl CaseInsensitiveExprAdapter {
         if logical_field.data_type() != physical_field.data_type()
             && !can_cast_types(physical_field.data_type(), logical_field.data_type())
         {
+            // Arrow has no *direct* cast for this pair, but an integer source can often reach the
+            // target through an `Int32`/`Int64` bridge. The motivating case is ClickBench's
+            // `EventDate`, stored in Parquet as `UInt16` (days since the epoch) yet declared `DATE`
+            // (`Date32`) in Glue: arrow rejects `UInt16`->`Date32` outright, but `UInt16`->`Int32`
+            // and `Int32`->`Date32` both exist and compose to the correct day count. We only bridge
+            // integer sources, so string/float->date (which arrow casts directly, or rejects with a
+            // clear error) keep their existing behavior.
+            if let Some(bridge) =
+                integer_cast_bridge(physical_field.data_type(), logical_field.data_type())
+            {
+                let mid: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(file_column, bridge, None));
+                return Ok(Transformed::yes(Arc::new(CastExpr::new_with_target_field(
+                    mid,
+                    Arc::new(logical_field.clone()),
+                    None,
+                ))));
+            }
             return exec_err!(
                 "Cannot cast column '{}' from '{}' (file) to '{}' (table)",
                 column.name(),
@@ -159,6 +176,30 @@ impl CaseInsensitiveExprAdapter {
             None,
         ))))
     }
+}
+
+/// When `from`->`to` has no direct arrow cast, find an `Int32`/`Int64` bridge type `b` such that
+/// `from`->`b`->`to` are both castable — but only for **integer** sources. This rescues integer
+/// columns declared as a temporal type (e.g. `UInt16` days -> `Date32`) without affecting the
+/// string/float cases arrow already handles (or rejects) directly.
+fn integer_cast_bridge(from: &DataType, to: &DataType) -> Option<DataType> {
+    let is_integer = matches!(
+        from,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    );
+    if !is_integer {
+        return None;
+    }
+    [DataType::Int32, DataType::Int64]
+        .into_iter()
+        .find(|bridge| can_cast_types(from, bridge) && can_cast_types(bridge, to))
 }
 
 #[cfg(test)]
@@ -215,6 +256,40 @@ mod tests {
         let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("absent", 0));
         let out = rewrite(logical, physical, col).unwrap();
         assert!(out.downcast_ref::<Literal>().is_some());
+    }
+
+    #[test]
+    fn uint16_file_to_date32_table_bridges_through_int32() {
+        // ClickBench `EventDate`: Parquet `UInt16` (days) declared `DATE` (`Date32`) in Glue.
+        // Arrow has no direct `UInt16`->`Date32` cast, so we must bridge `UInt16`->`Int32`->`Date32`.
+        let logical = Schema::new(vec![field("eventdate", DataType::Date32)]);
+        let physical = Schema::new(vec![field("eventdate", DataType::UInt16)]);
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("eventdate", 0));
+        let out = rewrite(logical, physical, col).expect("bridged cast, not an error");
+        // Outer cast targets Date32...
+        let outer = out
+            .downcast_ref::<CastExpr>()
+            .expect("outer cast to Date32");
+        assert_eq!(outer.cast_type(), &DataType::Date32);
+        // ...over an inner Int32 cast of the file column.
+        let inner = outer
+            .expr()
+            .downcast_ref::<CastExpr>()
+            .expect("inner Int32 bridge cast");
+        assert_eq!(inner.cast_type(), &DataType::Int32);
+        let leaf = inner.expr().downcast_ref::<Column>().expect("file column");
+        assert_eq!(leaf.name(), "eventdate");
+    }
+
+    #[test]
+    fn integer_cast_bridge_rejects_non_integer_source() {
+        // A non-integer source with no direct cast must NOT be bridged (no Float64->Date32 here).
+        assert!(integer_cast_bridge(&DataType::Float64, &DataType::Date32).is_none());
+        // Integer source reaches Date32 via Int32.
+        assert_eq!(
+            integer_cast_bridge(&DataType::UInt16, &DataType::Date32),
+            Some(DataType::Int32)
+        );
     }
 
     #[test]
