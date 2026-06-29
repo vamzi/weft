@@ -1661,6 +1661,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Run a SQL string and return a *streaming* cursor over the result batches, instead of
+    /// collecting them all into memory. The Spark Connect server uses this so a large result
+    /// (`SELECT *` over a big table) is sent batch-by-batch and never fully materialized in the
+    /// driver — collecting it would OOM the driver pod.
+    pub async fn sql_stream(
+        &self,
+        query: &str,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let query = normalize_spark_sql(query);
+        let df = self
+            .ctx
+            .sql(query.as_ref())
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?;
+        df.execute_stream()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
     /// Resolve the result schema of `query` without executing it — the logical-plan schema.
     /// Used by Spark Connect `AnalyzePlan(Schema)` (PySpark `df.schema` / `printSchema`).
     pub async fn schema(&self, query: &str) -> Result<arrow::datatypes::SchemaRef> {
@@ -1832,6 +1851,22 @@ impl Engine {
             .await
             .map_err(|e| Error::Plan(e.to_string()))?
             .collect()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Execute a DataFusion logical plan as a *streaming* cursor over the result batches — the
+    /// streaming counterpart of [`Self::execute_logical_plan`] used by the Spark Connect server so
+    /// a lowered DataFrame plan with a large result is streamed, not fully buffered in the driver.
+    pub async fn execute_logical_plan_stream(
+        &self,
+        plan: datafusion::logical_expr::LogicalPlan,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        self.ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?
+            .execute_stream()
             .await
             .map_err(|e| Error::Execution(e.to_string()))
     }

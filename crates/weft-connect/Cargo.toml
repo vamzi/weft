@@ -25,6 +25,7 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tokio-stream = "0.1"
+async-stream = "0.3"  # lazily stream Arrow result batches to the client without buffering the whole result
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

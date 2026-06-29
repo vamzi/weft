@@ -210,6 +210,118 @@ impl WeftService {
         Ok(responses)
     }
 
+    /// If `rel` is a large-result relation — a SQL query or a lowered DataFrame plan — execute it as
+    /// a *stream* and return a lazily-encoded gRPC response stream, so the driver emits Arrow batches
+    /// as they are produced and never holds the whole result set in memory (a big `SELECT *` would
+    /// otherwise OOM the driver, which is exactly the failure the embedded engine avoids by
+    /// streaming). Returns `Ok(None)` for the bounded relations (`ShowString` / `Catalog` /
+    /// `LocalRelation`), which the caller collects as before.
+    async fn stream_relation_response(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        rel: &sc::Relation,
+    ) -> std::result::Result<Option<RespStream>, Status> {
+        let stream = match rel.rel_type.as_ref() {
+            // Bounded result shapes keep the simple collected path.
+            Some(sc::relation::RelType::ShowString(_))
+            | Some(sc::relation::RelType::Catalog(_))
+            | Some(sc::relation::RelType::LocalRelation(_)) => return Ok(None),
+            Some(sc::relation::RelType::Sql(sql)) => self
+                .engine
+                .sql_stream(&sql.query)
+                .await
+                .map_err(err_to_status)?,
+            // Project/Filter/Aggregate/Join/… — the DataFrame API lowers to a logical plan.
+            _ => {
+                let plan = translate::to_plan(self.engine.ctx(), rel).await?;
+                self.engine
+                    .execute_logical_plan_stream(plan)
+                    .await
+                    .map_err(err_to_status)?
+            }
+        };
+        Ok(Some(self.encode_stream(session_id, operation_id, stream)))
+    }
+
+    /// Encode a DataFusion record-batch stream into a lazy stream of row-chunked `ArrowBatch`
+    /// responses followed by a terminal `ResultComplete` carrying the schema. Unsigned columns are
+    /// cast to signed (Spark has no unsigned types); a zero-row result still emits exactly one empty
+    /// `ArrowBatch` so PySpark's `collect()` always receives a batch. Because it is lazy, the driver
+    /// only holds one batch at a time and stops early if the client disconnects (backpressure).
+    fn encode_stream(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        mut batches: datafusion::physical_plan::SendableRecordBatchStream,
+    ) -> RespStream {
+        use tokio_stream::StreamExt as _;
+        let server_session_id = self.server_session_id.clone();
+        let session_id = session_id.to_string();
+        let operation_id = operation_id.to_string();
+        let schema = signed_schema(batches.schema().as_ref());
+        let stream = async_stream::try_stream! {
+            let mut any_rows = false;
+            while let Some(batch) = batches.next().await {
+                let batch = batch.map_err(|e| Status::internal(format!("execute: {e}")))?;
+                let batch = signed_columns(batch)?;
+                let n = batch.num_rows();
+                let mut off = 0;
+                loop {
+                    let len = (n - off).min(CHUNK_ROWS);
+                    let slice = batch.slice(off, len);
+                    let data = encode_ipc_stream(&slice)
+                        .map_err(|e| Status::internal(format!("arrow ipc encode: {e}")))?;
+                    yield response_msg(
+                        &session_id,
+                        &server_session_id,
+                        &operation_id,
+                        sc::execute_plan_response::ResponseType::ArrowBatch(
+                            sc::execute_plan_response::ArrowBatch {
+                                row_count: len as i64,
+                                data,
+                                ..Default::default()
+                            },
+                        ),
+                    );
+                    off += len;
+                    if off >= n {
+                        break;
+                    }
+                }
+                any_rows = true;
+            }
+            if !any_rows {
+                let empty = RecordBatch::new_empty(schema.clone());
+                let data = encode_ipc_stream(&empty)
+                    .map_err(|e| Status::internal(format!("arrow ipc encode: {e}")))?;
+                yield response_msg(
+                    &session_id,
+                    &server_session_id,
+                    &operation_id,
+                    sc::execute_plan_response::ResponseType::ArrowBatch(
+                        sc::execute_plan_response::ArrowBatch {
+                            row_count: 0,
+                            data,
+                            ..Default::default()
+                        },
+                    ),
+                );
+            }
+            let mut complete = response_msg(
+                &session_id,
+                &server_session_id,
+                &operation_id,
+                sc::execute_plan_response::ResponseType::ResultComplete(
+                    sc::execute_plan_response::ResultComplete {},
+                ),
+            );
+            complete.schema = Some(types::schema_to_spark(schema.as_ref()));
+            yield complete;
+        };
+        Box::pin(stream)
+    }
+
     /// Handle a PySpark `SqlCommand`. A query stays lazy — we return a `SqlCommandResult` whose
     /// relation is the `Sql` plan, so the client's `DataFrame` re-executes it on `collect`/`show`
     /// (no large result embedded here). A command (DDL/DML) runs eagerly for its side effect and
@@ -465,6 +577,15 @@ impl SparkConnectService for WeftService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
+                // Large query / DataFrame results are streamed batch-by-batch so the driver never
+                // materializes the whole result set (a big SELECT * would OOM it). Bounded relation
+                // shapes return None and fall through to the collected path below.
+                if let Some(resp) = self
+                    .stream_relation_response(&session_id, &operation_id, rel)
+                    .await?
+                {
+                    return Ok(Response::new(resp));
+                }
                 let batches = self.eval_relation(rel).await?;
                 self.stream_batches(&session_id, &operation_id, &batches)?
             }
@@ -742,6 +863,24 @@ fn sql_command_text(c: &sc::SqlCommand) -> Option<String> {
 }
 
 /// A bare `Sql` relation wrapping `query` (the lazy handle returned for a `SqlCommand` query).
+/// Build an `ExecutePlanResponse` from owned ids — the free-function form of [`WeftService::response`]
+/// for the streaming generator, which cannot borrow `&self` across its yields.
+fn response_msg(
+    session_id: &str,
+    server_session_id: &str,
+    operation_id: &str,
+    response_type: sc::execute_plan_response::ResponseType,
+) -> sc::ExecutePlanResponse {
+    sc::ExecutePlanResponse {
+        session_id: session_id.to_string(),
+        server_side_session_id: server_session_id.to_string(),
+        operation_id: operation_id.to_string(),
+        response_id: Uuid::new_v4().to_string(),
+        response_type: Some(response_type),
+        ..Default::default()
+    }
+}
+
 fn sql_relation(query: &str) -> sc::Relation {
     sc::Relation {
         common: None,
