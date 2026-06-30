@@ -44,9 +44,52 @@ impl Sink for FileSink {
                 "parquet"
             }
         ));
-        // Write via engine in scheduler; here just record row count.
-        let _ = out;
+        if self.format == "json" {
+            let mut lines = String::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    let mut cells = Vec::new();
+                    for col in 0..batch.num_columns() {
+                        cells.push(format_cell(batch.column(col), row));
+                    }
+                    lines.push_str(&cells.join(","));
+                    lines.push('\n');
+                }
+            }
+            std::fs::write(&out, lines)
+                .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
+        } else {
+            use datafusion::parquet::arrow::ArrowWriter;
+            let file = std::fs::File::create(&out)
+                .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
+            let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None)
+                .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
+            for batch in batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
+            }
+            writer
+                .close()
+                .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
+        }
         Ok(rows)
+    }
+}
+
+fn format_cell(arr: &weft_loom::arrow::array::ArrayRef, row: usize) -> String {
+    use weft_loom::arrow::array::{Array, AsArray};
+    use weft_loom::arrow::datatypes::DataType;
+    if arr.is_null(row) {
+        return String::new();
+    }
+    match arr.data_type() {
+        DataType::Utf8 => arr.as_string::<i32>().value(row).to_string(),
+        DataType::Int64 => arr
+            .as_primitive::<weft_loom::arrow::datatypes::Int64Type>()
+            .value(row)
+            .to_string(),
+        _ => String::new(),
     }
 }
 
@@ -78,5 +121,33 @@ impl Sink for MemorySink {
             .map_err(|e| weft_common::Error::Execution(e.to_string()))?;
         guard.extend_from_slice(batches);
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use weft_loom::arrow::array::Int64Array;
+    use weft_loom::arrow::datatypes::{DataType, Field, Schema};
+    use weft_loom::arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn file_sink_writes_parquet() {
+        let dir = TempDir::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+                .unwrap();
+        let mut sink = FileSink::new(dir.path(), "parquet");
+        let rows = sink.write_batch(&[batch]).unwrap();
+        assert_eq!(rows, 3);
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].extension().is_some_and(|e| e == "parquet"));
     }
 }

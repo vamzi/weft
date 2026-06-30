@@ -4476,6 +4476,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "datafusion",
  "serde",
  "serde_json",
  "tempfile",
