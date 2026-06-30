@@ -20,7 +20,9 @@ weft-catalog = { workspace = true }
 weft-catalog-hive = { workspace = true }
 weft-catalog-glue = { workspace = true }
 weft-loom = { workspace = true }
+weft-streaming = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
+serde_json = "1"
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
@@ -30,3 +32,5 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
+tokio-stream = "0.1"
+tonic = "0.12"

@@ -156,6 +156,7 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
     let tail = input_sql
         .strip_prefix("SELECT * ")
         .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
+    let tail = sanitize_generated_sql(tail);
 
     // Broadcast is only correct if the sharded table is *scanned* exactly once (the driving fact).
     // A second scan — a self-join or a correlated EXISTS/IN subquery over it — would see only the
@@ -194,9 +195,9 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
     }
 
     let (partial_sql, final_sql) = if distinct {
-        distinct_stage_sql(&up, p, &group_sql, &aggs, tail, &remap)?
+        distinct_stage_sql(&up, p, &group_sql, &aggs, &tail, &remap)?
     } else {
-        recombine_stage_sql(p, &group_sql, &aggs, tail, &remap)?
+        recombine_stage_sql(p, &group_sql, &aggs, &tail, &remap)?
     };
 
     let hash_key_cols: Vec<u32> = (0..group_sql.len() as u32).collect();
@@ -339,7 +340,10 @@ fn recombine_stage_sql(
     }
 
     let group_by = group_sql.join(", ");
-    let partial_sql = format!("SELECT {} {tail} GROUP BY {group_by}", psel.join(", "));
+    let partial_sql = sanitize_generated_sql(&format!(
+        "SELECT {} {tail} GROUP BY {group_by}",
+        psel.join(", ")
+    ));
     let inner = format!(
         "SELECT {} FROM shuffle_input GROUP BY {}",
         combine.join(", "),
@@ -371,7 +375,7 @@ fn distinct_stage_sql(
     for (i, a) in aggs.iter().enumerate() {
         psel.push(format!("{} AS c{i}", a.arg_sql));
     }
-    let partial_sql = format!("SELECT {} {tail}", psel.join(", "));
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
 
     // Final: re-run each aggregate over the projected columns, grouped by g{j}.
     let mut combine: Vec<String> = (0..group_sql.len()).map(|j| format!("g{j}")).collect();
@@ -467,8 +471,95 @@ fn remap_columns(e: &Expr, remap: &HashMap<String, String>) -> Expr {
 /// Unparse an expr to SQL text.
 fn expr_sql(up: &Unparser, e: &Expr) -> Result<String> {
     up.expr_to_sql(e)
-        .map(|ast| ast.to_string())
+        .map(|ast| sanitize_generated_sql(&ast.to_string()))
         .map_err(|err| Error::Unsupported(format!("auto-distribute: unparse expr: {err}")))
+}
+
+/// Fix SQL fragments from DataFusion's Unparser that the Databricks-dialect re-parser rejects.
+///
+/// Two common failure modes when generated stage SQL is sent to workers:
+/// - `alias."col"` — dot access with a double-quoted column name;
+/// - `"table".col` — dot access on a double-quoted table name (e.g. reserved `part`).
+fn sanitize_generated_sql(sql: &str) -> String {
+    fix_quoted_column_after_dot(&fix_quoted_table_dot_access(sql))
+}
+
+/// `"table".col` → `` `table`.col `` so dot access parses under the Databricks dialect.
+fn fix_quoted_table_dot_access(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                let ident = &sql[start + 1..i];
+                i += 1; // closing quote
+                if i < bytes.len() && bytes[i] == b'.' && is_simple_ident(ident) {
+                    out.push('`');
+                    out.push_str(ident);
+                    out.push('`');
+                    out.push('.');
+                    i += 1;
+                    continue;
+                }
+                out.push_str(&sql[start..i]);
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// `alias."col"` → `alias.col` when `col` is a plain identifier.
+fn fix_quoted_column_after_dot(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                let qstart = i + 2;
+                let mut j = qstart;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j < bytes.len() {
+                    let ident = &sql[qstart..j];
+                    if is_simple_ident(ident) {
+                        out.push_str(&sql[start..=i]);
+                        out.push_str(ident);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Extract a non-negative integer `LIMIT` value from a literal scalar.
@@ -524,5 +615,34 @@ fn collect_tables(lp: &LogicalPlan, out: &mut Vec<String>) {
     }
     for c in lp.inputs() {
         collect_tables(c, out);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::{fix_quoted_column_after_dot, fix_quoted_table_dot_access, sanitize_generated_sql};
+
+    #[test]
+    fn quoted_column_after_dot_becomes_unquoted() {
+        let sql = r#"sum(shipping."volume")"#;
+        assert_eq!(fix_quoted_column_after_dot(sql), "sum(shipping.volume)");
+    }
+
+    #[test]
+    fn quoted_table_dot_access_uses_backticks() {
+        let sql = r#""part".p_partkey = lineitem.l_partkey"#;
+        assert_eq!(
+            fix_quoted_table_dot_access(sql),
+            "`part`.p_partkey = lineitem.l_partkey"
+        );
+    }
+
+    #[test]
+    fn sanitize_composes_both_fixes() {
+        let sql = r#"SELECT sum(shipping."volume") FROM "part" WHERE "part".p_partkey = 1"#;
+        let got = sanitize_generated_sql(sql);
+        assert!(got.contains("shipping.volume"));
+        assert!(got.contains("`part`.p_partkey"));
+        assert!(!got.contains(r#""volume""#));
     }
 }

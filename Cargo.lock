@@ -681,8 +681,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -4320,6 +4322,8 @@ dependencies = [
 name = "weft-cli"
 version = "0.0.0"
 dependencies = [
+ "datafusion",
+ "tempfile",
  "tokio",
  "weft-common",
  "weft-connect",
@@ -4338,6 +4342,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "prost 0.13.5",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
@@ -4354,6 +4359,7 @@ dependencies = [
  "weft-plan",
  "weft-proto",
  "weft-sql",
+ "weft-streaming",
 ]
 
 [[package]]
@@ -4462,6 +4468,22 @@ version = "0.0.0"
 dependencies = [
  "weft-common",
  "weft-plan",
+]
+
+[[package]]
+name = "weft-streaming"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "weft-common",
+ "weft-loom",
 ]
 
 [[package]]

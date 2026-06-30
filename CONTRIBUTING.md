@@ -9,6 +9,18 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Local CI (matches GitHub Actions)
+
+```sh
+chmod +x scripts/ci-local.sh .githooks/pre-push
+./scripts/ci-local.sh          # full gate suite before a PR
+git config core.hooksPath .githooks   # optional: run fmt/clippy/test on git push
+```
+
+The `weft-cli` binary must be built before workspace tests because
+`crates/weft-cli/tests/cli_driver_worker.rs` spawns it as a subprocess.
+`scripts/ci-local.sh` and CI do this automatically; `cargo test --workspace` alone does not.
+
 The stub workspace builds on Rust 1.72+. The runtime crates (DataFusion/Arrow/tonic) will
 require **Rust ≥ 1.80** and **protoc**; their dependencies are stubbed out today and noted
 as `TODO(deps)` in each crate's `Cargo.toml`.

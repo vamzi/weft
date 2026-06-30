@@ -39,6 +39,7 @@ weft-connect    = { path = "crates/weft-connect" }
 # Control-plane / platform crates (Databricks-like layer; see ~/.claude/plans).
 # Spark parity harness (golden SQL tests + scoreboard).
 weft-spark-compat = { path = "crates/weft-spark-compat" }
+weft-streaming   = { path = "crates/weft-streaming" }
 
 [profile.release]
 opt-level = 3

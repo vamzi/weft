@@ -198,9 +198,22 @@ fn render(e: &Expr, agg: &AggMap) -> String {
                 render(&b.right, agg)
             )
         }
-        // Spark (like Postgres) omits coercion casts from the column name.
-        Expr::Cast(c) => render(&c.expr, agg),
-        Expr::TryCast(c) => render(&c.expr, agg),
+        // Spark (like Postgres) omits coercion casts from the column name, except for typed NULL
+        // literals where Spark prints `CAST(NULL AS <type>)`.
+        Expr::Cast(c) => {
+            if matches!(&*c.expr, Expr::Literal(ScalarValue::Null, _)) {
+                format!("CAST(NULL AS {})", spark_type_name(c.field.data_type()))
+            } else {
+                render(&c.expr, agg)
+            }
+        }
+        Expr::TryCast(c) => {
+            if matches!(&*c.expr, Expr::Literal(ScalarValue::Null, _)) {
+                format!("CAST(NULL AS {})", spark_type_name(c.field.data_type()))
+            } else {
+                render(&c.expr, agg)
+            }
+        }
         Expr::Negative(x) => format!("(- {})", render(x, agg)),
         Expr::Not(x) => format!("NOT {}", render(x, agg)),
         Expr::IsNull(x) => format!("{} IS NULL", render(x, agg)),
@@ -369,6 +382,30 @@ fn render_scalar_fn(sf: &ScalarFunction, agg: &AggMap) -> String {
     format!("{name}({args})")
 }
 
+/// Spark SQL type spelling for CAST display names.
+fn spark_type_name(dt: &datafusion::arrow::datatypes::DataType) -> String {
+    use datafusion::arrow::datatypes::DataType;
+    match dt {
+        DataType::Int32 => "int".into(),
+        DataType::Int64 => "bigint".into(),
+        DataType::Float32 => "float".into(),
+        DataType::Float64 => "double".into(),
+        DataType::Boolean => "boolean".into(),
+        DataType::Utf8 | DataType::LargeUtf8 => "string".into(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "binary".into(),
+        DataType::Date32 | DataType::Date64 => "date".into(),
+        DataType::Timestamp(_, tz) => {
+            if tz.is_some() {
+                "timestamp".into()
+            } else {
+                "timestamp_ntz".into()
+            }
+        }
+        DataType::Decimal128(p, s) => format!("decimal({p},{s})"),
+        other => other.to_string(),
+    }
+}
+
 /// Render a literal the way Spark names it: bare value text, full-length `X'…'` for binary,
 /// `DATE '…'` for dates. (Typed-null `CAST(NULL AS T)` spelling is deferred to a later increment;
 /// a bare `NULL` here can only leave such columns in `schema-only`, never regress a passing one.)
@@ -407,7 +444,8 @@ fn spark_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::logical_expr::{col, lit, Operator};
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::{col, lit, Cast, Operator};
 
     fn binary(l: Expr, op: Operator, r: Expr) -> Expr {
         Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
@@ -415,6 +453,17 @@ mod tests {
             op,
             Box::new(r),
         ))
+    }
+
+    #[test]
+    fn renders_typed_null_cast() {
+        assert_eq!(
+            spark_expr_name(&Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(ScalarValue::Null, None)),
+                DataType::Int32,
+            ))),
+            "CAST(NULL AS int)"
+        );
     }
 
     #[test]

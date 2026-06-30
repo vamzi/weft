@@ -28,6 +28,7 @@ pub(crate) mod spark_checked_mul;
 // `pub(crate)` so `crate::spark_names` can reuse the cast-alias name list for column naming.
 pub(crate) mod spark_cast_constructors;
 mod spark_convert;
+mod spark_csv;
 mod spark_datetime;
 // `pub(crate)` (unlike the other internal submodules): `SparkDividePlanner` in `lib.rs` embeds the
 // `spark_divide` UDF directly via `spark_divide::udf()` when lowering a literal-zero integral `/`.
@@ -57,6 +58,7 @@ pub fn register(ctx: &SessionContext) {
     spark_encoding::register(ctx);
     spark_datetime::register(ctx);
     spark_convert::register(ctx);
+    spark_csv::register(ctx);
     spark_regex_misc::register(ctx);
     spark_datetime2::register(ctx);
     spark_datetime3::register(ctx);

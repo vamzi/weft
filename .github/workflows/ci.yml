@@ -49,12 +49,16 @@ jobs:
           rustup component add clippy
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
+      - name: Build weft CLI (integration tests in weft-cli spawn the binary)
+        run: cargo build -p weft-cli
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (workspace)
         run: cargo test --workspace
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
+      - name: TPC-H distributed (2 workers, sf0.01)
+        run: cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
@@ -126,4 +130,31 @@ jobs:
             parity/parity.html
             parity/scoreboard.json
           retention-days: 30
+          if-no-files-found: ignore
+
+  # Informational line-coverage report (non-blocking). Uploads an HTML artifact for trending.
+  line-coverage:
+    name: line coverage (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build weft CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p weft-cli --target-dir target/llvm-cov-target
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov --workspace --html
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html
+          path: target/llvm-cov/html
+          retention-days: 14
           if-no-files-found: ignore

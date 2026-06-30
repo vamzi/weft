@@ -148,6 +148,7 @@ fn rel_name(rt: &sc::relation::RelType) -> &'static str {
 }
 
 async fn read(ctx: &SessionContext, r: &sc::Read) -> Result<LogicalPlan, Status> {
+    let _is_streaming = r.is_streaming;
     match r.read_type.as_ref().ok_or_else(|| inval("empty read"))? {
         sc::read::ReadType::NamedTable(t) => ctx
             .table(&t.unparsed_identifier)
@@ -833,6 +834,36 @@ fn build(b: datafusion::error::Result<LogicalPlanBuilder>) -> Result<LogicalPlan
 
 fn plan_err(e: datafusion::error::DataFusionError) -> Status {
     Status::invalid_argument(format!("plan: {e}"))
+}
+
+/// Returns true when the relation tree contains a streaming read.
+pub fn relation_is_streaming(rel: &sc::Relation) -> bool {
+    use sc::relation::RelType;
+    let Some(rt) = rel.rel_type.as_ref() else {
+        return false;
+    };
+    match rt {
+        RelType::Read(r) => r.is_streaming,
+        RelType::Project(p) => p.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        RelType::Filter(f) => f.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        RelType::Aggregate(a) => a.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        RelType::Join(j) => {
+            j.left.as_ref().is_some_and(|l| relation_is_streaming(l))
+                || j.right.as_ref().is_some_and(|r| relation_is_streaming(r))
+        }
+        RelType::Sort(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        RelType::Limit(l) => l.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        RelType::SetOp(u) => {
+            u.left_input
+                .as_ref()
+                .is_some_and(|l| relation_is_streaming(l))
+                || u.right_input
+                    .as_ref()
+                    .is_some_and(|r| relation_is_streaming(r))
+        }
+        RelType::SubqueryAlias(s) => s.input.as_ref().is_some_and(|i| relation_is_streaming(i)),
+        _ => false,
+    }
 }
 
 /// Tiny `.pipe()` so the `ctx.sql(...).into_unoptimized_plan().pipe(Ok)` reads top-to-bottom.

@@ -46,3 +46,66 @@ pulls in real DataFusion/Arrow/tonic and the engine executes SQL end-to-end.
 The `weft` binary also has `worker` and `driver` subcommands for a Flight-based
 driver/worker cluster (`weft worker --port ...`, `weft driver --workers h:p,... --partial-sql ... --final-sql ...`).
 Not needed for the basic single-server flow.
+
+### CI gotchas (commit / push / PR)
+
+GitHub Actions gates live in `.github/workflows/ci.yml`. Before pushing, run
+`./scripts/ci-local.sh` (or install the optional pre-push hook:
+`git config core.hooksPath .githooks`). The following issues have bitten real PRs:
+
+#### `weft-cli` must be built before `cargo test --workspace`
+
+`weft-cli` is a **binary-only** crate (`[[bin]] weft`). `cargo test --workspace` does **not**
+build orphan binaries, so `CARGO_BIN_EXE_weft` is unset unless you built it explicitly.
+
+- **Symptom:** `cli_driver_worker_matches_single_node` panics with
+  `weft binary not found at …/target/debug/weft`.
+- **Fix:** `cargo build -p weft-cli` before tests. CI and `scripts/ci-local.sh` do this.
+- **Test location:** the driver/worker subprocess smoke test lives in
+  `crates/weft-cli/tests/cli_driver_worker.rs` (not `weft-execution`) so Cargo sets
+  `CARGO_BIN_EXE_weft` when the test is built via `cargo test -p weft-cli`.
+- **`weft_bin()` fallback:** when the env var is missing, probe (in order)
+  `$CARGO_TARGET_DIR/$PROFILE/weft`, `target/$PROFILE/weft`, and
+  `target/llvm-cov-target/$PROFILE/weft` (see llvm-cov below).
+
+#### `cargo llvm-cov` uses a separate target directory
+
+The informational `line-coverage` job runs `cargo llvm-cov --workspace --html`, which
+re-runs the full test suite under `target/llvm-cov-target/` (not `target/debug/`).
+
+- **Symptom:** same `weft binary not found` failure, but only in the `line-coverage` job
+  even when `clippy + test + tpch` passes.
+- **Fix (CI):** `cargo build -p weft-cli --target-dir target/llvm-cov-target` before
+  `cargo llvm-cov`. Upload artifact from `target/llvm-cov/html` (not `coverage/`).
+- **Flag gotcha:** do **not** pass `--output-path coverage/` together with `--html` —
+  `cargo-llvm-cov` rejects incompatible flags. Use `--html` alone.
+- **Job is non-blocking** (`continue-on-error: true`) but should still be kept green for
+  trending artifacts.
+
+#### `tpch-distributed` auto-splitter SQL must re-parse on workers
+
+`cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2` is a **blocking** CI
+gate. The auto-splitter (`weft_execution::plan::plan_distributed`) unparses logical plans
+to stage SQL via DataFusion's `Unparser`, then workers re-parse that SQL under the
+Databricks dialect. Some Unparser output is **invalid on round-trip**:
+
+| Unparser output | Problem | Sanitized to |
+|----------------|---------|--------------|
+| `shipping."volume"` | dot + double-quoted column | `shipping.volume` |
+| `"part".p_partkey` | dot access on quoted table (reserved name) | `` `part`.p_partkey `` |
+
+- **Symptom:** Q7/Q8 `ParserError: Expected identifier after '.'`; Q9
+  `Dot access not supported for non-string expr`.
+- **Fix:** `sanitize_generated_sql()` in `crates/weft-execution/src/plan/stage_planner.rs`
+  rewrites these patterns before stage SQL is sent to workers.
+- **Debug locally:** `WEFT_TPCH_ONLY=Q7 WEFT_TPCH_DEBUG=1 cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2`
+
+#### CI job map (quick reference)
+
+| Job | Blocking? | Key command |
+|-----|-----------|-------------|
+| rustfmt | yes | `cargo fmt --all -- --check` |
+| clippy + test + tpch | yes | `cargo build -p weft-cli` then clippy/test/tpch/tpch-distributed |
+| coverage gates | yes | clickbench, clickbench-grpc, correctness |
+| Spark SQL parity ratchet | yes | `weft-parity ratchet --baseline parity/baseline.json` |
+| line coverage | no (informational) | `cargo llvm-cov --workspace --html` |

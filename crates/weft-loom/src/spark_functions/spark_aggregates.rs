@@ -44,6 +44,7 @@ pub fn register(ctx: &SessionContext) {
     ctx.register_udaf(AggregateUDF::from(AnyValue::new()));
     ctx.register_udaf(AggregateUDF::from(Mode::new()));
     ctx.register_udaf(AggregateUDF::from(Percentile::new()));
+    ctx.register_udaf(AggregateUDF::from(GroupingId::new()));
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +477,69 @@ fn exact_percentile(sorted: &[f64], p: f64) -> f64 {
         return lower_v;
     }
     lower_v + (position - lower as f64) * (higher_v - lower_v)
+}
+
+// ---------------------------------------------------------------------------
+// grouping_id(col, ...) -> bigint
+// ---------------------------------------------------------------------------
+
+/// `grouping_id(cols…)` — Spark's grouping identifier bitmask. For ordinary `GROUP BY` (no
+/// `GROUPING SETS` / `ROLLUP` / `CUBE`), the result is always `0`. Returns `bigint`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct GroupingId {
+    signature: Signature,
+}
+
+impl GroupingId {
+    fn new() -> Self {
+        Self {
+            signature: Signature::user_defined(Volatility::Immutable),
+        }
+    }
+}
+
+impl AggregateUDFImpl for GroupingId {
+    fn name(&self) -> &str {
+        "grouping_id"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![Field::new(
+            format_state_name(args.name, "grouping_id"),
+            DataType::Int64,
+            false,
+        )
+        .into()])
+    }
+    fn accumulator(&self, _acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(GroupingIdAccumulator))
+    }
+}
+
+#[derive(Debug, Default)]
+struct GroupingIdAccumulator;
+
+impl Accumulator for GroupingIdAccumulator {
+    fn update_batch(&mut self, _values: &[ArrayRef]) -> Result<()> {
+        Ok(())
+    }
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        Ok(ScalarValue::Int64(Some(0)))
+    }
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Int64(Some(0))])
+    }
+    fn merge_batch(&mut self, _states: &[ArrayRef]) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
