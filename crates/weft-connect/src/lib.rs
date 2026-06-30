@@ -36,9 +36,11 @@ use weft_proto::spark::connect as sc;
 use weft_streaming::StreamingQueryManager;
 
 mod catalog;
+mod distributed;
 mod streaming;
 mod translate;
 mod types;
+mod udf;
 
 /// Max gRPC message size (Spark Connect defaults to 128 MB; we allow 256 MB headroom).
 const MAX_MSG: usize = 256 * 1024 * 1024;
@@ -54,6 +56,9 @@ pub struct ServerConfig {
     /// `spark.sql.catalog.prod.type=hive`). Seeds the session config so external catalogs are
     /// live before the first client connects; clients can still add more via the `Config` RPC.
     pub catalogs: std::collections::HashMap<String, String>,
+    /// Arrow Flight worker endpoints for distributed execution (`host:port`, comma-separated in
+    /// env as `WEFT_WORKERS`). When non-empty, auto-splittable queries route through the driver.
+    pub workers: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +66,7 @@ impl Default for ServerConfig {
         Self {
             port: 50051,
             catalogs: std::collections::HashMap::new(),
+            workers: distributed::parse_worker_list(None),
         }
     }
 }
@@ -77,6 +83,10 @@ pub struct WeftService {
     registry: Arc<weft_catalog::CatalogRegistry>,
     /// Structured Streaming query manager.
     streaming: Arc<StreamingQueryManager>,
+    /// Flight worker endpoints for distributed query routing.
+    pub workers: Vec<String>,
+    /// Python UDF artifact bytes from `AddArtifacts`.
+    artifacts: udf::SharedArtifacts,
 }
 
 impl Default for WeftService {
@@ -104,7 +114,20 @@ impl WeftService {
             config: std::sync::Mutex::new(config),
             registry: Arc::new(weft_catalog::CatalogRegistry::new()),
             streaming: Arc::new(StreamingQueryManager::new()),
+            workers: distributed::parse_worker_list(None),
+            artifacts: Arc::new(std::sync::Mutex::new(udf::ArtifactStore::default())),
         }
+    }
+
+    fn workers_from_config(&self) -> Vec<String> {
+        let cfg_workers = self
+            .config
+            .lock()
+            .expect("config poisoned")
+            .get("spark.weft.workers")
+            .map(|s| distributed::parse_worker_list(Some(s)))
+            .filter(|w| !w.is_empty());
+        cfg_workers.unwrap_or_else(|| self.workers.clone())
     }
 
     /// Reconcile declared `spark.sql.catalog.<name>.*` config into live, bridged catalogs.
@@ -117,16 +140,39 @@ impl WeftService {
     /// Build a service with external catalogs declared up front (flat `spark.sql.catalog.*`
     /// entries). The catalogs are bridged into the engine before any client connects.
     pub fn with_catalogs(catalogs: std::collections::HashMap<String, String>) -> Self {
+        Self::with_config(ServerConfig {
+            catalogs,
+            ..Default::default()
+        })
+    }
+
+    /// Build with full server configuration (workers, catalogs, port).
+    pub fn with_config(config: ServerConfig) -> Self {
         let service = Self::new();
-        if !catalogs.is_empty() {
-            service
-                .config
+        let mut svc = service;
+        if !config.catalogs.is_empty() {
+            svc.config
                 .lock()
                 .expect("config poisoned")
-                .extend(catalogs);
-            service.sync_catalogs();
+                .extend(config.catalogs);
+            svc.sync_catalogs();
         }
-        service
+        if !config.workers.is_empty() {
+            svc.workers = config.workers;
+        }
+        svc
+    }
+
+    /// Build with a pre-configured engine (tests and embedded driver setups).
+    pub fn with_engine(engine: Arc<Engine>) -> Self {
+        let mut svc = Self::new();
+        svc.engine = engine;
+        svc
+    }
+
+    /// Access the session engine (register tables for distributed planning in tests).
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
     }
 
     fn sync_catalogs(&self) {
@@ -368,6 +414,20 @@ impl WeftService {
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
+                let workers = self.workers_from_config();
+                let udf_json = self.engine.export_udfs_json();
+                if let Some(dist) = distributed::try_run_distributed(
+                    &self.engine,
+                    &workers,
+                    &sql.query,
+                    &[],
+                    Some(&udf_json),
+                )
+                .await
+                .map_err(err_to_status)?
+                {
+                    return Ok(dist);
+                }
                 let mut batches = self.engine.sql(&sql.query).await.map_err(err_to_status)?;
                 // A 0-row result must still carry its schema so the client gets a typed (empty)
                 // table. Re-derive the schema only for queries — `engine.schema` plans via
@@ -483,6 +543,19 @@ impl SparkConnectService for WeftService {
                         &operation_id,
                         sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(
                             result,
+                        ),
+                    )]
+                }
+                Some(sc::command::CommandType::RegisterFunction(rf)) => {
+                    let registry = self.engine.udf_registry();
+                    let mut reg = registry.lock().unwrap();
+                    udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
+                    drop(reg);
+                    vec![self.response(
+                        &session_id,
+                        &operation_id,
+                        sc::execute_plan_response::ResponseType::ResultComplete(
+                            sc::execute_plan_response::ResultComplete {},
                         ),
                     )]
                 }
@@ -674,11 +747,42 @@ impl SparkConnectService for WeftService {
 
     async fn add_artifacts(
         &self,
-        _request: Request<tonic::Streaming<sc::AddArtifactsRequest>>,
+        request: Request<tonic::Streaming<sc::AddArtifactsRequest>>,
     ) -> std::result::Result<Response<sc::AddArtifactsResponse>, Status> {
-        Err(Status::unimplemented(
-            "AddArtifacts (Python UDFs) lands in Phase 1",
-        ))
+        let mut stream = request.into_inner();
+        let mut pending: Vec<sc::AddArtifactsRequest> = Vec::new();
+        while let Some(msg) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.message()))?
+        {
+            pending.push(msg);
+        }
+        let mut store = self.artifacts.lock().expect("artifacts poisoned");
+        use sc::add_artifacts_request::Payload;
+        for msg in pending {
+            match msg.payload {
+                Some(Payload::Batch(batch)) => {
+                    for art in batch.artifacts {
+                        if let Some(chunk) = art.data {
+                            store.insert(art.name, chunk.data.to_vec());
+                        }
+                    }
+                }
+                Some(Payload::BeginChunk(begin)) => {
+                    let data = begin
+                        .initial_chunk
+                        .map(|c| c.data.to_vec())
+                        .unwrap_or_default();
+                    store.insert(begin.name.clone(), data);
+                }
+                Some(Payload::Chunk(chunk)) => {
+                    store.append_last(&chunk.data);
+                }
+                None => {}
+            }
+        }
+        Ok(Response::new(sc::AddArtifactsResponse::default()))
     }
 
     async fn artifact_status(
@@ -1064,14 +1168,20 @@ fn err_to_status(e: Error) -> Status {
 
 /// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let addr = format!("0.0.0.0:{}", config.port)
+    let port = config.port;
+    serve_instance(WeftService::with_config(config), port).await
+}
+
+/// Serve a pre-built service instance (tests with a seeded engine).
+pub async fn serve_instance(service: WeftService, port: u16) -> Result<()> {
+    let addr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| Error::Io(format!("bad listen addr: {e}")))?;
-    let service = SparkConnectServiceServer::new(WeftService::with_catalogs(config.catalogs))
+    let grpc = SparkConnectServiceServer::new(service)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG);
     tonic::transport::Server::builder()
-        .add_service(service)
+        .add_service(grpc)
         .serve(addr)
         .await
         .map_err(|e| Error::Io(format!("server error: {e}")))?;

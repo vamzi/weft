@@ -15,6 +15,12 @@
 //!
 //! [`Role::Driver`]: crate::Role
 
+#[cfg(feature = "k8s")]
+pub mod k8s;
+
+#[cfg(feature = "k8s")]
+pub use k8s::K8sMembership;
+
 /// A worker endpoint (`host:port`) the driver can dial over Arrow Flight.
 pub type WorkerEndpoint = String;
 

@@ -57,7 +57,12 @@ async fn run_server(args: &[String]) -> weft_common::Result<()> {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
     eprintln!("Weft Spark Connect server listening on sc://0.0.0.0:{port}");
-    serve(ServerConfig { port, catalogs }).await
+    serve(ServerConfig {
+        port,
+        catalogs,
+        ..Default::default()
+    })
+    .await
 }
 
 /// Collect startup catalog config from repeated `--catalog-conf key=value` flags and the

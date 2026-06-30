@@ -1,0 +1,23 @@
+replicaCount: 1
+
+gateway:
+  image: weft/gateway:latest
+  port: 8080
+  env:
+    WEFT_ORCHESTRATOR: k8s
+    WEFT_WORKER_IMAGE: weft/worker:latest
+    WEFT_CLUSTER_IMAGE: weft/connect-server:latest
+
+worker:
+  image: weft/worker:latest
+  port: 50561
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+connect:
+  image: weft/connect-server:latest
+  port: 50051
