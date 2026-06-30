@@ -189,8 +189,7 @@ async fn streaming_query_status_and_stop() {
         if let Some(sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(r)) =
             resp.response_type
         {
-            if let Some(sc::streaming_query_command_result::ResultType::Status(s)) = r.result_type
-            {
+            if let Some(sc::streaming_query_command_result::ResultType::Status(s)) = r.result_type {
                 saw_active = s.is_active;
             }
         }
@@ -222,8 +221,7 @@ async fn streaming_query_status_and_stop() {
         if let Some(sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(r)) =
             resp.response_type
         {
-            if let Some(sc::streaming_query_command_result::ResultType::Status(s)) = r.result_type
-            {
+            if let Some(sc::streaming_query_command_result::ResultType::Status(s)) = r.result_type {
                 stopped = !s.is_active;
             }
         }
