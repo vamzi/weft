@@ -31,9 +31,6 @@ impl ClusterSpec {
 
     /// Headless Service DNS name workers register under.
     pub fn worker_service_host(&self) -> String {
-        format!(
-            "weft-worker.{}.svc.cluster.local",
-            self.namespace
-        )
+        format!("weft-worker.{}.svc.cluster.local", self.namespace)
     }
 }

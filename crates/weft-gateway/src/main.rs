@@ -41,14 +41,10 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
 
-    let backend: Arc<dyn ClusterBackend> = match std::env::var("WEFT_ORCHESTRATOR")
-        .ok()
-        .as_deref()
+    let backend: Arc<dyn ClusterBackend> = match std::env::var("WEFT_ORCHESTRATOR").ok().as_deref()
     {
         Some("k8s") => Arc::new(K8sBackend::default()),
-        _ => Arc::new(
-            StaticBackend::from_env().unwrap_or_else(|| StaticBackend::new(vec![])),
-        ),
+        _ => Arc::new(StaticBackend::from_env().unwrap_or_else(|| StaticBackend::new(vec![]))),
     };
 
     let app = Router::new()
@@ -70,10 +66,10 @@ async fn provision(
     State(state): State<AppState>,
     Json(req): Json<ProvisionRequest>,
 ) -> Json<ProvisionResponse> {
-    let worker_image = std::env::var("WEFT_WORKER_IMAGE")
-        .unwrap_or_else(|_| "weft/worker:latest".into());
-    let connect_image = std::env::var("WEFT_CLUSTER_IMAGE")
-        .unwrap_or_else(|_| "weft/connect-server:latest".into());
+    let worker_image =
+        std::env::var("WEFT_WORKER_IMAGE").unwrap_or_else(|_| "weft/worker:latest".into());
+    let connect_image =
+        std::env::var("WEFT_CLUSTER_IMAGE").unwrap_or_else(|_| "weft/connect-server:latest".into());
     let spec = ClusterSpec {
         cluster_id: req.cluster_id.clone(),
         namespace: format!("weft-cl-{}", req.cluster_id),
@@ -107,10 +103,7 @@ async fn delete_cluster(
     Json(serde_json::json!({ "deleted": id }))
 }
 
-async fn list_workers(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Json<Vec<String>> {
+async fn list_workers(State(state): State<AppState>, Path(id): Path<String>) -> Json<Vec<String>> {
     let spec = ClusterSpec::local_demo(&id, 2);
     let eps = state.backend.worker_endpoints(&spec).unwrap_or_default();
     Json(eps)

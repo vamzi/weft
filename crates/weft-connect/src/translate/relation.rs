@@ -103,10 +103,7 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         // Repartition hints set shuffle partition count for distributed routing.
         RelType::Repartition(r) => {
             if r.num_partitions > 0 {
-                std::env::set_var(
-                    "WEFT_SHUFFLE_PARTITIONS",
-                    r.num_partitions.to_string(),
-                );
+                std::env::set_var("WEFT_SHUFFLE_PARTITIONS", r.num_partitions.to_string());
             }
             child(ctx, &r.input).await
         }

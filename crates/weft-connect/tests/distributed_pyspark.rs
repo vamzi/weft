@@ -39,7 +39,8 @@ async fn distributed_groupby_via_connect() {
     const N: i64 = 100;
     for (port, start, end) in [(W0, 0, N / 2), (W1, N / 2, N)] {
         let e = Arc::new(Engine::new());
-        e.register_batches("t", vec![make_batch(start, end)]).unwrap();
+        e.register_batches("t", vec![make_batch(start, end)])
+            .unwrap();
         let ee = e.clone();
         tokio::spawn(async move {
             let _ = serve_worker(port, ee).await;
@@ -91,10 +92,7 @@ async fn connect(endpoint: &str) -> SparkConnectServiceClient<Channel> {
     panic!("server not ready at {endpoint}");
 }
 
-async fn exec_sql(
-    client: &mut SparkConnectServiceClient<Channel>,
-    sql: &str,
-) -> Vec<RecordBatch> {
+async fn exec_sql(client: &mut SparkConnectServiceClient<Channel>, sql: &str) -> Vec<RecordBatch> {
     use std::io::Cursor;
     use weft_loom::arrow::ipc::reader::StreamReader;
     use weft_proto::spark::connect as sc;

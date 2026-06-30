@@ -175,11 +175,8 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
     let mut out = Vec::new();
     for p in 0..w {
         let endpoint = cluster.owner_endpoint(p)?;
-        let part = run_stage_on_worker(
-            endpoint,
-            stage_ticket(output, p, w, cluster, false),
-        )
-        .await?;
+        let part =
+            run_stage_on_worker(endpoint, stage_ticket(output, p, w, cluster, false)).await?;
         out.extend(part);
     }
 

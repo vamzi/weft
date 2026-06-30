@@ -674,7 +674,8 @@ async fn run_correctness_distributed(_rows: usize) {
     for (i, (start, end)) in [(0, N / 2), (N / 2, N)].iter().enumerate() {
         let port = 50680 + i as u16;
         let e = Arc::new(Engine::new());
-        e.register_batches("t", vec![make_batch(*start, *end)]).unwrap();
+        e.register_batches("t", vec![make_batch(*start, *end)])
+            .unwrap();
         let ee = e.clone();
         tokio::spawn(async move {
             let _ = serve_worker(port, ee).await;

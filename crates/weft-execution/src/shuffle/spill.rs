@@ -75,11 +75,7 @@ impl SpillStore {
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             let prefix = format!("stage_{stage_id}_");
             for ent in entries.flatten() {
-                if ent
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(&prefix)
-                {
+                if ent.file_name().to_string_lossy().starts_with(&prefix) {
                     let _ = std::fs::remove_file(ent.path());
                 }
             }
@@ -90,8 +86,8 @@ impl SpillStore {
 fn read_ipc_file(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::Io(format!("spill open {}: {e}", path.display())))?;
-    let reader = StreamReader::try_new(file, None)
-        .map_err(|e| Error::Io(format!("spill read: {e}")))?;
+    let reader =
+        StreamReader::try_new(file, None).map_err(|e| Error::Io(format!("spill read: {e}")))?;
     reader
         .map(|b| b.map_err(|e| Error::Io(format!("spill batch: {e}"))))
         .collect()
@@ -134,10 +130,7 @@ impl BucketCache {
 
     pub fn read_partition(&self, partition: usize) -> Vec<RecordBatch> {
         match self {
-            Self::Memory(buckets) => buckets
-                .get(partition)
-                .cloned()
-                .unwrap_or_default(),
+            Self::Memory(buckets) => buckets.get(partition).cloned().unwrap_or_default(),
             Self::Spilled {
                 schema,
                 spill,

@@ -145,13 +145,9 @@ impl Worker {
             let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
             let buckets = hash_partition(&batches, &key_cols, t.num_partitions as usize)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let cache = BucketCache::maybe_spill(
-                schema.clone(),
-                buckets,
-                t.stage_id,
-                self.spill.as_ref(),
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            let cache =
+                BucketCache::maybe_spill(schema.clone(), buckets, t.stage_id, self.spill.as_ref())
+                    .map_err(|e| Status::internal(e.to_string()))?;
             self.stage_outputs
                 .lock()
                 .expect("stage cache poisoned")
@@ -255,9 +251,7 @@ impl FlightService for Worker {
                 let body = arrow_flight::Result {
                     body: b"ok".to_vec().into(),
                 };
-                Ok(Response::new(
-                    futures::stream::iter(vec![Ok(body)]).boxed(),
-                ))
+                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
             }
             ACTION_REGISTER_UDFS => {
                 let payload = String::from_utf8_lossy(&action.body);
@@ -267,9 +261,7 @@ impl FlightService for Worker {
                 let body = arrow_flight::Result {
                     body: b"ok".to_vec().into(),
                 };
-                Ok(Response::new(
-                    futures::stream::iter(vec![Ok(body)]).boxed(),
-                ))
+                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
             }
             other => Err(Status::unimplemented(format!(
                 "flight do_action `{other}` not implemented"

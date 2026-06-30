@@ -117,7 +117,10 @@ impl ScalarUDFImpl for PythonUdf {
         Ok(self.return_type.clone())
     }
 
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> datafusion::common::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        _args: ScalarFunctionArgs,
+    ) -> datafusion::common::Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(eval_python_udf_scalar(
             &self.name,
             &self.command,

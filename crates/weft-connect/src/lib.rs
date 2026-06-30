@@ -770,7 +770,10 @@ impl SparkConnectService for WeftService {
                     }
                 }
                 Some(Payload::BeginChunk(begin)) => {
-                    let data = begin.initial_chunk.map(|c| c.data.to_vec()).unwrap_or_default();
+                    let data = begin
+                        .initial_chunk
+                        .map(|c| c.data.to_vec())
+                        .unwrap_or_default();
                     store.insert(begin.name.clone(), data);
                 }
                 Some(Payload::Chunk(chunk)) => {
