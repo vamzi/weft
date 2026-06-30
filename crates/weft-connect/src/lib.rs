@@ -33,8 +33,10 @@ use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
+use weft_streaming::StreamingQueryManager;
 
 mod catalog;
+mod streaming;
 mod translate;
 mod types;
 
@@ -73,6 +75,8 @@ pub struct WeftService {
     /// Named catalogs + current catalog/db pointers. External catalogs declared via
     /// `spark.sql.catalog.<name>.*` are bridged into the engine and tracked here.
     registry: Arc<weft_catalog::CatalogRegistry>,
+    /// Structured Streaming query manager.
+    streaming: Arc<StreamingQueryManager>,
 }
 
 impl Default for WeftService {
@@ -99,6 +103,7 @@ impl WeftService {
             server_session_id: Uuid::new_v4().to_string(),
             config: std::sync::Mutex::new(config),
             registry: Arc::new(weft_catalog::CatalogRegistry::new()),
+            streaming: Arc::new(StreamingQueryManager::new()),
         }
     }
 
@@ -461,6 +466,26 @@ impl SparkConnectService for WeftService {
                     self.run_sql_command(&session_id, &operation_id, &sql)
                         .await?
                 }
+                Some(sc::command::CommandType::WriteStreamOperationStart(s)) => {
+                    let result = self.handle_write_stream_start(s).await?;
+                    vec![self.response(
+                        &session_id,
+                        &operation_id,
+                        sc::execute_plan_response::ResponseType::WriteStreamOperationStartResult(
+                            result,
+                        ),
+                    )]
+                }
+                Some(sc::command::CommandType::StreamingQueryCommand(c)) => {
+                    let result = self.handle_streaming_query_command(c).await?;
+                    vec![self.response(
+                        &session_id,
+                        &operation_id,
+                        sc::execute_plan_response::ResponseType::StreamingQueryCommandResult(
+                            result,
+                        ),
+                    )]
+                }
                 _ => return Err(Status::unimplemented("unsupported command")),
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
@@ -527,9 +552,20 @@ impl SparkConnectService for WeftService {
             Some(Analyze::IsLocal(_)) => {
                 Some(out::Result::IsLocal(out::IsLocal { is_local: false }))
             }
-            Some(Analyze::IsStreaming(_)) => Some(out::Result::IsStreaming(out::IsStreaming {
-                is_streaming: false,
-            })),
+            Some(Analyze::IsStreaming(s)) => {
+                let is_streaming = s
+                    .plan
+                    .as_ref()
+                    .and_then(|p| p.op_type.as_ref())
+                    .map(|op| match op {
+                        sc::plan::OpType::Root(rel) => {
+                            translate::relation::relation_is_streaming(rel)
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                Some(out::Result::IsStreaming(out::IsStreaming { is_streaming }))
+            }
             other => {
                 return Err(Status::unimplemented(format!(
                     "AnalyzePlan variant not implemented: {other:?}"

@@ -57,6 +57,17 @@ pub async fn run_file(rel_out: &str) -> FileReport {
     // (e.g. multi-arg `COUNT(DISTINCT a, b)`), and a single panicking query must not abort the
     // whole corpus run — it becomes an `engine-panic` verdict instead.
     let engine = std::sync::Arc::new(Engine::new());
+
+    // Execute `--IMPORT` setup statements (CREATE VIEW, SET, etc.) before golden replay.
+    let inputs_dir = root.join("inputs");
+    for setup_sql in splitter::setup_statements(&inputs_dir, rel_input) {
+        let eng = engine.clone();
+        let sql = setup_sql.clone();
+        if let Err(join_err) = tokio::spawn(async move { eng.sql(&sql).await }).await {
+            let _ = panic_message(join_err);
+        }
+    }
+
     let mut verdicts: Vec<(String, Verdict)> = Vec::with_capacity(blocks.len());
     for b in &blocks {
         let eng = engine.clone();

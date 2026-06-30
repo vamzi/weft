@@ -90,6 +90,61 @@ pub(crate) fn lower_create_table_using(sql: &str, warehouse: &Path) -> Option<Lo
     Some(Lowered { ddl, table_dir })
 }
 
+/// A CTAS lowering: materialize `select_sql` into `table_dir`, then run `ddl`.
+pub(crate) struct LoweredCtas {
+    pub select_sql: String,
+    pub fmt: String,
+    pub ddl: String,
+    pub table_dir: PathBuf,
+}
+
+/// Return lowering for `CREATE TABLE [IF NOT EXISTS] name USING fmt AS SELECT …`.
+pub(crate) fn lower_create_table_ctas(sql: &str, warehouse: &Path) -> Option<LoweredCtas> {
+    let mut t = Tok::new(sql);
+    t.kw("create")?;
+    t.kw("table")?;
+    let if_not_exists = t.opt_kw3("if", "not", "exists");
+    let name = t.object_name()?;
+    if name.eq_ignore_ascii_case("identifier") {
+        return None;
+    }
+    // CTAS has no column list — skip optional parens only if absent.
+    if t.peek_ch() == Some(b'(') {
+        return None;
+    }
+    t.kw("using")?;
+    let fmt = t.ident()?;
+    let fmt_l = fmt.to_ascii_lowercase();
+    if !FORMATS.contains(&fmt_l.as_str()) {
+        return None;
+    }
+    t.kw("as")?;
+    let select_start = t.i;
+    let select_sql = t
+        .rest_from(select_start)
+        .trim()
+        .trim_end_matches(';')
+        .to_string();
+    if select_sql.is_empty() {
+        return None;
+    }
+    let dir_name = sanitize(&name);
+    let table_dir = warehouse.join(&dir_name);
+    let location = format!("{}/", table_dir.display());
+    let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    // Schema inferred from data at insert time; external table without explicit columns.
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE {ine}{name} STORED AS {} LOCATION '{location}'",
+        fmt_l.to_uppercase()
+    );
+    Some(LoweredCtas {
+        select_sql,
+        fmt: fmt_l,
+        ddl,
+        table_dir,
+    })
+}
+
 /// Leading-keyword INSERT detector (skips leading whitespace / `--` / `/* */`). Used by
 /// `Engine::sql` to run the write for its side effects but return empty batches, matching Spark
 /// (DataFusion's INSERT `count` row is dropped — `spark.sql("INSERT …")` is an empty DataFrame).
@@ -326,6 +381,15 @@ impl<'a> Tok<'a> {
             self.skip_ws_comments();
         }
         self.i >= self.b.len()
+    }
+
+    fn peek_ch(&mut self) -> Option<u8> {
+        self.skip_ws_comments();
+        self.b.get(self.i).copied()
+    }
+
+    fn rest_from(&self, start: usize) -> &str {
+        &self.s[start..]
     }
 }
 

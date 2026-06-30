@@ -40,6 +40,7 @@ mod spark_int_literals;
 /// Faithful lowering of Spark's `CREATE TABLE … USING <fmt>` DDL to a real, format-backed
 /// `CREATE EXTERNAL TABLE`. See [`spark_create_table::lower_create_table_using`].
 mod spark_create_table;
+mod spark_decimal;
 
 /// Re-export of the exact `arrow` DataFusion uses, so every crate in the workspace encodes
 /// Arrow IPC against one version (no cross-crate `arrow` mismatch).
@@ -87,6 +88,30 @@ fn env_bool(key: &str) -> Option<bool> {
 ///
 /// This is a stopgap living in the engine; it will migrate into the `weft-sql` Spark-dialect
 /// front end when that lands.
+/// Detect `COUNT(DISTINCT col1, col2, …)` — Spark rejects this; DataFusion panics.
+fn is_multi_arg_count_distinct(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let Some(pos) = lower.find("count") else {
+        return false;
+    };
+    let rest = &lower[pos..];
+    if !rest.contains("distinct") {
+        return false;
+    }
+    let Some(lp) = rest.find('(') else {
+        return false;
+    };
+    let Some(rp) = rest[lp..].find(')') else {
+        return false;
+    };
+    let inside = &rest[lp + 1..lp + rp];
+    if !inside.contains("distinct") {
+        return false;
+    }
+    let after_distinct = inside.split("distinct").nth(1).unwrap_or("");
+    after_distinct.contains(',')
+}
+
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // Passes run in order: (1) the leading-keyword DDL rewrite, (2) Spark single-quoted
     // string-literal unescaping, (3) the typed-literal rewrite over the result. Unescaping runs
@@ -1577,6 +1602,13 @@ impl Engine {
     /// Errors are mapped onto the Weft error model: a planning/analysis failure becomes
     /// [`Error::Plan`] (→ Spark `AnalysisException`), an execution failure [`Error::Execution`].
     pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        // Spark rejects multi-column `COUNT(DISTINCT a, b)` at analysis time; DataFusion panics.
+        // Reject early so the parity harness records `exec-error` instead of `engine-panic`.
+        if is_multi_arg_count_distinct(query) {
+            return Err(Error::Plan(
+                "COUNT(DISTINCT) does not support multiple columns".into(),
+            ));
+        }
         // Catalog-listing statements (`SHOW DATABASES`/`SHOW SCHEMAS`[ IN <cat>],
         // `SHOW TABLES IN <cat>[.<db>]`) are served straight from the registered weft catalogs —
         // DataFusion's parser rejects most of these shapes and its bridge can only see
@@ -1614,6 +1646,12 @@ impl Engine {
         // bucket it failed in before (never a regression).
         if let Some(low) = spark_create_table::lower_create_table_using(query, &self.warehouse) {
             if self.run_create_external(&low).await.is_ok() {
+                return Ok(vec![]);
+            }
+        } else if let Some(ctas) =
+            spark_create_table::lower_create_table_ctas(query, &self.warehouse)
+        {
+            if self.run_create_table_ctas(&ctas).await.is_ok() {
                 return Ok(vec![]);
             }
         } else if spark_create_table::is_insert(query) {
@@ -1661,6 +1699,47 @@ impl Engine {
         Ok(())
     }
 
+    /// CTAS: execute SELECT, write result as format files, then CREATE EXTERNAL TABLE.
+    async fn run_create_table_ctas(&self, ctas: &spark_create_table::LoweredCtas) -> Result<()> {
+        std::fs::create_dir_all(&ctas.table_dir).map_err(|e| Error::Execution(e.to_string()))?;
+        let batches = self
+            .plan_spark(&ctas.select_sql)
+            .await?
+            .collect()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        if !batches.is_empty() {
+            let ext = match ctas.fmt.as_str() {
+                "json" => "json",
+                "csv" => "csv",
+                _ => "parquet",
+            };
+            let file = ctas.table_dir.join(format!("part-00000.{ext}"));
+            use datafusion::parquet::arrow::ArrowWriter;
+            let schema = batches[0].schema();
+            let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
+            let mut writer = ArrowWriter::try_new(f, schema, None)
+                .map_err(|e| Error::Execution(e.to_string()))?;
+            for b in &batches {
+                writer
+                    .write(b)
+                    .map_err(|e| Error::Execution(e.to_string()))?;
+            }
+            writer
+                .close()
+                .map_err(|e| Error::Execution(e.to_string()))?;
+        }
+        let ddl = normalize_spark_sql(&ctas.ddl);
+        self.ctx
+            .sql(ddl.as_ref())
+            .await
+            .map_err(|e| Error::Plan(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        Ok(())
+    }
+
     /// Resolve the result schema of `query` without executing it — the logical-plan schema.
     /// Used by Spark Connect `AnalyzePlan(Schema)` (PySpark `df.schema` / `printSchema`).
     pub async fn schema(&self, query: &str) -> Result<arrow::datatypes::SchemaRef> {
@@ -1672,7 +1751,10 @@ impl Engine {
     /// the executed result and `df.schema` both expose the same column names Spark would. Shared by
     /// [`Engine::sql`] and [`Engine::schema`] so the two never disagree.
     async fn plan_spark(&self, query: &str) -> Result<datafusion::dataframe::DataFrame> {
-        let query = normalize_spark_sql(query);
+        let query = match spark_decimal::rewrite_decimal_string_compare(query) {
+            Some(q) => std::borrow::Cow::Owned(q),
+            None => normalize_spark_sql(query),
+        };
         // Plan WITHOUT executing. `ctx.sql()` eagerly runs DDL (e.g. `CREATE VIEW`) inside its
         // call, registering the view *before* we could retype its body — so we go one level down:
         // `create_logical_plan` returns the raw, un-analyzed plan, we (1) retype in-range integer

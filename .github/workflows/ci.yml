@@ -55,6 +55,8 @@ jobs:
         run: cargo test --workspace
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
+      - name: TPC-H distributed (2 workers, sf0.01)
+        run: cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so
@@ -126,4 +128,29 @@ jobs:
             parity/parity.html
             parity/scoreboard.json
           retention-days: 30
+          if-no-files-found: ignore
+
+  # Informational line-coverage report (non-blocking). Uploads an HTML artifact for trending.
+  line-coverage:
+    name: line coverage (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov --workspace --html --output-path coverage/
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html
+          path: coverage/html
+          retention-days: 14
           if-no-files-found: ignore
