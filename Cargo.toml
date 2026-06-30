@@ -40,6 +40,8 @@ weft-connect    = { path = "crates/weft-connect" }
 # Spark parity harness (golden SQL tests + scoreboard).
 weft-spark-compat = { path = "crates/weft-spark-compat" }
 weft-streaming   = { path = "crates/weft-streaming" }
+weft-orchestrator = { path = "crates/weft-orchestrator" }
+weft-gateway     = { path = "crates/weft-gateway" }
 
 [profile.release]
 opt-level = 3

@@ -33,12 +33,16 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
 use crate::shuffle::protocol::{self, ShuffleReadTicket, StageTicket};
+use crate::shuffle::spill::{BucketCache, SpillStore};
 use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 
-/// One stage's cached output: the output schema (so an *empty* bucket can still be served as a
-/// schema-carrying batch — a downstream consumer must always be able to register the input table)
-/// plus the per-downstream buckets.
-type CachedStage = (SchemaRef, Vec<Vec<RecordBatch>>);
+/// Flight `do_action` type: evict all cached stage outputs on this worker.
+pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
+/// Flight `do_action` type: register session UDF definitions (JSON payload).
+pub const ACTION_REGISTER_UDFS: &str = "register_udfs";
+
+/// One stage's cached output: schema + partitioned buckets (memory or spilled).
+type CachedStage = (SchemaRef, BucketCache);
 
 /// Per-stage cached output, partitioned into buckets (one per downstream worker).
 type StageCache = Arc<Mutex<HashMap<u32, CachedStage>>>;
@@ -47,6 +51,7 @@ type StageCache = Arc<Mutex<HashMap<u32, CachedStage>>>;
 pub struct Worker {
     engine: Arc<Engine>,
     stage_outputs: StageCache,
+    spill: Option<SpillStore>,
 }
 
 impl Worker {
@@ -55,7 +60,21 @@ impl Worker {
         Self {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
+            spill: SpillStore::from_env(),
         }
+    }
+
+    fn clear_stages(&self) {
+        if let Some(spill) = &self.spill {
+            let guard = self.stage_outputs.lock().expect("stage cache poisoned");
+            for stage_id in guard.keys() {
+                spill.clear_stage(*stage_id);
+            }
+        }
+        self.stage_outputs
+            .lock()
+            .expect("stage cache poisoned")
+            .clear();
     }
 }
 
@@ -126,10 +145,17 @@ impl Worker {
             let key_cols: Vec<usize> = t.hash_key_cols.iter().map(|&c| c as usize).collect();
             let buckets = hash_partition(&batches, &key_cols, t.num_partitions as usize)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            let cache = BucketCache::maybe_spill(
+                schema.clone(),
+                buckets,
+                t.stage_id,
+                self.spill.as_ref(),
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
             self.stage_outputs
                 .lock()
                 .expect("stage cache poisoned")
-                .insert(t.stage_id, (schema, buckets));
+                .insert(t.stage_id, (schema, cache));
             Ok(Vec::new())
         } else {
             // Output stage: run and return the result.
@@ -145,13 +171,10 @@ impl Worker {
     /// table — important for shuffle joins where some key buckets legitimately have no rows.
     fn read_shuffle(&self, r: ShuffleReadTicket) -> Vec<RecordBatch> {
         let guard = self.stage_outputs.lock().expect("stage cache poisoned");
-        let Some((schema, buckets)) = guard.get(&r.stage_id) else {
+        let Some((_schema, cache)) = guard.get(&r.stage_id) else {
             return Vec::new();
         };
-        match buckets.get(r.target_partition as usize) {
-            Some(b) if !b.is_empty() => b.clone(),
-            _ => vec![RecordBatch::new_empty(schema.clone())],
-        }
+        cache.read_partition(r.target_partition as usize)
     }
 }
 
@@ -223,9 +246,35 @@ impl FlightService for Worker {
     }
     async fn do_action(
         &self,
-        _r: Request<Action>,
+        request: Request<Action>,
     ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
-        unimpl("do_action")
+        let action = request.into_inner();
+        match action.r#type.as_str() {
+            ACTION_CLEAR_STAGES => {
+                self.clear_stages();
+                let body = arrow_flight::Result {
+                    body: b"ok".to_vec().into(),
+                };
+                Ok(Response::new(
+                    futures::stream::iter(vec![Ok(body)]).boxed(),
+                ))
+            }
+            ACTION_REGISTER_UDFS => {
+                let payload = String::from_utf8_lossy(&action.body);
+                self.engine
+                    .register_udfs_json(&payload)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let body = arrow_flight::Result {
+                    body: b"ok".to_vec().into(),
+                };
+                Ok(Response::new(
+                    futures::stream::iter(vec![Ok(body)]).boxed(),
+                ))
+            }
+            other => Err(Status::unimplemented(format!(
+                "flight do_action `{other}` not implemented"
+            ))),
+        }
     }
     async fn list_actions(
         &self,
@@ -256,9 +305,30 @@ pub async fn serve_worker(port: u16, engine: Arc<Engine>) -> Result<()> {
     Ok(())
 }
 
-/// Connect to a worker and run one `do_get` with the given ticket bytes, decoding the Flight
-/// stream into record batches. The shared transport for every driver→worker call.
+/// Connect to a worker and run one `do_get` with retries on transient errors.
 async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
+    const MAX_TRIES: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..MAX_TRIES {
+        match do_get_batches_once(endpoint.clone(), ticket_bytes.clone()).await {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                let retryable = e.to_string().contains("connect worker")
+                    || e.to_string().contains("do_get:")
+                    || e.to_string().contains("Unavailable");
+                if !retryable || attempt + 1 == MAX_TRIES {
+                    return Err(e);
+                }
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::Execution("do_get failed".into())))
+}
+
+async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
     // Build the channel via tonic directly (arrow-flight's generated client has no `connect`).
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
@@ -292,6 +362,38 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
         }
     }
     Ok(out)
+}
+
+/// Evict all cached shuffle stages on a worker (post-query cleanup).
+pub async fn clear_worker_stages(endpoint: String) -> Result<()> {
+    do_action(endpoint, ACTION_CLEAR_STAGES, b"").await
+}
+
+/// Push UDF definitions to a worker before stage execution.
+pub async fn sync_udfs_to_worker(endpoint: String, udf_json: &str) -> Result<()> {
+    do_action(endpoint, ACTION_REGISTER_UDFS, udf_json.as_bytes()).await
+}
+
+async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<()> {
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .map_err(|e| Error::Io(format!("endpoint: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
+    let mut client = FlightServiceClient::new(channel);
+    let action = Action {
+        r#type: action_type.to_string(),
+        body: body.to_vec().into(),
+    };
+    let mut stream = client
+        .do_action(action)
+        .await
+        .map_err(|e| Error::Execution(format!("do_action: {}", e.message())))?
+        .into_inner();
+    while let Some(item) = stream.next().await {
+        item.map_err(|e| Error::Execution(format!("do_action stream: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Driver: send raw `sql` to a worker over Flight and collect the result (single-stage path).

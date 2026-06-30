@@ -29,6 +29,9 @@ mod schema_adapt;
 /// Spark-only scalar functions (DataFusion `ScalarUDF`s) registered into every [`Engine`].
 pub mod spark_functions;
 
+/// Session UDF registry (`CREATE FUNCTION`, worker sync).
+pub mod udf_registry;
+
 /// Spark-compatible output column naming for the top result projection (drop-in `df.columns`
 /// parity). See [`spark_names::project_spark_names`].
 mod spark_names;
@@ -1492,6 +1495,8 @@ pub struct Engine {
     /// `SHOW DATABASES`/`SHOW TABLES IN …` authoritatively (the bridge only exposes a best-effort,
     /// already-materialized listing). See the SHOW interception in [`Engine::sql`].
     weft_catalogs: Mutex<HashMap<String, Arc<dyn weft_catalog::CatalogProvider>>>,
+    /// User-defined functions registered in this session (SQL `CREATE FUNCTION`, Connect sync).
+    udf_registry: udf_registry::SharedUdfRegistry,
 }
 
 impl Engine {
@@ -1594,7 +1599,25 @@ impl Engine {
             warehouse,
             temp_views: Mutex::new(HashSet::new()),
             weft_catalogs: Mutex::new(HashMap::new()),
+            udf_registry: Arc::new(Mutex::new(udf_registry::UdfRegistry::new())),
         }
+    }
+
+    /// Import UDF definitions from JSON (distributed worker sync).
+    pub fn register_udfs_json(&self, json: &str) -> Result<()> {
+        let mut reg = self.udf_registry.lock().unwrap();
+        reg.import_json(json)?;
+        reg.apply_to_context(&self.ctx)
+    }
+
+    /// Export registered UDFs for broadcast to workers.
+    pub fn export_udfs_json(&self) -> String {
+        self.udf_registry.lock().unwrap().export_json()
+    }
+
+    /// Shared UDF registry handle (Connect registration, worker sync).
+    pub fn udf_registry(&self) -> udf_registry::SharedUdfRegistry {
+        Arc::clone(&self.udf_registry)
     }
 
     /// Run a SQL string and collect the result as Arrow record batches.
@@ -1617,6 +1640,13 @@ impl Engine {
         // (including bare `SHOW TABLES`) to flow through unchanged.
         if let Some(show) = parse_show(query) {
             return self.run_show(&show).await;
+        }
+        // SQL user-defined functions: `CREATE [OR REPLACE] FUNCTION … RETURN …`
+        if let Some(def) = udf_registry::try_create_function(query) {
+            let mut reg = self.udf_registry.lock().unwrap();
+            reg.register_sql_fn(def.clone());
+            reg.apply_to_context(&self.ctx)?;
+            return Ok(vec![]);
         }
         // SPARK-29628 (`INVALID_TEMP_OBJ_REFERENCE`): a *persistent* `CREATE VIEW` may not reference
         // a session-temporary view. DataFusion has no temp/permanent distinction (we strip the

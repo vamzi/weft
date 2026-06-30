@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod partition;
 pub mod protocol;
+pub mod spill;
 
 pub use partition::hash_partition;
 pub use protocol::{decode_ticket, ShuffleReadTicket, StageTicket, Ticket};

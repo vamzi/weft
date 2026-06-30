@@ -95,9 +95,12 @@ Implemented in `crates/weft-execution`: 2-stage `partial-agg → hash shuffle �
   seam in `lib.rs`.
 - Test `two_worker_groupby_matches_single_node` asserts row-for-row equality with single-node.
 
-**Remaining 1.5b follow-ups (deferred):** auto-decompose SQL aggregates (AVG/COUNT(DISTINCT) via
-sum+count or sketches), >2-stage plans, shuffle spill, dynamic worker discovery, `do_exchange`
-streaming, and routing `weft spark server --cluster` GROUP BY through `run_distributed`.
+**Completed in 1.5b:** auto-decompose SQL aggregates (AVG/COUNT(DISTINCT)), multi-stage DAG plans,
+broadcast joins, global ORDER BY/LIMIT — see `stage_planner.rs` + `auto_distribute.rs`.
+
+**Remaining 1.5b follow-ups:** shuffle spill (implemented via `WEFT_SHUFFLE_SPILL_DIR`),
+dynamic worker discovery (`K8sMembership` behind `k8s` feature), Spark Connect → distributed
+routing (`weft-connect::distributed`), and `do_exchange` streaming.
 
 ### Phase 1 exit loose ends
 - Compute **median per-query speedup vs Spark** (need a Spark baseline run or use Sail's published

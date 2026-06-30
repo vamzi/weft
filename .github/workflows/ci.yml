@@ -57,8 +57,10 @@ jobs:
         run: cargo test --workspace
       - name: TPC-H coverage (Q1/Q3/Q5/Q6/Q10)
         run: cargo run -p weft-bench -- tpch
-      - name: TPC-H distributed (2 workers, sf0.01)
-        run: cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2
+      - name: TPC-H distributed (2 workers, sf0.05)
+        run: cargo run -p weft-bench -- tpch-distributed --sf 0.05 --workers 3
+      - name: Distributed correctness gate
+        run: cargo run -p weft-bench -- correctness-distributed --rows 2000
 
   # ClickBench / correctness coverage on small synthetic data. Required gate: all 43 queries must
   # pass. Fixed by switching queries.sql identifiers from ANSI double-quotes to backtick-quotes so

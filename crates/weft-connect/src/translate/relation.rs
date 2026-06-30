@@ -100,10 +100,23 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
         RelType::Drop(d) => drop_columns(ctx, d).await,
         RelType::ToDf(t) => to_df(ctx, t).await,
         RelType::Unpivot(u) => unpivot(ctx, u).await,
-        // Single-node: hints and repartitioning are no-ops over the child.
+        // Repartition hints set shuffle partition count for distributed routing.
+        RelType::Repartition(r) => {
+            if r.num_partitions > 0 {
+                std::env::set_var(
+                    "WEFT_SHUFFLE_PARTITIONS",
+                    r.num_partitions.to_string(),
+                );
+            }
+            child(ctx, &r.input).await
+        }
+        RelType::RepartitionByExpression(r) => {
+            if let Some(n) = r.num_partitions.filter(|&n| n > 0) {
+                std::env::set_var("WEFT_SHUFFLE_PARTITIONS", n.to_string());
+            }
+            child(ctx, &r.input).await
+        }
         RelType::Hint(h) => child(ctx, &h.input).await,
-        RelType::Repartition(r) => child(ctx, &r.input).await,
-        RelType::RepartitionByExpression(r) => child(ctx, &r.input).await,
         other => Err(Status::unimplemented(format!(
             "relation not supported yet: {}",
             rel_name(other)
