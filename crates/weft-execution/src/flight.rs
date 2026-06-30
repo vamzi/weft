@@ -167,10 +167,16 @@ impl Worker {
     /// table — important for shuffle joins where some key buckets legitimately have no rows.
     fn read_shuffle(&self, r: ShuffleReadTicket) -> Vec<RecordBatch> {
         let guard = self.stage_outputs.lock().expect("stage cache poisoned");
-        let Some((_schema, cache)) = guard.get(&r.stage_id) else {
+        let Some((schema, cache)) = guard.get(&r.stage_id) else {
             return Vec::new();
         };
-        cache.read_partition(r.target_partition as usize)
+        let batches = cache.read_partition(r.target_partition as usize);
+        // Empty in-memory buckets carry no schema; consumers still need typed `shuffle_input`
+        // (e.g. TPC-H Q8 with few group keys and many partitions).
+        if batches.is_empty() {
+            return vec![RecordBatch::new_empty(schema.clone())];
+        }
+        batches
     }
 }
 
@@ -488,5 +494,80 @@ mod tests {
         // The cached bucket 0 should now be pullable and contain the row.
         let pulled = pull_bucket(endpoint, 0, 0).await.unwrap();
         assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_shuffle_bucket_carries_producer_schema() {
+        let port = 50563;
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        // One row hashes into exactly one of three buckets; the other two are empty but must still
+        // expose the producer schema so consumers can plan `SELECT k FROM shuffle_input`.
+        let ticket = StageTicket {
+            stage_id: 7,
+            partition_id: 0,
+            num_partitions: 3,
+            upstream_endpoints: vec![],
+            stage_sql: "SELECT 1 AS k, 2 AS v".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![0],
+            upstream_stage_ids: vec![],
+            produce: true,
+        };
+        for _ in 0..50 {
+            if run_stage_on_worker(endpoint.clone(), ticket.clone())
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut empty_bucket = None;
+        for bucket in [1u32, 2] {
+            for _ in 0..50 {
+                match pull_bucket(endpoint.clone(), 7, bucket).await {
+                    Ok(b) if !b.is_empty() => {
+                        empty_bucket = Some((bucket, b));
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                }
+            }
+            if empty_bucket.is_some() {
+                break;
+            }
+        }
+        let (bucket, batches) = empty_bucket.expect("expected an empty typed bucket");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+        assert_eq!(batches[0].schema().field(0).name(), "k");
+
+        // Consumer over an empty upstream bucket must still resolve column names.
+        let consume = StageTicket {
+            stage_id: 8,
+            partition_id: bucket,
+            num_partitions: 3,
+            upstream_endpoints: vec![endpoint.clone()],
+            stage_sql: "SELECT k, sum(v) AS s FROM shuffle_input GROUP BY k".into(),
+            plan_fragment: vec![],
+            hash_key_cols: vec![],
+            upstream_stage_ids: vec![7],
+            produce: false,
+        };
+        let mut out = None;
+        for _ in 0..50 {
+            match run_stage_on_worker(endpoint.clone(), consume.clone()).await {
+                Ok(b) => {
+                    out = Some(b);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        out.expect("consumer over empty typed bucket should plan and run");
     }
 }
