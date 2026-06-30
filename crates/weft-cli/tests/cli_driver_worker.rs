@@ -1,7 +1,10 @@
 //! Smoke test for the `weft worker` / `weft driver` CLI subprocess path: spawn two workers,
 //! register in-memory data via Parquet files, and assert the distributed GROUP BY matches
 //! single-node execution.
+//!
+//! Lives in `weft-cli` so Cargo sets `CARGO_BIN_EXE_weft` when the test binary is built.
 
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +14,14 @@ use weft_loom::arrow::array::Int64Array;
 use weft_loom::arrow::datatypes::{DataType, Field, Schema};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
+
+fn pick_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
 
 fn make_batch(start: i64, end: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -37,6 +48,20 @@ fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
     writer.close().unwrap();
 }
 
+fn weft_bin() -> std::path::PathBuf {
+    std::env::var("CARGO_BIN_EXE_weft")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let target = std::env::var("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
+                });
+            let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+            target.join(profile).join("weft")
+        })
+}
+
 #[tokio::test]
 async fn cli_driver_worker_matches_single_node() {
     const N: i64 = 50;
@@ -60,18 +85,15 @@ async fn cli_driver_worker_matches_single_node() {
     write_parquet(&p0_path, &make_batch(0, N / 2));
     write_parquet(&p1_path, &make_batch(N / 2, N));
 
-    let weft = std::env::var("CARGO_BIN_EXE_weft")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/weft")
-        });
+    let weft = weft_bin();
     assert!(
         weft.exists(),
         "weft binary not found at {}; run `cargo build -p weft-cli` first",
         weft.display()
     );
-    let p0: u16 = 50701;
-    let p1: u16 = 50702;
+
+    let p0 = pick_port();
+    let p1 = pick_port();
 
     let mut w0 = Command::new(&weft)
         .args([
@@ -102,7 +124,6 @@ async fn cli_driver_worker_matches_single_node() {
         .spawn()
         .expect("spawn worker 1");
 
-    // Wait for workers to bind.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut driver_ok = false;

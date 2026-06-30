@@ -4322,6 +4322,8 @@ dependencies = [
 name = "weft-cli"
 version = "0.0.0"
 dependencies = [
+ "datafusion",
+ "tempfile",
  "tokio",
  "weft-common",
  "weft-connect",
@@ -4378,7 +4380,6 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "prost 0.14.4",
- "tempfile",
  "tokio",
  "tonic 0.14.6",
  "weft-common",

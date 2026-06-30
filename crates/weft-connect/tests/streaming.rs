@@ -1,5 +1,6 @@
 //! Streaming Connect integration tests.
 
+use std::net::TcpListener;
 use std::time::Duration;
 
 use sc::spark_connect_service_client::SparkConnectServiceClient;
@@ -7,6 +8,14 @@ use sc::spark_connect_service_server::SparkConnectService;
 use tonic::Request;
 use weft_connect::{serve, ServerConfig, WeftService};
 use weft_proto::spark::connect as sc;
+
+fn pick_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
 
 async fn boot(port: u16) -> SparkConnectServiceClient<tonic::transport::Channel> {
     tokio::spawn(async move {
@@ -28,7 +37,7 @@ async fn boot(port: u16) -> SparkConnectServiceClient<tonic::transport::Channel>
 
 #[tokio::test]
 async fn write_stream_start_returns_query_id() {
-    let port = 50801u16;
+    let port = pick_port();
     let mut client = boot(port).await;
 
     let req = sc::ExecutePlanRequest {
