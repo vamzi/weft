@@ -145,6 +145,8 @@ jobs:
           rustup component add llvm-tools-preview
           rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
+      - name: Build weft CLI (integration tests spawn the binary under llvm-cov target dir)
+        run: cargo build -p weft-cli --target-dir target/llvm-cov-target
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Generate HTML coverage report
