@@ -49,17 +49,33 @@ fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
 }
 
 fn weft_bin() -> std::path::PathBuf {
-    std::env::var("CARGO_BIN_EXE_weft")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let target = std::env::var("CARGO_TARGET_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
-                });
-            let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-            target.join(profile).join("weft")
-        })
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_weft") {
+        return std::path::PathBuf::from(p);
+    }
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(std::path::PathBuf::from(td).join(&profile).join("weft"));
+    }
+    let workspace_target =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    candidates.push(workspace_target.join(&profile).join("weft"));
+    // `cargo llvm-cov` uses a separate target dir; CI pre-builds weft-cli there.
+    candidates.push(
+        workspace_target
+            .join("llvm-cov-target")
+            .join(&profile)
+            .join("weft"),
+    );
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| workspace_target.join(&profile).join("weft"))
 }
 
 #[tokio::test]
