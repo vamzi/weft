@@ -81,15 +81,50 @@ impl ClusterMembership for StaticMembership {
 }
 
 /// Resolve cluster membership for distributed execution.
-///
-/// Priority: `WEFT_WORKER_SERVICE` (K8s headless Service DNS, `k8s` feature) → static
-/// `WEFT_WORKERS` / config list.
 pub fn resolve_membership(static_workers: &[WorkerEndpoint]) -> Arc<dyn ClusterMembership> {
     #[cfg(feature = "k8s")]
     if let Some(k8s) = k8s::K8sMembership::from_env() {
-        return Arc::new(k8s);
+        return Arc::new(RefreshingMembership::new(k8s));
     }
-    Arc::new(StaticMembership::new(static_workers.to_vec()))
+    Arc::new(RefreshingMembership::new(StaticMembership::new(
+        static_workers.to_vec(),
+    )))
+}
+
+/// TTL-cached membership that re-resolves endpoints on each `endpoints()` call after expiry.
+pub struct RefreshingMembership {
+    inner: Arc<dyn ClusterMembership>,
+    ttl: std::time::Duration,
+    cache: std::sync::Mutex<(std::time::Instant, Vec<WorkerEndpoint>)>,
+}
+
+impl RefreshingMembership {
+    pub fn new(inner: impl ClusterMembership + 'static) -> Self {
+        let ttl_ms = std::env::var("WEFT_MEMBERSHIP_TTL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
+        Self {
+            inner: Arc::new(inner),
+            ttl: std::time::Duration::from_millis(ttl_ms),
+            cache: std::sync::Mutex::new((std::time::Instant::now(), Vec::new())),
+        }
+    }
+
+    fn refresh_if_needed(&self) -> Vec<WorkerEndpoint> {
+        let mut guard = self.cache.lock().expect("membership cache poisoned");
+        if guard.1.is_empty() || guard.0.elapsed() >= self.ttl {
+            guard.1 = self.inner.endpoints();
+            guard.0 = std::time::Instant::now();
+        }
+        guard.1.clone()
+    }
+}
+
+impl ClusterMembership for RefreshingMembership {
+    fn endpoints(&self) -> Vec<WorkerEndpoint> {
+        self.refresh_if_needed()
+    }
 }
 
 #[cfg(test)]

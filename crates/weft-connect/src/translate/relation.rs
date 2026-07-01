@@ -256,7 +256,7 @@ async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPla
         .collect::<Result<Vec<_>, _>>()?;
     if a.group_type == sc::aggregate::GroupType::Pivot as i32 {
         let pivot = a.pivot.as_ref().ok_or_else(|| inval("pivot: no spec"))?;
-        return pivot_aggregate(ctx, input, group, a, pivot);
+        return pivot_aggregate(ctx, input, group, a, pivot).await;
     }
     // Spark's aggregate_expressions may repeat the grouping columns; DataFusion's aggregate adds
     // the group columns itself, so drop plain group-column refs from the aggregate list.
@@ -272,26 +272,60 @@ async fn aggregate(ctx: &SessionContext, a: &sc::Aggregate) -> Result<LogicalPla
     build(LogicalPlanBuilder::from(input).aggregate(group, aggs))
 }
 
-/// `df.groupBy(...).pivot(col, [values]).agg(...)`: one output column per (pivot value, aggregate),
-/// each aggregate filtered to rows where the pivot column equals that value
-/// (`agg(x) FILTER (WHERE pivot = value)`). Requires explicit pivot values (no server-side distinct).
-fn pivot_aggregate(
+/// `df.groupBy(...).pivot(col, [values]).agg(...)`: when values are omitted, discovers distinct
+/// pivot values from the input relation.
+async fn pivot_aggregate(
     ctx: &SessionContext,
     input: LogicalPlan,
     group: Vec<Expr>,
     a: &sc::Aggregate,
     pivot: &sc::aggregate::Pivot,
 ) -> Result<LogicalPlan, Status> {
-    if pivot.values.is_empty() {
-        return Err(Status::unimplemented(
-            "pivot without an explicit value list is not supported yet",
-        ));
-    }
     let pivot_col = to_expr(
         ctx,
         pivot.col.as_ref().ok_or_else(|| inval("pivot.col"))?,
         None,
     )?;
+    let mut values = pivot.values.clone();
+    if values.is_empty() {
+        let sub = Unparser::default()
+            .plan_to_sql(&input)
+            .map_err(|e| inval(format!("pivot unparse: {e}")))?;
+        let col_name = pivot
+            .col
+            .as_ref()
+            .and_then(|e| e.expr_type.as_ref())
+            .and_then(|t| match t {
+                sc::expression::ExprType::UnresolvedAttribute(u) => Some(u.unparsed_identifier.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "pivot_col".into());
+        let sql = format!(
+            "SELECT DISTINCT `{col_name}` AS v FROM ({sub}) AS _pivot_src ORDER BY v"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| inval(format!("pivot distinct: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| inval(format!("pivot collect: {e}")))?;
+        for b in batches {
+            use datafusion::arrow::array::Array;
+            use datafusion::scalar::ScalarValue;
+            let arr = b.column(0);
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    let sv = ScalarValue::try_from_array(arr, i)
+                        .map_err(|e| inval(format!("pivot value: {e}")))?;
+                    values.push(scalar_to_spark_literal(&sv)?);
+                }
+            }
+        }
+        if values.is_empty() {
+            return Err(inval("pivot: no distinct values found"));
+        }
+    }
     let aggs = a
         .aggregate_expressions
         .iter()
@@ -301,7 +335,7 @@ fn pivot_aggregate(
     let single = aggs.len() == 1;
     let labels: Vec<String> = aggs.iter().map(agg_label).collect();
     let mut out = Vec::new();
-    for v in &pivot.values {
+    for v in &values {
         let name = pivot_value_name(v);
         let filter = pivot_col.clone().eq(super::expr::literal(v)?);
         for (agg, label) in aggs.iter().zip(&labels) {
@@ -334,6 +368,32 @@ fn agg_label(e: &Expr) -> String {
         Expr::Alias(a) => a.name.clone(),
         other => other.schema_name().to_string(),
     }
+}
+
+/// Build a Spark Connect literal from a DataFusion scalar (for pivot value discovery).
+fn scalar_to_spark_literal(sv: &datafusion::scalar::ScalarValue) -> Result<sc::expression::Literal, Status> {
+    use datafusion::scalar::ScalarValue;
+    use sc::expression::literal::LiteralType as L;
+    let literal_type = match sv {
+        ScalarValue::Null => return Err(inval("pivot literal: null")),
+        ScalarValue::Boolean(Some(b)) => Some(L::Boolean(*b)),
+        ScalarValue::Int8(Some(v)) => Some(L::Byte(*v as i32)),
+        ScalarValue::Int16(Some(v)) => Some(L::Short(*v as i32)),
+        ScalarValue::Int32(Some(v)) => Some(L::Integer(*v)),
+        ScalarValue::Int64(Some(v)) => Some(L::Long(*v)),
+        ScalarValue::Float32(Some(v)) => Some(L::Float(*v)),
+        ScalarValue::Float64(Some(v)) => Some(L::Double(*v)),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(L::String(s.clone())),
+        ScalarValue::Date32(Some(d)) => Some(L::Date(*d)),
+        ScalarValue::TimestampMicrosecond(Some(t), _) | ScalarValue::TimestampNanosecond(Some(t), _) => {
+            Some(L::Timestamp(*t))
+        }
+        other => return Err(inval(format!("pivot literal: unsupported {other:?}"))),
+    };
+    Ok(sc::expression::Literal {
+        literal_type,
+        ..Default::default()
+    })
 }
 
 /// The output column name Spark gives a pivot value (its literal rendered as a string).

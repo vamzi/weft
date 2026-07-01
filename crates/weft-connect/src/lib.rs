@@ -87,6 +87,8 @@ pub struct WeftService {
     pub workers: Vec<String>,
     /// Python UDF artifact bytes from `AddArtifacts`.
     artifacts: udf::SharedArtifacts,
+    /// Buffered completed operation responses for ReattachExecute.
+    completed_ops: std::sync::Mutex<std::collections::HashMap<String, Vec<sc::ExecutePlanResponse>>>,
 }
 
 impl Default for WeftService {
@@ -116,6 +118,7 @@ impl WeftService {
             streaming: Arc::new(StreamingQueryManager::new()),
             workers: distributed::parse_worker_list(None),
             artifacts: Arc::new(std::sync::Mutex::new(udf::ArtifactStore::default())),
+            completed_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -259,6 +262,13 @@ impl WeftService {
         }
         responses.push(complete);
         Ok(responses)
+    }
+
+    fn buffer_operation(&self, operation_id: &str, responses: Vec<sc::ExecutePlanResponse>) {
+        self.completed_ops
+            .lock()
+            .expect("completed_ops poisoned")
+            .insert(operation_id.to_string(), responses);
     }
 
     /// Handle a PySpark `SqlCommand`. A query stays lazy — we return a `SqlCommandResult` whose
@@ -569,6 +579,7 @@ impl SparkConnectService for WeftService {
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
 
+        self.buffer_operation(&operation_id, responses.clone());
         let stream = tokio_stream::iter(responses.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -809,6 +820,16 @@ impl SparkConnectService for WeftService {
         request: Request<sc::ReattachExecuteRequest>,
     ) -> std::result::Result<Response<Self::ReattachExecuteStream>, Status> {
         let req = request.into_inner();
+        if let Some(buf) = self
+            .completed_ops
+            .lock()
+            .expect("completed_ops poisoned")
+            .get(&req.operation_id)
+            .cloned()
+        {
+            let stream = tokio_stream::iter(buf.into_iter().map(Ok));
+            return Ok(Response::new(Box::pin(stream) as Self::ReattachExecuteStream));
+        }
         let complete = self.response(
             &req.session_id,
             &req.operation_id,

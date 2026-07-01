@@ -10,6 +10,8 @@ pub struct StreamQueryConfig {
     pub sink_path: Option<String>,
     pub sink_format: String,
     pub output_mode: String,
+    /// Optional dedup key columns (comma-separated).
+    pub dedup_columns: Vec<String>,
 }
 
 impl Default for StreamQueryConfig {
@@ -20,6 +22,7 @@ impl Default for StreamQueryConfig {
             sink_path: None,
             sink_format: "memory".into(),
             output_mode: "append".into(),
+            dedup_columns: vec![],
         }
     }
 }
@@ -47,6 +50,10 @@ impl StreamQueryConfig {
                 .get("outputMode")
                 .cloned()
                 .unwrap_or_else(|| "append".into()),
+            dedup_columns: options
+                .get("dedupColumns")
+                .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
+                .unwrap_or_default(),
         }
     }
 }

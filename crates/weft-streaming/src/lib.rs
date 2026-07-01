@@ -9,6 +9,8 @@ mod query;
 mod scheduler;
 mod sink;
 mod source;
+mod state;
+mod watermark;
 
 pub use checkpoint::CheckpointStore;
 pub use config::StreamQueryConfig;
@@ -16,3 +18,5 @@ pub use query::{QueryProgress, QueryStatus, StreamingQuery, StreamingQueryId};
 pub use scheduler::{StreamingQueryManager, Trigger};
 pub use sink::{FileSink, MemorySink, Sink};
 pub use source::{FileSource, KafkaSource, MemoryRateSource, Source};
+pub use state::DedupState;
+pub use watermark::WatermarkConfig;

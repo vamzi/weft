@@ -7,8 +7,10 @@
 //! partitioned shuffle with spill is a deliberate divergence lane — Sail's cluster mode is new
 //! (Feb 2026) and its ClickBench is single-process-per-query.
 
+pub mod aqe;
 pub mod driver;
 pub mod flight;
+pub mod lineage;
 pub mod membership;
 pub mod plan;
 pub mod scheduler;

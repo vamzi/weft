@@ -7,11 +7,13 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use weft_loom::Engine;
 
-use crate::checkpoint::{CheckpointState, CheckpointStore};
+use crate::checkpoint::CheckpointStore;
 use crate::config::StreamQueryConfig;
 use crate::query::{QueryProgress, QueryStatus, StreamingQuery, StreamingQueryId};
 use crate::sink::{FileSink, MemorySink, Sink};
 use crate::source::{FileSource, KafkaSource, MemoryRateSource, Source};
+use crate::state::DedupState;
+use crate::watermark::WatermarkConfig;
 
 /// Trigger mode for micro-batch execution.
 #[derive(Debug, Clone)]
@@ -36,6 +38,10 @@ struct ManagedQuery {
     checkpoint: CheckpointStore,
     #[allow(dead_code)]
     trigger: Trigger,
+    watermark: Option<WatermarkConfig>,
+    dedup: Option<DedupState>,
+    dedup_columns: Vec<String>,
+    dedup_key_cols: Vec<usize>,
 }
 
 impl StreamingQueryManager {
@@ -68,6 +74,7 @@ impl StreamingQueryManager {
         let id = q.query_id.clone();
         let checkpoint = CheckpointStore::new(&checkpoint_location);
         let _ = checkpoint.init_for_query(&id);
+        let watermark = WatermarkConfig::from_options(&config.source_options);
         let source: Box<dyn Source> = build_source(&config);
         let sink: Box<dyn Sink> = build_sink(&config);
         let managed = ManagedQuery {
@@ -76,6 +83,14 @@ impl StreamingQueryManager {
             sink,
             checkpoint,
             trigger,
+            watermark,
+            dedup: if config.dedup_columns.is_empty() {
+                None
+            } else {
+                Some(DedupState::new(100_000))
+            },
+            dedup_columns: config.dedup_columns.clone(),
+            dedup_key_cols: vec![],
         };
         self.queries.write().await.insert(id.id.clone(), managed);
         id
@@ -117,6 +132,21 @@ impl StreamingQueryManager {
             return Ok(0);
         }
         let batches = m.source.poll_batch(engine).await?;
+        let mut batches = batches;
+        if let Some(wm) = &m.watermark {
+            let now = chrono::Utc::now().timestamp_micros();
+            let watermark = wm.watermark_micros(now);
+            batches = apply_watermark(batches, &wm.event_time_column, watermark);
+            let mut state = m.checkpoint.load().unwrap_or_default();
+            state.watermark_micros = watermark;
+            let _ = m.checkpoint.save(&state);
+        }
+        if let Some(dedup) = &mut m.dedup {
+            if m.dedup_key_cols.is_empty() && !batches.is_empty() {
+                m.dedup_key_cols = resolve_dedup_cols(&batches[0], &m.dedup_columns);
+            }
+            batches = dedup.dedup_batches(&batches, &m.dedup_key_cols);
+        }
         let rows = m.sink.write_batch(&batches)?;
         m.query.batch_id += 1;
         m.query.status.is_data_available = rows > 0;
@@ -128,12 +158,10 @@ impl StreamingQueryManager {
             processed_rows_per_second: rows as f64,
             batch_id: m.query.batch_id,
         });
-        let state = CheckpointState {
-            query_id: m.query.query_id.id.clone(),
-            run_id: m.query.query_id.run_id.clone(),
-            batch_id: m.query.batch_id,
-            source_offsets: vec![],
-        };
+        // Exactly-once: checkpoint only after successful sink write.
+        let mut state = m.checkpoint.load().unwrap_or_default();
+        state.batch_id = m.query.batch_id;
+        state.committed_batch_id = m.query.batch_id;
         let _ = m.checkpoint.save(&state);
         Ok(rows)
     }
@@ -211,6 +239,60 @@ fn build_sink(config: &StreamQueryConfig) -> Box<dyn Sink> {
         }
         _ => Box::new(MemorySink::new()),
     }
+}
+
+fn resolve_dedup_cols(batch: &weft_loom::arrow::record_batch::RecordBatch, names: &[String]) -> Vec<usize> {
+    names
+        .iter()
+        .filter_map(|n| batch.schema().index_of(n).ok())
+        .collect()
+}
+
+fn apply_watermark(
+    batches: Vec<weft_loom::arrow::record_batch::RecordBatch>,
+    event_col: &str,
+    watermark_micros: i64,
+) -> Vec<weft_loom::arrow::record_batch::RecordBatch> {
+    use weft_loom::arrow::array::{Array, AsArray, BooleanArray};
+    use weft_loom::arrow::compute::filter_record_batch;
+    use weft_loom::arrow::datatypes::DataType;
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let Ok(col_idx) = batch.schema().index_of(event_col) else {
+            out.push(batch);
+            continue;
+        };
+        let arr = batch.column(col_idx);
+        let mut keep = vec![true; batch.num_rows()];
+        match arr.data_type() {
+            DataType::Timestamp(_, _) => {
+                let ts = arr.as_primitive::<weft_loom::arrow::datatypes::TimestampMicrosecondType>();
+                for (row, slot) in keep.iter_mut().enumerate() {
+                    if !arr.is_null(row) && ts.value(row) < watermark_micros {
+                        *slot = false;
+                    }
+                }
+            }
+            DataType::Date32 => {
+                let d = arr.as_primitive::<weft_loom::arrow::datatypes::Date32Type>();
+                let wm_days = (watermark_micros / 86_400_000_000) as i32;
+                for (row, slot) in keep.iter_mut().enumerate() {
+                    if !arr.is_null(row) && d.value(row) < wm_days {
+                        *slot = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mask = BooleanArray::from(keep);
+        if let Ok(filtered) = filter_record_batch(&batch, &mask) {
+            if filtered.num_rows() > 0 {
+                out.push(filtered);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

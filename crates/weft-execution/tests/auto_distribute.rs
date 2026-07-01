@@ -252,19 +252,18 @@ async fn auto_derived_broadcast_join() {
 }
 
 #[tokio::test]
-async fn two_sharded_tables_is_rejected() {
-    // Two sharded tables in a join can't be a broadcast join — must be rejected (caller falls back
-    // to single-node / a hand-authored shuffle-join plan).
+async fn two_sharded_tables_shuffle_join() {
     let single = Engine::new();
     single
         .register_batches("t", vec![batch(0, 60, 12)])
         .unwrap();
     single.register_batches("dim", vec![dim(12)]).unwrap();
-    let err = plan_distributed(
+    let plan = plan_distributed(
         &single,
-        "SELECT d.d_name AS name, COUNT(*) AS c FROM t JOIN dim d ON t.k = d.d_key GROUP BY d.d_name",
-        &[], // nothing replicated -> both t and dim are sharded
+        "SELECT d.d_key AS name, COUNT(*) AS c FROM t JOIN dim d ON t.k = d.d_key GROUP BY d.d_key",
+        &[],
     )
     .await;
-    assert!(err.is_err(), "two sharded tables must be rejected");
+    assert!(plan.is_ok(), "two-sharded shuffle join should auto-derive: {plan:?}");
+    assert_eq!(plan.unwrap().stages.len(), 3);
 }
