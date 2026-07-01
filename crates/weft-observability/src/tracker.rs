@@ -1,6 +1,6 @@
 //! High-level helpers for instrumenting query execution.
 
-use crate::events::{ExecutionEvent, JobStatus, StageStatus, TaskStatus, now_ms};
+use crate::events::{now_ms, ExecutionEvent, JobStatus, StageStatus, TaskStatus};
 use crate::store::SharedStore;
 
 /// Tracks a single operation (Spark Connect `operation_id`) through job/stage lifecycle.

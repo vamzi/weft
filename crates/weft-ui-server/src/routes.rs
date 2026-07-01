@@ -1,12 +1,12 @@
 use axum::{
-    Json, Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
     },
     routing::get,
+    Json, Router,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -52,7 +52,10 @@ pub fn app_router(store: SharedStore) -> Router {
             get(get_stage),
         )
         .route("/api/v1/applications/{app_id}/sql", get(list_sql))
-        .route("/api/v1/applications/{app_id}/executors", get(list_executors))
+        .route(
+            "/api/v1/applications/{app_id}/executors",
+            get(list_executors),
+        )
         .route(
             "/api/v1/applications/{app_id}/environment",
             get(list_environment),
@@ -124,10 +127,8 @@ async fn list_environment(
     Path(_app_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let entries = state.store.list_environment();
-    let map: std::collections::HashMap<String, String> = entries
-        .into_iter()
-        .map(|e| (e.key, e.value))
-        .collect();
+    let map: std::collections::HashMap<String, String> =
+        entries.into_iter().map(|e| (e.key, e.value)).collect();
     Json(json!({
         "runtime": { "javaVersion": "N/A (Rust/DataFusion)" },
         "sparkProperties": map,
@@ -172,16 +173,8 @@ async fn spark_proxy(Query(q): Query<SparkProxyQuery>) -> Result<Response, Statu
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok((
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response())
+    let body = resp.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok((status, [(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
 fn is_allowed_proxy_url(url: &str) -> bool {
@@ -200,6 +193,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use std::sync::Arc;
     use tower::ServiceExt;
     use weft_observability::AppStateStore;
 

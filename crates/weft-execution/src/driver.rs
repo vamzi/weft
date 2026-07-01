@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
-use weft_observability::{ExecutionEvent, SharedStore, StageStatus, TaskStatus, now_ms};
+use weft_observability::{now_ms, ExecutionEvent, SharedStore, StageStatus, TaskStatus};
 
 use crate::aqe::{aqe_enabled, coalesced_partitions};
 use crate::flight::{clear_worker_stages, pull_bucket_with_retry};
@@ -213,7 +213,8 @@ pub async fn run_stages_obs(
             }
             futs.push(async move {
                 let start = std::time::Instant::now();
-                let result = run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
+                let result =
+                    run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
                 if let (Some(s), Some(op)) = (store_c, op_c) {
                     match &result {
                         Ok(batches) => {

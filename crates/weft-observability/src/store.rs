@@ -7,12 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::events::{
-    ExecutionEvent, JobStatus, StageStatus, TaskStatus, now_ms,
-};
+use crate::events::{now_ms, ExecutionEvent, JobStatus, StageStatus, TaskStatus};
 use crate::model::{
-    ApplicationInfo, ApplicationAttemptInfo, EnvironmentEntry, ExecutorSummary, JobData, SqlExecution,
-    StageData, TaskData, job_status_str, ms_to_iso, stage_status_str, task_status_str,
+    job_status_str, ms_to_iso, stage_status_str, task_status_str, ApplicationAttemptInfo,
+    ApplicationInfo, EnvironmentEntry, ExecutorSummary, JobData, SqlExecution, StageData, TaskData,
 };
 
 const DEFAULT_MAX_QUERIES: usize = 100;
@@ -116,10 +114,15 @@ struct StoreInner {
     operation_order: Vec<String>,
     operations: HashMap<String, OperationState>,
     jobs: HashMap<i64, InnerJob>,
-    stages: HashMap<i32, InnerStage>,
+    /// Keyed by `{operation_id}:{stage_id}` so concurrent queries do not collide.
+    stages: HashMap<String, InnerStage>,
     sql_executions: HashMap<i64, InnerSql>,
     executors: HashMap<String, InnerExecutor>,
     environment: HashMap<String, String>,
+}
+
+fn stage_key(operation_id: &str, stage_id: i32) -> String {
+    format!("{operation_id}:{stage_id}")
 }
 
 impl AppStateStore {
@@ -142,11 +145,8 @@ impl AppStateStore {
             next_sql_id: AtomicI64::new(0),
             next_task_id: AtomicI64::new(0),
             max_queries: max_queries.max(1),
-            event_log_dir: event_log_dir.or_else(|| {
-                std::env::var("WEFT_EVENT_LOG_DIR")
-                    .ok()
-                    .map(PathBuf::from)
-            }),
+            event_log_dir: event_log_dir
+                .or_else(|| std::env::var("WEFT_EVENT_LOG_DIR").ok().map(PathBuf::from)),
             tx,
             inner: Mutex::new(StoreInner {
                 operation_order: Vec::new(),
@@ -219,7 +219,9 @@ impl AppStateStore {
                         }
                     }
                 }
-                inner.operations.insert(operation_id.clone(), OperationState::Running);
+                inner
+                    .operations
+                    .insert(operation_id.clone(), OperationState::Running);
                 inner.jobs.insert(
                     *job_id,
                     InnerJob {
@@ -278,7 +280,7 @@ impl AppStateStore {
                     }
                 }
                 inner.stages.insert(
-                    *stage_id,
+                    stage_key(operation_id, *stage_id),
                     InnerStage {
                         operation_id: operation_id.clone(),
                         stage_id: *stage_id,
@@ -305,7 +307,7 @@ impl AppStateStore {
                 input_rows,
                 output_rows,
             } => {
-                if let Some(stage) = inner.stages.get_mut(stage_id) {
+                if let Some(stage) = inner.stages.get_mut(&stage_key(operation_id, *stage_id)) {
                     if stage.operation_id == *operation_id {
                         stage.status = *status;
                         stage.completion_time_ms = Some(*completion_time_ms);
@@ -323,7 +325,7 @@ impl AppStateStore {
                 executor_id,
                 launch_time_ms,
             } => {
-                if let Some(stage) = inner.stages.get_mut(stage_id) {
+                if let Some(stage) = inner.stages.get_mut(&stage_key(operation_id, *stage_id)) {
                     if stage.operation_id == *operation_id {
                         stage.tasks.insert(
                             *task_id,
@@ -357,7 +359,7 @@ impl AppStateStore {
                 shuffle_write_bytes,
                 output_rows,
             } => {
-                if let Some(stage) = inner.stages.get_mut(stage_id) {
+                if let Some(stage) = inner.stages.get_mut(&stage_key(operation_id, *stage_id)) {
                     if stage.operation_id == *operation_id {
                         if let Some(task) = stage.tasks.get_mut(task_id) {
                             task.status = *status;
@@ -419,15 +421,18 @@ impl AppStateStore {
                 executor_id,
                 host_port,
             } => {
-                inner.executors.entry(executor_id.clone()).or_insert(InnerExecutor {
-                    host_port: host_port.clone(),
-                    active_tasks: 0,
-                    completed_tasks: 0,
-                    failed_tasks: 0,
-                    total_shuffle_read: 0,
-                    total_shuffle_write: 0,
-                    total_duration: 0,
-                });
+                inner
+                    .executors
+                    .entry(executor_id.clone())
+                    .or_insert(InnerExecutor {
+                        host_port: host_port.clone(),
+                        active_tasks: 0,
+                        completed_tasks: 0,
+                        failed_tasks: 0,
+                        total_shuffle_read: 0,
+                        total_shuffle_write: 0,
+                        total_duration: 0,
+                    });
             }
             ExecutionEvent::AqeCoalesced { .. } => {}
         }
@@ -489,7 +494,7 @@ impl AppStateStore {
         let stages: Vec<_> = j
             .stage_ids
             .iter()
-            .filter_map(|sid| inner.stages.get(sid))
+            .filter_map(|sid| inner.stages.get(&stage_key(&j.operation_id, *sid)))
             .collect();
         let num_tasks: i32 = stages.iter().map(|s| s.num_tasks).sum();
         let num_completed_tasks = stages
@@ -540,11 +545,7 @@ impl AppStateStore {
         }
     }
 
-    pub fn list_stages(
-        &self,
-        status_filter: Option<&str>,
-        with_details: bool,
-    ) -> Vec<StageData> {
+    pub fn list_stages(&self, status_filter: Option<&str>, with_details: bool) -> Vec<StageData> {
         let inner = self.inner.lock().expect("store poisoned");
         let mut stages: Vec<StageData> = inner
             .stages
@@ -558,11 +559,18 @@ impl AppStateStore {
         stages
     }
 
-    pub fn get_stage(&self, stage_id: i32, attempt_id: i32, with_details: bool) -> Option<StageData> {
+    pub fn get_stage(
+        &self,
+        stage_id: i32,
+        attempt_id: i32,
+        with_details: bool,
+    ) -> Option<StageData> {
         let inner = self.inner.lock().expect("store poisoned");
         inner
             .stages
-            .get(&stage_id)
+            .values()
+            .filter(|s| s.stage_id == stage_id)
+            .max_by_key(|s| s.submission_time_ms)
             .map(|s| self.stage_to_data(s, with_details))
             .map(|mut d| {
                 d.attempt_id = attempt_id;
@@ -596,11 +604,7 @@ impl AppStateStore {
             num_failed_tasks: num_failed,
             num_killed_tasks: 0,
             submission_time: Some(ms_to_iso(s.submission_time_ms)),
-            first_task_launched_time: tasks
-                .iter()
-                .map(|t| t.launch_time_ms)
-                .min()
-                .map(ms_to_iso),
+            first_task_launched_time: tasks.iter().map(|t| t.launch_time_ms).min().map(ms_to_iso),
             completion_time: s.completion_time_ms.map(ms_to_iso),
             executor_run_time,
             executor_cpu_time: executor_run_time,
@@ -664,9 +668,7 @@ impl AppStateStore {
                 description: s.description.clone(),
                 submission_time: Some(ms_to_iso(s.submission_time_ms)),
                 completion_time: s.completion_time_ms.map(ms_to_iso),
-                duration: s
-                    .completion_time_ms
-                    .map(|c| c - s.submission_time_ms),
+                duration: s.completion_time_ms.map(|c| c - s.submission_time_ms),
                 physical_plan: s.physical_plan.clone(),
                 logical_plan: s.logical_plan.clone(),
                 job_ids: s.job_ids.clone(),
@@ -749,13 +751,32 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_stages_do_not_collide() {
+        let store = AppStateStore::new();
+        for (op, sid) in [("op-a", 0), ("op-b", 0)] {
+            store.emit(ExecutionEvent::StageStarted {
+                operation_id: op.into(),
+                stage_id: sid,
+                name: format!("stage for {op}"),
+                num_tasks: 1,
+                submission_time_ms: 1000,
+            });
+        }
+        let stages = store.list_stages(None, false);
+        assert_eq!(stages.len(), 2);
+    }
 
     #[test]
     fn job_lifecycle_updates_store() {

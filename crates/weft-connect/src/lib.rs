@@ -312,11 +312,8 @@ impl WeftService {
         let relation = if is_query(sql) {
             sql_relation(sql)
         } else {
-            let tracker = QueryTracker::begin(
-                self.observability.clone(),
-                operation_id,
-                truncate_sql(sql),
-            );
+            let tracker =
+                QueryTracker::begin(self.observability.clone(), operation_id, truncate_sql(sql));
             if let Ok(plan) = self.engine.logical_plan(sql).await {
                 if let Ok(text) = self.engine.explain(&plan, true).await {
                     tracker.set_plan(text, None);
@@ -466,9 +463,7 @@ impl WeftService {
                 .input
                 .as_deref()
                 .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
-            let batches = self
-                .base_relation_batches(child, operation_id)
-                .await?;
+            let batches = self.base_relation_batches(child, operation_id).await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
             return Ok(vec![show_string_batch(text)]);
         }
@@ -500,7 +495,7 @@ impl WeftService {
                         }
                     }
                 }
-                if let Some(dist) = distributed::try_run_distributed(
+                match distributed::try_run_distributed(
                     &self.engine,
                     &workers,
                     &sql.query,
@@ -509,13 +504,21 @@ impl WeftService {
                     tracker.as_ref(),
                 )
                 .await
-                .map_err(err_to_status)?
                 {
-                    if let Some(t) = tracker {
-                        let rows: i64 = dist.iter().map(|b| b.num_rows() as i64).sum();
-                        t.finish_success(rows);
+                    Ok(Some(dist)) => {
+                        if let Some(t) = tracker {
+                            let rows: i64 = dist.iter().map(|b| b.num_rows() as i64).sum();
+                            t.finish_success(rows);
+                        }
+                        return Ok(dist);
                     }
-                    return Ok(dist);
+                    Ok(None) => {}
+                    Err(e) => {
+                        if let Some(t) = tracker {
+                            t.finish_error(e.to_string());
+                        }
+                        return Err(err_to_status(e));
+                    }
                 }
                 let local_tracker = tracker.map(|t| {
                     let mut t = t;
@@ -579,9 +582,8 @@ impl WeftService {
             _ => {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
-                let tracker = operation_id.map(|op| {
-                    QueryTracker::begin(self.observability.clone(), op, "DataFrame")
-                });
+                let tracker = operation_id
+                    .map(|op| QueryTracker::begin(self.observability.clone(), op, "DataFrame"));
                 if let Some(ref t) = tracker {
                     if let Ok(text) = self.engine.explain(&plan, true).await {
                         t.set_plan(text, None);
@@ -743,9 +745,7 @@ impl SparkConnectService for WeftService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let batches = self
-                    .eval_relation(rel, Some(&operation_id))
-                    .await?;
+                let batches = self.eval_relation(rel, Some(&operation_id)).await?;
                 self.stream_batches(&session_id, &operation_id, &batches)?
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
@@ -1147,7 +1147,8 @@ impl SparkConnectService for WeftService {
                 if let Some(state) = self.observability.operation_state(&op_id) {
                     let proto_state = match state {
                         weft_observability::OperationState::Running => {
-                            sc::get_status_response::operation_status::OperationState::Running as i32
+                            sc::get_status_response::operation_status::OperationState::Running
+                                as i32
                         }
                         weft_observability::OperationState::Succeeded => {
                             sc::get_status_response::operation_status::OperationState::Succeeded
@@ -1157,13 +1158,13 @@ impl SparkConnectService for WeftService {
                             sc::get_status_response::operation_status::OperationState::Failed as i32
                         }
                     };
-                    response.operation_statuses.push(
-                        sc::get_status_response::OperationStatus {
+                    response
+                        .operation_statuses
+                        .push(sc::get_status_response::OperationStatus {
                             operation_id: op_id,
                             state: proto_state,
                             ..Default::default()
-                        },
-                    );
+                        });
                 }
             }
         }

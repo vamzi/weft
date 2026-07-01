@@ -8,4 +8,4 @@ mod tracker;
 pub use events::*;
 pub use model::*;
 pub use store::{AppStateStore, OperationState, SharedStore};
-pub use tracker::{QueryTracker, emit_worker_task, set_worker_store, worker_store};
+pub use tracker::{emit_worker_task, set_worker_store, worker_store, QueryTracker};

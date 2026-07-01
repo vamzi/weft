@@ -41,20 +41,24 @@ pub async fn try_run_distributed(
     if let Some(t) = tracker {
         let op = t.operation_id().to_string();
         for ep in &endpoints {
-            let host = ep.trim_start_matches("http://").trim_start_matches("https://");
-            t.store().emit(weft_observability::ExecutionEvent::ExecutorRegistered {
-                executor_id: host.to_string(),
-                host_port: host.to_string(),
-            });
+            let host = ep
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            t.store()
+                .emit(weft_observability::ExecutionEvent::ExecutorRegistered {
+                    executor_id: host.to_string(),
+                    host_port: host.to_string(),
+                });
         }
         for stage in &dq.stages {
-            t.store().emit(weft_observability::ExecutionEvent::StageStarted {
-                operation_id: op.clone(),
-                stage_id: stage.stage_id as i32,
-                name: truncate_sql(&stage.sql),
-                num_tasks: endpoints.len() as i32,
-                submission_time_ms: weft_observability::now_ms(),
-            });
+            t.store()
+                .emit(weft_observability::ExecutionEvent::StageStarted {
+                    operation_id: op.clone(),
+                    stage_id: stage.stage_id as i32,
+                    name: truncate_sql(&stage.sql),
+                    num_tasks: endpoints.len() as i32,
+                    submission_time_ms: weft_observability::now_ms(),
+                });
         }
         if let Ok(plan) = engine.logical_plan(sql).await {
             if let Ok(text) = engine.explain(&plan, true).await {
