@@ -305,9 +305,7 @@ fn find_join(lp: &LogicalPlan) -> Option<&datafusion::logical_expr::Join> {
     }
 }
 
-fn equi_join_columns_from_join(
-    j: &datafusion::logical_expr::Join,
-) -> Result<(String, String)> {
+fn equi_join_columns_from_join(j: &datafusion::logical_expr::Join) -> Result<(String, String)> {
     for (l, r) in &j.on {
         if let Some(pair) = equi_pair_from_exprs(l, r) {
             return Ok(pair);

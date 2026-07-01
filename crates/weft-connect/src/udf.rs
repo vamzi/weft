@@ -160,10 +160,7 @@ fn eval_python_udf_scalar(
     std::fs::create_dir_all(&dir).ok();
     let script = dir.join(format!("{name}.pkl"));
     std::fs::write(&script, command).ok();
-    let arg_literals: Vec<String> = args
-        .iter()
-        .map(|v| format!("{v:?}"))
-        .collect();
+    let arg_literals: Vec<String> = args.iter().map(|v| format!("{v:?}")).collect();
     let out = std::process::Command::new("python3")
         .arg("-c")
         .arg(

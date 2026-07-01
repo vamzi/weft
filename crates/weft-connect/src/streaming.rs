@@ -51,11 +51,8 @@ impl WeftService {
             }
             _ => None,
         };
-        let config = weft_streaming::StreamQueryConfig::from_spark(
-            &start.format,
-            &start.options,
-            sink_path,
-        );
+        let config =
+            weft_streaming::StreamQueryConfig::from_spark(&start.format, &start.options, sink_path);
         let id = self
             .streaming
             .start_with_config(name.clone(), checkpoint, trigger.clone(), config)
@@ -69,11 +66,7 @@ impl WeftService {
                 tokio::spawn(async move {
                     loop {
                         let _ = mgr.run_batch(&qid, &eng).await;
-                        let active = mgr
-                            .status(&qid)
-                            .await
-                            .map(|s| s.is_active)
-                            .unwrap_or(false);
+                        let active = mgr.status(&qid).await.map(|s| s.is_active).unwrap_or(false);
                         if !active {
                             break;
                         }

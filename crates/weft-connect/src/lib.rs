@@ -88,7 +88,8 @@ pub struct WeftService {
     /// Python UDF artifact bytes from `AddArtifacts`.
     artifacts: udf::SharedArtifacts,
     /// Buffered completed operation responses for ReattachExecute.
-    completed_ops: std::sync::Mutex<std::collections::HashMap<String, Vec<sc::ExecutePlanResponse>>>,
+    completed_ops:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<sc::ExecutePlanResponse>>>,
 }
 
 impl Default for WeftService {
@@ -557,10 +558,11 @@ impl SparkConnectService for WeftService {
                     )]
                 }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
-                    let registry = self.engine.udf_registry();
-                    let mut reg = registry.lock().unwrap();
-                    udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
-                    drop(reg);
+                    {
+                        let registry = self.engine.udf_registry();
+                        let mut reg = registry.lock().unwrap();
+                        udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
+                    }
                     vec![self.response(
                         &session_id,
                         &operation_id,
@@ -828,7 +830,9 @@ impl SparkConnectService for WeftService {
             .cloned()
         {
             let stream = tokio_stream::iter(buf.into_iter().map(Ok));
-            return Ok(Response::new(Box::pin(stream) as Self::ReattachExecuteStream));
+            return Ok(Response::new(
+                Box::pin(stream) as Self::ReattachExecuteStream
+            ));
         }
         let complete = self.response(
             &req.session_id,
@@ -838,7 +842,9 @@ impl SparkConnectService for WeftService {
             ),
         );
         let stream = tokio_stream::iter(vec![Ok(complete)]);
-        Ok(Response::new(Box::pin(stream) as Self::ReattachExecuteStream))
+        Ok(Response::new(
+            Box::pin(stream) as Self::ReattachExecuteStream
+        ))
     }
 
     async fn release_execute(

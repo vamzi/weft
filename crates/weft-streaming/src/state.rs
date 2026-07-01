@@ -20,7 +20,11 @@ impl DedupState {
     }
 
     /// Filter batches to rows whose key hash was not seen before (dropDuplicates).
-    pub fn dedup_batches(&mut self, batches: &[RecordBatch], key_cols: &[usize]) -> Vec<RecordBatch> {
+    pub fn dedup_batches(
+        &mut self,
+        batches: &[RecordBatch],
+        key_cols: &[usize],
+    ) -> Vec<RecordBatch> {
         use weft_loom::arrow::array::BooleanArray;
         use weft_loom::arrow::compute::filter_record_batch;
 

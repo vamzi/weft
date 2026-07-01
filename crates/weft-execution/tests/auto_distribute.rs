@@ -264,6 +264,9 @@ async fn two_sharded_tables_shuffle_join() {
         &[],
     )
     .await;
-    assert!(plan.is_ok(), "two-sharded shuffle join should auto-derive: {plan:?}");
+    assert!(
+        plan.is_ok(),
+        "two-sharded shuffle join should auto-derive: {plan:?}"
+    );
     assert_eq!(plan.unwrap().stages.len(), 3);
 }

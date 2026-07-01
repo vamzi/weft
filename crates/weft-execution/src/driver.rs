@@ -140,10 +140,8 @@ pub async fn run_stages_with_membership(
 
 pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<RecordBatch>> {
     let lineage = Arc::new(StageLineage::new());
-    let stage_map: HashMap<u32, StageDef> = stages
-        .iter()
-        .map(|s| (s.stage_id, s.clone()))
-        .collect();
+    let stage_map: HashMap<u32, StageDef> =
+        stages.iter().map(|s| (s.stage_id, s.clone())).collect();
     let mut cluster = cluster.clone();
     let consumed: HashSet<u32> = stages
         .iter()
@@ -189,9 +187,7 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
             let mut counts = vec![0usize; np as usize];
             for p in 0..np {
                 if let Ok(ep) = cluster.owner_endpoint(p) {
-                    if let Ok(batches) =
-                        pull_bucket_with_retry(ep, stage.stage_id, p).await
-                    {
+                    if let Ok(batches) = pull_bucket_with_retry(ep, stage.stage_id, p).await {
                         counts[p as usize] = batches.iter().map(|b| b.num_rows()).sum();
                     }
                 }
@@ -205,8 +201,7 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
     }
 
     // Output stage: per-worker scatter (global agg) or per-partition rendezvous shuffle.
-    let scatter_output =
-        output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
+    let scatter_output = output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
     refresh_cluster_workers(&mut cluster);
     let w = cluster.num_partitions;

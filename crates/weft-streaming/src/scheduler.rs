@@ -58,8 +58,13 @@ impl StreamingQueryManager {
         checkpoint_location: String,
         trigger: Trigger,
     ) -> StreamingQueryId {
-        self.start_with_config(name, checkpoint_location, trigger, StreamQueryConfig::default())
-            .await
+        self.start_with_config(
+            name,
+            checkpoint_location,
+            trigger,
+            StreamQueryConfig::default(),
+        )
+        .await
     }
 
     /// Start a streaming query with explicit source/sink configuration from Spark Connect.
@@ -241,7 +246,10 @@ fn build_sink(config: &StreamQueryConfig) -> Box<dyn Sink> {
     }
 }
 
-fn resolve_dedup_cols(batch: &weft_loom::arrow::record_batch::RecordBatch, names: &[String]) -> Vec<usize> {
+fn resolve_dedup_cols(
+    batch: &weft_loom::arrow::record_batch::RecordBatch,
+    names: &[String],
+) -> Vec<usize> {
     names
         .iter()
         .filter_map(|n| batch.schema().index_of(n).ok())
@@ -267,7 +275,8 @@ fn apply_watermark(
         let mut keep = vec![true; batch.num_rows()];
         match arr.data_type() {
             DataType::Timestamp(_, _) => {
-                let ts = arr.as_primitive::<weft_loom::arrow::datatypes::TimestampMicrosecondType>();
+                let ts =
+                    arr.as_primitive::<weft_loom::arrow::datatypes::TimestampMicrosecondType>();
                 for (row, slot) in keep.iter_mut().enumerate() {
                     if !arr.is_null(row) && ts.value(row) < watermark_micros {
                         *slot = false;

@@ -34,10 +34,14 @@ impl StageLineage {
     }
 
     pub fn producer_endpoint(&self, stage_id: u32, partition_id: u32) -> Option<String> {
-        self.producers.lock().expect("lineage poisoned").get(&ProducerKey {
-            stage_id,
-            partition_id,
-        }).cloned()
+        self.producers
+            .lock()
+            .expect("lineage poisoned")
+            .get(&ProducerKey {
+                stage_id,
+                partition_id,
+            })
+            .cloned()
     }
 
     pub fn clear(&self) {
@@ -55,10 +59,7 @@ mod tests {
     fn records_and_retrieves_producer() {
         let l = StageLineage::new();
         l.record_producer(0, 1, "http://w:50561");
-        assert_eq!(
-            l.producer_endpoint(0, 1).as_deref(),
-            Some("http://w:50561")
-        );
+        assert_eq!(l.producer_endpoint(0, 1).as_deref(), Some("http://w:50561"));
         assert!(l.producer_endpoint(0, 2).is_none());
     }
 }

@@ -7,11 +7,11 @@ use std::time::Duration;
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
+use crate::driver::StageDef;
 use crate::flight::{health_check_worker, pull_bucket_with_retry, run_stage_on_worker};
 use crate::lineage::SharedLineage;
 use crate::membership::ClusterMembership;
 use crate::shuffle::protocol::StageTicket;
-use crate::driver::StageDef;
 
 /// Max task attempts per endpoint before trying alternates (env: `WEFT_TASK_MAX_RETRIES`, default 3).
 pub fn task_max_retries() -> u32 {
@@ -102,9 +102,8 @@ async fn run_stage_speculative(
     let primary2 = primary.clone();
     let stages2 = stages.clone();
 
-    let primary_fut = async move {
-        run_stage_inner(&membership2, primary2, ticket2, &lineage2, &stages2).await
-    };
+    let primary_fut =
+        async move { run_stage_inner(&membership2, primary2, ticket2, &lineage2, &stages2).await };
 
     let membership3 = membership.clone();
     let ticket3 = ticket.clone();
@@ -125,7 +124,9 @@ async fn run_stage_speculative(
                     .await;
             }
         }
-        Err(Error::Execution("speculative backup: no healthy alternate".into()))
+        Err(Error::Execution(
+            "speculative backup: no healthy alternate".into(),
+        ))
     };
 
     tokio::select! {
@@ -164,7 +165,8 @@ async fn run_stage_inner_impl(
     }
 
     // Shuffle durability: recompute upstream producers when consumer can't read buckets.
-    if !ticket.upstream_stage_ids.is_empty() && last_err.as_ref().is_some_and(needs_upstream_recompute)
+    if !ticket.upstream_stage_ids.is_empty()
+        && last_err.as_ref().is_some_and(needs_upstream_recompute)
     {
         if let Err(e) = recompute_upstream_producers(membership, &ticket, lineage, stages).await {
             last_err = Some(e);
@@ -188,7 +190,11 @@ async fn run_stage_inner_impl(
         match run_stage_on_worker(alt, ticket.clone()).await {
             Ok(b) => {
                 if ticket.produce {
-                    lineage.record_producer(ticket.stage_id, ticket.partition_id, tried.last().unwrap());
+                    lineage.record_producer(
+                        ticket.stage_id,
+                        ticket.partition_id,
+                        tried.last().unwrap(),
+                    );
                 }
                 return Ok(b);
             }
@@ -208,9 +214,9 @@ async fn recompute_upstream_producers(
     stages: &std::collections::HashMap<u32, StageDef>,
 ) -> Result<()> {
     for &up_stage in &consumer.upstream_stage_ids {
-        let stage_def = stages.get(&up_stage).ok_or_else(|| {
-            Error::Execution(format!("recompute: unknown stage {up_stage}"))
-        })?;
+        let stage_def = stages
+            .get(&up_stage)
+            .ok_or_else(|| Error::Execution(format!("recompute: unknown stage {up_stage}")))?;
         for (i, ep) in consumer.upstream_endpoints.iter().enumerate() {
             let readable = pull_bucket_with_retry(ep.clone(), up_stage, consumer.partition_id)
                 .await
@@ -223,12 +229,7 @@ async fn recompute_upstream_producers(
                 .await
                 .into_iter()
                 .next()
-                .or_else(|| {
-                    membership
-                        .endpoints()
-                        .into_iter()
-                        .find(|e| e != ep)
-                })
+                .or_else(|| membership.endpoints().into_iter().find(|e| e != ep))
                 .ok_or_else(|| Error::Execution("recompute: no healthy worker".into()))?;
             let producer_ticket = StageTicket {
                 stage_id: up_stage,
@@ -269,7 +270,9 @@ mod tests {
     #[test]
     fn retryable_errors_match_transport_failures() {
         assert!(is_retryable(&Error::Io("connect worker: refused".into())));
-        assert!(is_retryable(&Error::Execution("do_get: Unavailable".into())));
+        assert!(is_retryable(&Error::Execution(
+            "do_get: Unavailable".into()
+        )));
         assert!(!is_retryable(&Error::Plan("bad sql".into())));
     }
 

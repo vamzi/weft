@@ -296,13 +296,14 @@ async fn pivot_aggregate(
             .as_ref()
             .and_then(|e| e.expr_type.as_ref())
             .and_then(|t| match t {
-                sc::expression::ExprType::UnresolvedAttribute(u) => Some(u.unparsed_identifier.clone()),
+                sc::expression::ExprType::UnresolvedAttribute(u) => {
+                    Some(u.unparsed_identifier.clone())
+                }
                 _ => None,
             })
             .unwrap_or_else(|| "pivot_col".into());
-        let sql = format!(
-            "SELECT DISTINCT `{col_name}` AS v FROM ({sub}) AS _pivot_src ORDER BY v"
-        );
+        let sql =
+            format!("SELECT DISTINCT `{col_name}` AS v FROM ({sub}) AS _pivot_src ORDER BY v");
         let batches = ctx
             .sql(&sql)
             .await
@@ -371,7 +372,9 @@ fn agg_label(e: &Expr) -> String {
 }
 
 /// Build a Spark Connect literal from a DataFusion scalar (for pivot value discovery).
-fn scalar_to_spark_literal(sv: &datafusion::scalar::ScalarValue) -> Result<sc::expression::Literal, Status> {
+fn scalar_to_spark_literal(
+    sv: &datafusion::scalar::ScalarValue,
+) -> Result<sc::expression::Literal, Status> {
     use datafusion::scalar::ScalarValue;
     use sc::expression::literal::LiteralType as L;
     let literal_type = match sv {
@@ -385,9 +388,8 @@ fn scalar_to_spark_literal(sv: &datafusion::scalar::ScalarValue) -> Result<sc::e
         ScalarValue::Float64(Some(v)) => Some(L::Double(*v)),
         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(L::String(s.clone())),
         ScalarValue::Date32(Some(d)) => Some(L::Date(*d)),
-        ScalarValue::TimestampMicrosecond(Some(t), _) | ScalarValue::TimestampNanosecond(Some(t), _) => {
-            Some(L::Timestamp(*t))
-        }
+        ScalarValue::TimestampMicrosecond(Some(t), _)
+        | ScalarValue::TimestampNanosecond(Some(t), _) => Some(L::Timestamp(*t)),
         other => return Err(inval(format!("pivot literal: unsupported {other:?}"))),
     };
     Ok(sc::expression::Literal {
@@ -911,11 +913,7 @@ async fn stat_describe(ctx: &SessionContext, d: &sc::StatDescribe) -> Result<Log
     let input = child(ctx, &d.input).await?;
     let schema = input.schema();
     let cols: Vec<String> = if d.cols.is_empty() {
-        schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect()
+        schema.fields().iter().map(|f| f.name().clone()).collect()
     } else {
         d.cols.clone()
     };

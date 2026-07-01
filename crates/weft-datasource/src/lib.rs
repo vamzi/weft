@@ -29,10 +29,10 @@ pub fn scan(_uri: &str, _req: &ScanRequest) -> Result<()> {
 
 /// Write Arrow record batches to a Parquet file (create or overwrite).
 pub fn write_parquet(path: &str, batches: &[arrow::record_batch::RecordBatch]) -> Result<()> {
-    use std::fs::File;
-    use std::sync::Arc;
     use arrow::datatypes::Schema;
     use parquet::arrow::ArrowWriter;
+    use std::fs::File;
+    use std::sync::Arc;
 
     if batches.is_empty() {
         let schema = Arc::new(Schema::empty());

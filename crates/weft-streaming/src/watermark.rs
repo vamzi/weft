@@ -13,7 +13,9 @@ pub struct WatermarkConfig {
 
 impl WatermarkConfig {
     pub fn from_options(options: &std::collections::HashMap<String, String>) -> Option<Self> {
-        let col = options.get("eventTimeColumn").or_else(|| options.get("watermarkColumn"))?;
+        let col = options
+            .get("eventTimeColumn")
+            .or_else(|| options.get("watermarkColumn"))?;
         let delay_ms = options
             .get("delayMs")
             .or_else(|| options.get("watermarkDelayMs"))

@@ -28,7 +28,11 @@ impl Default for StreamQueryConfig {
 }
 
 impl StreamQueryConfig {
-    pub fn from_spark(format: &str, options: &HashMap<String, String>, path: Option<String>) -> Self {
+    pub fn from_spark(
+        format: &str,
+        options: &HashMap<String, String>,
+        path: Option<String>,
+    ) -> Self {
         let source_format = if format.is_empty() {
             options
                 .get("source")
@@ -52,7 +56,12 @@ impl StreamQueryConfig {
                 .unwrap_or_else(|| "append".into()),
             dedup_columns: options
                 .get("dedupColumns")
-                .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     }
