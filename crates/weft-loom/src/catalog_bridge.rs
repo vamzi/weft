@@ -209,7 +209,14 @@ impl CtasWriter {
                     .build()
                     .expect("build CTAS writer runtime");
                 for job in rx {
-                    job(&rt);
+                    // A panicking job must not take this thread down with it — every other
+                    // catalog/session shares this single process-wide writer, so one bad CTAS
+                    // (e.g. an internal panic in a dependency) would otherwise permanently break
+                    // CTAS writes for everyone until the process restarts. `run`'s caller already
+                    // gets a clean "CTAS writer thread died" error for THIS call (the boxed job's
+                    // `result_tx` is dropped mid-unwind, closing its channel), so the only extra
+                    // work needed here is keeping the loop itself alive for the NEXT job.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&rt)));
                 }
             })
             .expect("spawn CTAS writer thread");
@@ -227,7 +234,9 @@ impl CtasWriter {
             .send(Box::new(move |rt| {
                 let _ = result_tx.send(f(rt));
             }))
-            .map_err(|_| DataFusionError::Execution("CTAS writer thread unavailable".to_string()))?;
+            .map_err(|_| {
+                DataFusionError::Execution("CTAS writer thread unavailable".to_string())
+            })?;
         result_rx
             .recv()
             .map_err(|_| DataFusionError::Execution("CTAS writer thread died".to_string()))
@@ -255,12 +264,26 @@ async fn register_table_async(
     let (schema, batches) = extract_mem_table_data(&table).await?;
 
     let metadata = catalog
-        .create_table(&namespace, &name, schema.clone(), TableFormat::Parquet, None, &[])
+        .create_table(
+            &namespace,
+            &name,
+            schema.clone(),
+            TableFormat::Parquet,
+            None,
+            &[],
+        )
         .await
         .map_err(weft_to_df)?;
 
     let state = ctx.state();
-    write_batches_to_location(&state, &metadata.location, metadata.format, &schema, batches).await?;
+    write_batches_to_location(
+        &state,
+        &metadata.location,
+        metadata.format,
+        &schema,
+        batches,
+    )
+    .await?;
 
     metadata_to_provider(&state, &metadata).await
 }
@@ -429,12 +452,19 @@ async fn write_batches_to_location(
 }
 
 /// Serialize `batches` into an in-memory buffer in `format` (Parquet/Csv/Json).
-fn encode_batches(format: TableFormat, schema: &SchemaRef, batches: &[RecordBatch]) -> DfResult<Vec<u8>> {
+fn encode_batches(
+    format: TableFormat,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> DfResult<Vec<u8>> {
     let mut buf = Vec::new();
     match format {
         TableFormat::Parquet => {
-            let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(&mut buf, schema.clone(), None)
-                .map_err(|e| DataFusionError::Execution(format!("build parquet writer: {e}")))?;
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(&mut buf, schema.clone(), None)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("build parquet writer: {e}"))
+                    })?;
             for b in batches {
                 writer
                     .write(b)
@@ -650,7 +680,10 @@ mod tests {
                     TableFormat::Parquet,
                 ))
             } else {
-                Err(Error::Plan(format!("no such table: {}.{table}", ns.join("."))))
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
             }
         }
         async fn create_table(
@@ -663,12 +696,13 @@ mod tests {
             partition_columns: &[String],
         ) -> CatResult<TableMetadata> {
             let db = namespace.first().cloned().unwrap_or_default();
-            let location = location.unwrap_or_else(|| {
-                format!("file://{}/{db}/{table}/", self.dir.to_string_lossy())
-            });
-            Ok(TableMetadata::new(format!("fakewrite.{db}.{table}"), location, format)
-                .with_schema(schema)
-                .with_partition_columns(partition_columns.to_vec()))
+            let location = location
+                .unwrap_or_else(|| format!("file://{}/{db}/{table}/", self.dir.to_string_lossy()));
+            Ok(
+                TableMetadata::new(format!("fakewrite.{db}.{table}"), location, format)
+                    .with_schema(schema)
+                    .with_partition_columns(partition_columns.to_vec()),
+            )
         }
     }
 

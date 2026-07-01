@@ -115,6 +115,38 @@ fn is_multi_arg_count_distinct(sql: &str) -> bool {
     after_distinct.contains(',')
 }
 
+/// Split a (possibly qualified, possibly backtick-quoted) object name on `.`, treating a
+/// backtick-quoted span as a single segment (its contents, including a literal `.`, are never
+/// treated as a separator). Used by [`Engine::name_targets_external_catalog`] to check a name's
+/// arity (only a 3+ segment name — `catalog.db.table` or deeper — can be catalog-qualified).
+fn split_name_segments(name: &str) -> Vec<&str> {
+    let bytes = name.as_bytes();
+    let mut segments = Vec::new();
+    let mut i = 0;
+    let mut seg_start = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // closing backtick
+            }
+            continue;
+        }
+        if bytes[i] == b'.' {
+            segments.push(&name[seg_start..i]);
+            i += 1;
+            seg_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    segments.push(&name[seg_start..]);
+    segments
+}
+
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // Passes run in order: (1) the leading-keyword DDL rewrite, (2) Spark single-quoted
     // string-literal unescaping, (3) the typed-literal rewrite over the result. Unescaping runs
@@ -1680,8 +1712,9 @@ impl Engine {
             if self.run_create_external(&low).await.is_ok() {
                 return Ok(vec![]);
             }
-        } else if let Some(ctas) = spark_create_table::lower_create_table_ctas(query, &self.warehouse)
-            .filter(|c| !self.name_targets_external_catalog(&c.name))
+        } else if let Some(ctas) =
+            spark_create_table::lower_create_table_ctas(query, &self.warehouse)
+                .filter(|c| !self.name_targets_external_catalog(&c.name))
         {
             if self.run_create_table_ctas(&ctas).await.is_ok() {
                 return Ok(vec![]);
@@ -2061,23 +2094,34 @@ impl Engine {
         self.ctx.register_catalog(name, bridge);
     }
 
-    /// Whether `name`'s leading (possibly backtick-quoted) dotted segment names a registered
-    /// external catalog. Used to bail out of the local-warehouse `CREATE TABLE ... USING <fmt>`
-    /// lowerings (`spark_create_table::lower_create_table_using`/`lower_create_table_ctas`) when
-    /// the target is actually qualified with an external catalog (e.g.
-    /// `CREATE TABLE glue.db.t USING parquet AS SELECT ...`) — otherwise that lowering would
-    /// silently write to the local warehouse under the default catalog instead of routing to the
-    /// external catalog's real `CatalogProvider::create_table` (via `catalog_bridge`'s
-    /// `register_table`, which the un-qualified/no-`USING` CTAS path already reaches).
+    /// Whether `name` is qualified with a registered external catalog (`catalog.db.table`, or
+    /// deeper). Used to bail out of the local-warehouse `CREATE TABLE ... USING <fmt>` lowerings
+    /// (`spark_create_table::lower_create_table_using`/`lower_create_table_ctas`) when the target
+    /// actually targets an external catalog (e.g. `CREATE TABLE glue.db.t USING parquet AS
+    /// SELECT ...`) — otherwise that lowering would silently write to the local warehouse under
+    /// the default catalog instead of routing to the external catalog's real
+    /// `CatalogProvider::create_table` (via `catalog_bridge`'s `register_table`, which the
+    /// un-qualified/no-`USING` CTAS path already reaches).
+    ///
+    /// Two things this deliberately gets right (each was a real bug in an earlier version):
+    /// - **Arity**: only a name with 3+ dotted segments can be catalog-qualified at all — a bare
+    ///   1-part name (`t`) or 2-part `schema.table` (the existing, tested local-warehouse shape,
+    ///   e.g. `s.tab`) is always local, even if its first segment happens to spell a registered
+    ///   catalog's name (e.g. a local schema named the same as some catalog `glue`).
+    /// - **Case**: SQL unquoted identifiers are conventionally case-insensitive, but catalog names
+    ///   are registered verbatim (`register_catalog`); comparing case-sensitively would silently
+    ///   misroute e.g. `CREATE TABLE Glue.db.t ...` when the catalog was registered as `glue`.
     fn name_targets_external_catalog(&self, name: &str) -> bool {
-        let first = match name.strip_prefix('`') {
-            Some(rest) => rest.split('`').next().unwrap_or(rest),
-            None => name.split('.').next().unwrap_or(name),
-        };
+        let segments = split_name_segments(name);
+        if segments.len() < 3 {
+            return false;
+        }
+        let first = segments[0].trim_matches('`');
         self.weft_catalogs
             .lock()
             .expect("weft_catalogs poisoned")
-            .contains_key(first)
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(first))
     }
 
     /// Serve a parsed catalog-listing statement directly from the registered weft catalogs.
@@ -2438,7 +2482,10 @@ mod tests {
         fn name(&self) -> &str {
             "extcat"
         }
-        async fn list_namespaces(&self, _parent: &[String]) -> weft_catalog::Result<Vec<Vec<String>>> {
+        async fn list_namespaces(
+            &self,
+            _parent: &[String],
+        ) -> weft_catalog::Result<Vec<Vec<String>>> {
             Ok(vec![])
         }
         async fn list_tables(&self, _ns: &[String]) -> weft_catalog::Result<Vec<String>> {
@@ -2449,7 +2496,10 @@ mod tests {
             ns: &[String],
             table: &str,
         ) -> weft_catalog::Result<weft_catalog::TableMetadata> {
-            Err(Error::Plan(format!("no such table: {}.{table}", ns.join("."))))
+            Err(Error::Plan(format!(
+                "no such table: {}.{table}",
+                ns.join(".")
+            )))
         }
     }
 
@@ -2467,6 +2517,46 @@ mod tests {
         assert!(
             !engine.warehouse.join("extcat_ns_t").exists(),
             "must not fall back to writing the local warehouse for an external-catalog-qualified name"
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_external_catalog_ctas_skips_local_warehouse_lowering_case_insensitively() {
+        // Catalogs are registered verbatim ("extcat"), but SQL identifiers are conventionally
+        // case-insensitive — a differently-cased reference must still be recognized as external,
+        // not silently misrouted to the local warehouse.
+        let engine = Engine::new();
+        engine.register_catalog("extcat", Arc::new(StubExternalCatalog));
+        let _ = engine
+            .sql("CREATE TABLE ExtCat.ns.t USING parquet AS SELECT 1 AS x")
+            .await;
+        assert!(
+            !engine.warehouse.join("ExtCat_ns_t").exists(),
+            "a differently-cased catalog reference must still route away from the local warehouse"
+        );
+    }
+
+    #[tokio::test]
+    async fn unqualified_name_matching_a_catalog_name_still_uses_local_warehouse() {
+        // A 1-part name is never catalog-qualified, even when it happens to spell a registered
+        // catalog's own name (e.g. a local table coincidentally named "extcat"). This must NOT be
+        // misclassified as external (the arity check) — a local `CREATE TABLE ... USING <fmt>`
+        // must still lower to the local warehouse and round-trip data normally.
+        let engine = Engine::new();
+        engine.register_catalog("extcat", Arc::new(StubExternalCatalog));
+        engine
+            .sql("create table extcat(a int) using parquet")
+            .await
+            .expect("1-part name colliding with a catalog name must still use the local warehouse");
+        engine
+            .sql("insert into extcat values (1), (2)")
+            .await
+            .expect("insert into the local table must succeed");
+        let out = engine.sql("select a from extcat order by a").await.unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 2,
+            "a 1-part name must use the local warehouse, not be misrouted as catalog-qualified"
         );
     }
 

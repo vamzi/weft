@@ -179,7 +179,14 @@ pub trait CatalogProvider: Send + Sync {
         location: Option<String>,
         partition_columns: &[String],
     ) -> Result<TableMetadata> {
-        let _ = (namespace, table, schema, format, location, partition_columns);
+        let _ = (
+            namespace,
+            table,
+            schema,
+            format,
+            location,
+            partition_columns,
+        );
         Err(Error::Unsupported(format!(
             "catalog `{}` does not support creating tables",
             self.name()

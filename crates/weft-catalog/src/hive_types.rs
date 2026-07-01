@@ -192,6 +192,24 @@ pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
     }
 }
 
+/// Validate that `value` is safe to use as a bare `db`/`table` path segment when building a
+/// warehouse-derived default location (`{warehouse}/{db}/{table}/`) — i.e. it's a plain identifier
+/// (ASCII alphanumeric/underscore, non-empty), not `.`/`..`/a path separator/anything else that
+/// could escape the intended directory. Glue and Hive database/table names are conventionally
+/// restricted to this shape anyway, so this rejects malformed input rather than silently mangling
+/// it (unlike the unrelated local-warehouse directory-naming `sanitize()`, which only ever feeds a
+/// throwaway directory name, not a catalog-visible identifier).
+pub fn validate_identifier(kind: &str, value: &str) -> Result<()> {
+    let ok = !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Plan(format!(
+            "{kind} `{value}` is not a valid identifier (expected letters, digits, underscore only)"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,12 +324,19 @@ mod tests {
             (DataType::Utf8, "string"),
             (DataType::Boolean, "boolean"),
             (DataType::Date32, "date"),
-            (DataType::Timestamp(TimeUnit::Microsecond, None), "timestamp"),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "timestamp",
+            ),
             (DataType::Binary, "binary"),
             (DataType::Decimal128(15, 2), "decimal(15,2)"),
         ];
         for (arrow, hive) in cases {
-            assert_eq!(arrow_type_to_hive(&arrow).as_deref(), Some(hive), "{arrow:?}");
+            assert_eq!(
+                arrow_type_to_hive(&arrow).as_deref(),
+                Some(hive),
+                "{arrow:?}"
+            );
             // And the forward mapping accepts what we just produced.
             assert_eq!(hive_type_to_arrow(hive), Some(arrow.clone()), "{hive}");
         }
@@ -351,7 +376,11 @@ mod tests {
     fn schema_to_columns_rejects_unmappable_type() {
         let schema = Schema::new(vec![Field::new(
             "tags",
-            DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            ))),
             true,
         )]);
         let err = schema_to_columns(&schema, &[]).unwrap_err();
@@ -364,7 +393,25 @@ mod tests {
             assert!(format_serde(format).is_ok(), "{format:?}");
         }
         for format in [TableFormat::Delta, TableFormat::Iceberg] {
-            assert!(matches!(format_serde(format), Err(Error::Unsupported(_))), "{format:?}");
+            assert!(
+                matches!(format_serde(format), Err(Error::Unsupported(_))),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_identifier_accepts_plain_names() {
+        for ok in ["orders", "Orders_2024", "_tmp", "a1"] {
+            assert!(validate_identifier("table", ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn validate_identifier_rejects_path_traversal_and_separators() {
+        for bad in ["..", "../../etc/evil", "a/b", "a\\b", "", "a.b", "a b"] {
+            let err = validate_identifier("table", bad).unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{bad}");
         }
     }
 }

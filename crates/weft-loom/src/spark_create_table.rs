@@ -91,7 +91,11 @@ pub(crate) fn lower_create_table_using(sql: &str, warehouse: &Path) -> Option<Lo
         "CREATE EXTERNAL TABLE {ine}{name} {cols} STORED AS {} LOCATION '{location}'",
         fmt_l.to_uppercase()
     );
-    Some(Lowered { ddl, table_dir, name })
+    Some(Lowered {
+        ddl,
+        table_dir,
+        name,
+    })
 }
 
 /// A CTAS lowering: materialize `select_sql` into `table_dir`, then run `ddl`.

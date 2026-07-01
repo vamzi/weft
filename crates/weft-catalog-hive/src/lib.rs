@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use weft_catalog::arrow::datatypes::SchemaRef;
-use weft_catalog::hive_types::{columns_to_schema, format_serde, schema_to_columns};
+use weft_catalog::hive_types::{
+    columns_to_schema, format_serde, schema_to_columns, validate_identifier,
+};
 use weft_catalog::{CatalogProvider, Error, Result, TableFormat, TableMetadata};
 
 use thrift::{HiveTable, MetastoreClient, NewHiveTable};
@@ -83,21 +85,32 @@ impl HiveCatalog {
         MetastoreClient::connect(&self.host, self.port).await
     }
 
-    /// Resolve the storage location for a table being created: the explicit `location` if given,
+    /// Resolve the storage location for a table being created: the explicit `location` if given
+    /// (normalized to end in `/`, required for `ListingTable`/`is_collection()` on read-back),
     /// else `{warehouse}/{db}/{table}/`, else an error naming what's missing.
-    fn resolve_create_location(&self, db: &str, table: &str, location: Option<String>) -> Result<String> {
-        match location {
-            Some(l) => Ok(l),
-            None => {
-                let warehouse = self.warehouse.as_deref().ok_or_else(|| {
-                    Error::Plan(format!(
-                        "catalog `{}` has no `warehouse` configured and no explicit LOCATION given",
-                        self.name
-                    ))
-                })?;
-                Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
-            }
+    ///
+    /// `db`/`table` are validated as plain identifiers first (`validate_identifier`) — they come
+    /// straight from the SQL statement's table reference, and were previously interpolated
+    /// unsanitized into the warehouse-derived path, letting a name like `../../etc/evil` escape
+    /// the intended directory (a real path-traversal bug for `file://` warehouses).
+    fn resolve_create_location(
+        &self,
+        db: &str,
+        table: &str,
+        location: Option<String>,
+    ) -> Result<String> {
+        if let Some(l) = location {
+            return Ok(if l.ends_with('/') { l } else { format!("{l}/") });
         }
+        validate_identifier("database", db)?;
+        validate_identifier("table", table)?;
+        let warehouse = self.warehouse.as_deref().ok_or_else(|| {
+            Error::Plan(format!(
+                "catalog `{}` has no `warehouse` configured and no explicit LOCATION given",
+                self.name
+            ))
+        })?;
+        Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
     }
 }
 
@@ -318,5 +331,42 @@ mod tests {
         opts.insert("uri".to_string(), "thrift://h:9083".to_string());
         let c = HiveCatalog::from_config("prod", &opts).unwrap();
         assert_eq!(c.name(), "prod");
+    }
+
+    fn catalog_with_warehouse(warehouse: Option<&str>) -> HiveCatalog {
+        let mut opts = HashMap::new();
+        opts.insert("uri".to_string(), "thrift://h:9083".to_string());
+        if let Some(w) = warehouse {
+            opts.insert("warehouse".to_string(), w.to_string());
+        }
+        HiveCatalog::from_config("hive", &opts).unwrap()
+    }
+
+    #[test]
+    fn resolve_create_location_rejects_path_traversal() {
+        let cat = catalog_with_warehouse(Some("s3://wh"));
+        for (db, table) in [("db", "../../etc/evil"), ("../escape", "t"), ("db", "a/b")] {
+            let err = cat.resolve_create_location(db, table, None).unwrap_err();
+            assert!(matches!(err, Error::Plan(_)), "{db}.{table}");
+        }
+    }
+
+    #[test]
+    fn resolve_create_location_normalizes_missing_trailing_slash() {
+        let cat = catalog_with_warehouse(None);
+        assert_eq!(
+            cat.resolve_create_location("db", "t", Some("s3://explicit/t".to_string()))
+                .unwrap(),
+            "s3://explicit/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_falls_back_to_warehouse() {
+        let cat = catalog_with_warehouse(Some("s3://wh/"));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", None).unwrap(),
+            "s3://wh/db/t/"
+        );
     }
 }

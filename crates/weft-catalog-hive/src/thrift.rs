@@ -834,7 +834,10 @@ mod tests {
             "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
             "EXTERNAL_TABLE",
         ] {
-            assert!(s.contains(expect), "expected `{expect}` in encoded Table struct");
+            assert!(
+                s.contains(expect),
+                "expected `{expect}` in encoded Table struct"
+            );
         }
     }
 
