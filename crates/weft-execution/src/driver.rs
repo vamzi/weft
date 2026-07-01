@@ -8,14 +8,17 @@
 //! Shuffle partition count defaults to worker count but can be overridden via
 //! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
-use crate::flight::{clear_worker_stages, run_stage_on_worker};
+use crate::aqe::{aqe_enabled, coalesced_partitions};
+use crate::flight::{clear_worker_stages, pull_bucket_with_retry};
+use crate::lineage::StageLineage;
 use crate::membership::{ClusterMembership, StaticMembership};
+use crate::scheduler::run_stage_with_retry;
 use crate::shuffle::protocol::StageTicket;
 
 /// Number of hash-shuffle partitions for the next query.
@@ -34,7 +37,7 @@ pub struct Cluster {
     pub workers: Vec<String>,
     /// Hash-shuffle partition count (may exceed worker count).
     pub num_partitions: u32,
-    membership: Arc<dyn ClusterMembership>,
+    pub(crate) membership: Arc<dyn ClusterMembership>,
 }
 
 impl Cluster {
@@ -60,8 +63,9 @@ impl Cluster {
         }
     }
 
-    /// Wrap an existing trait object reference.
+    /// Wrap an existing trait object reference (preserves live membership for DNS refresh).
     pub fn from_membership_ref(membership: &dyn ClusterMembership) -> Self {
+        // Caller should prefer `from_membership(Arc<...>)`; this path clones endpoints once.
         Self::from_membership(Arc::new(StaticMembership::new(membership.endpoints())))
     }
 
@@ -135,7 +139,10 @@ pub async fn run_stages_with_membership(
 }
 
 pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<RecordBatch>> {
-    let w = cluster.num_partitions;
+    let lineage = Arc::new(StageLineage::new());
+    let stage_map: HashMap<u32, StageDef> =
+        stages.iter().map(|s| (s.stage_id, s.clone())).collect();
+    let mut cluster = cluster.clone();
     let consumed: HashSet<u32> = stages
         .iter()
         .flat_map(|s| s.upstream_stage_ids.iter().copied())
@@ -159,25 +166,97 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
     // and hash-partitions into `num_partitions` buckets). Rendezvous hashing applies to the
     // output stage only.
     for stage in stages.iter().filter(|s| s.stage_id != output.stage_id) {
+        refresh_cluster_workers(&mut cluster);
+        let np = cluster.num_partitions;
         let mut futs = Vec::new();
         for (i, endpoint) in cluster.workers.iter().enumerate() {
-            futs.push(run_stage_on_worker(
-                endpoint.clone(),
-                stage_ticket(stage, i as u32, w, cluster, true),
-            ));
+            let ticket = stage_ticket(stage, i as u32, np, &cluster, true);
+            let membership = cluster.membership.clone();
+            let ep = endpoint.clone();
+            let lineage = lineage.clone();
+            let stage_map = stage_map.clone();
+            futs.push(async move {
+                run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await
+            });
         }
         for r in futures::future::join_all(futs).await {
             r?;
         }
+        // AQE: sample bucket row counts after producer stage when enabled.
+        if aqe_enabled() {
+            let mut counts = vec![0usize; np as usize];
+            for p in 0..np {
+                if let Ok(ep) = cluster.owner_endpoint(p) {
+                    if let Ok(batches) = pull_bucket_with_retry(ep, stage.stage_id, p).await {
+                        counts[p as usize] = batches.iter().map(|b| b.num_rows()).sum();
+                    }
+                }
+            }
+            if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), np, &counts) {
+                if new_p < cluster.num_partitions {
+                    cluster.num_partitions = new_p;
+                }
+            }
+        }
     }
 
-    // Output stage: one invocation per shuffle partition on its rendezvous owner.
+    // Output stage: per-worker scatter (global agg) or per-partition rendezvous shuffle.
+    let scatter_output = output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
-    for p in 0..w {
-        let endpoint = cluster.owner_endpoint(p)?;
-        let part =
-            run_stage_on_worker(endpoint, stage_ticket(output, p, w, cluster, false)).await?;
-        out.extend(part);
+    refresh_cluster_workers(&mut cluster);
+    let w = cluster.num_partitions;
+    if scatter_output {
+        let mut futs = Vec::new();
+        for (i, endpoint) in cluster.workers.iter().enumerate() {
+            let ticket = stage_ticket(output, i as u32, w, &cluster, false);
+            let membership = cluster.membership.clone();
+            let ep = endpoint.clone();
+            let lineage = lineage.clone();
+            let stage_map = stage_map.clone();
+            futs.push(async move {
+                run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await
+            });
+        }
+        for r in futures::future::join_all(futs).await {
+            out.extend(r?);
+        }
+    } else {
+        // Group partitions by rendezvous owner so concurrent tasks on the same worker do not
+        // race on the shared `shuffle_input` registration table.
+        let mut by_endpoint: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for p in 0..w {
+            let endpoint = cluster.owner_endpoint(p)?;
+            by_endpoint.entry(endpoint).or_default().push(p);
+        }
+        let mut ep_futs = Vec::new();
+        for (endpoint, parts) in by_endpoint {
+            let membership = cluster.membership.clone();
+            let output = output.clone();
+            let cluster = cluster.clone();
+            let lineage = lineage.clone();
+            let stage_map = stage_map.clone();
+            ep_futs.push(async move {
+                let mut local = Vec::new();
+                for p in parts {
+                    let ticket = stage_ticket(&output, p, w, &cluster, false);
+                    local.extend(
+                        run_stage_with_retry(
+                            &membership,
+                            endpoint.clone(),
+                            ticket,
+                            &lineage,
+                            &stage_map,
+                        )
+                        .await?,
+                    );
+                }
+                Ok::<_, Error>(local)
+            });
+        }
+        for r in futures::future::join_all(ep_futs).await {
+            out.extend(r?);
+        }
     }
 
     // Evict stage caches on all workers after the query completes.
@@ -192,6 +271,15 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
         data
     };
     Ok(unify_schema(out))
+}
+
+/// Refresh worker list from live membership (autoscaling between stage barriers).
+fn refresh_cluster_workers(cluster: &mut Cluster) {
+    let fresh = cluster.membership.endpoints();
+    if !fresh.is_empty() && fresh != cluster.workers {
+        cluster.workers = fresh;
+        cluster.num_partitions = shuffle_partitions(cluster.workers.len());
+    }
 }
 
 fn unify_schema(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {

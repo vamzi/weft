@@ -40,6 +40,8 @@ use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
 /// Flight `do_action` type: register session UDF definitions (JSON payload).
 pub const ACTION_REGISTER_UDFS: &str = "register_udfs";
+/// Flight `do_action` type: liveness probe (driver heartbeats).
+pub const ACTION_HEALTH: &str = "health";
 
 /// One stage's cached output: schema + partitioned buckets (memory or spilled).
 type CachedStage = (SchemaRef, BucketCache);
@@ -269,6 +271,12 @@ impl FlightService for Worker {
                 };
                 Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
             }
+            ACTION_HEALTH => {
+                let body = arrow_flight::Result {
+                    body: b"ok".to_vec().into(),
+                };
+                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+            }
             other => Err(Status::unimplemented(format!(
                 "flight do_action `{other}` not implemented"
             ))),
@@ -372,6 +380,11 @@ pub async fn sync_udfs_to_worker(endpoint: String, udf_json: &str) -> Result<()>
     do_action(endpoint, ACTION_REGISTER_UDFS, udf_json.as_bytes()).await
 }
 
+/// Liveness probe — returns `Ok(())` when the worker responds to `ACTION_HEALTH`.
+pub async fn health_check_worker(endpoint: String) -> Result<()> {
+    do_action(endpoint, ACTION_HEALTH, b"").await
+}
+
 async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<()> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
@@ -413,11 +426,39 @@ pub async fn pull_bucket(
     stage_id: u32,
     target_partition: u32,
 ) -> Result<Vec<RecordBatch>> {
+    pull_bucket_with_retry(endpoint, stage_id, target_partition).await
+}
+
+/// Pull a shuffle bucket with transient retries (shuffle durability on read path).
+pub async fn pull_bucket_with_retry(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+) -> Result<Vec<RecordBatch>> {
+    const MAX_TRIES: u32 = 3;
     let ticket = ShuffleReadTicket {
         stage_id,
         target_partition,
     };
-    do_get_batches(endpoint, ticket.to_ticket_bytes()).await
+    let bytes = ticket.to_ticket_bytes();
+    let mut last = None;
+    for attempt in 0..MAX_TRIES {
+        match do_get_batches(endpoint.clone(), bytes.clone()).await {
+            Ok(b) => return Ok(b),
+            Err(e) if is_pull_retryable(&e) && attempt + 1 < MAX_TRIES => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Execution("pull_bucket failed".into())))
+}
+
+fn is_pull_retryable(err: &Error) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("connect") || s.contains("unavailable") || s.contains("do_get")
 }
 
 #[cfg(test)]

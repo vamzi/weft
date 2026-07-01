@@ -27,12 +27,6 @@ impl ArtifactStore {
         self.files.insert(path, data);
     }
 
-    pub fn append_last(&mut self, data: &[u8]) {
-        if let Some((_, buf)) = self.files.iter_mut().last() {
-            buf.extend_from_slice(data);
-        }
-    }
-
     #[allow(dead_code)]
     pub fn get(&self, path: &str) -> Option<&[u8]> {
         self.files.get(path).map(|v| v.as_slice())
@@ -119,38 +113,80 @@ impl ScalarUDFImpl for PythonUdf {
 
     fn invoke_with_args(
         &self,
-        _args: ScalarFunctionArgs,
+        args: ScalarFunctionArgs,
     ) -> datafusion::common::Result<ColumnarValue> {
+        let scalar_args: Vec<ScalarValue> = args
+            .args
+            .iter()
+            .map(columnar_to_scalar)
+            .collect::<datafusion::common::Result<Vec<_>>>()?;
         Ok(ColumnarValue::Scalar(eval_python_udf_scalar(
             &self.name,
             &self.command,
+            &scalar_args,
+            &self.return_type,
         )?))
     }
 }
 
-fn eval_python_udf_scalar(name: &str, command: &[u8]) -> datafusion::common::Result<ScalarValue> {
-    if std::env::var("WEFT_ALLOW_PYTHON_UDF").ok().as_deref() != Some("1") {
-        let _ = (name, command);
-        return Ok(ScalarValue::Int32(Some(1)));
+fn columnar_to_scalar(cv: &ColumnarValue) -> datafusion::common::Result<ScalarValue> {
+    match cv {
+        ColumnarValue::Scalar(s) => Ok(s.clone()),
+        ColumnarValue::Array(a) => ScalarValue::try_from_array(a, 0),
+    }
+}
+
+fn eval_python_udf_scalar(
+    name: &str,
+    command: &[u8],
+    args: &[ScalarValue],
+    return_type: &DataType,
+) -> datafusion::common::Result<ScalarValue> {
+    let allow = std::env::var("WEFT_ALLOW_PYTHON_UDF")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !allow {
+        return Ok(default_scalar_for_type(return_type));
     }
     let dir = std::env::temp_dir().join("weft-pyudf");
     std::fs::create_dir_all(&dir).ok();
     let script = dir.join(format!("{name}.pkl"));
     std::fs::write(&script, command).ok();
+    let arg_literals: Vec<String> = args.iter().map(|v| format!("{v:?}")).collect();
     let out = std::process::Command::new("python3")
         .arg("-c")
-        .arg("import pickle,sys; print(pickle.loads(open(sys.argv[1],'rb').read())())")
+        .arg(
+            "import pickle,sys; \
+             udf=pickle.loads(open(sys.argv[1],'rb').read()); \
+             args=[eval(a) for a in sys.argv[2:]]; \
+             print(udf(*args) if args else udf())",
+        )
         .arg(&script)
+        .args(arg_literals)
         .output();
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if let Ok(v) = s.parse::<i32>() {
-                Ok(ScalarValue::Int32(Some(v)))
-            } else {
-                Ok(ScalarValue::Int32(Some(1)))
-            }
+            parse_python_result(&s, return_type)
         }
-        _ => Ok(ScalarValue::Int32(Some(1))),
+        _ => Ok(default_scalar_for_type(return_type)),
+    }
+}
+
+fn default_scalar_for_type(dt: &DataType) -> ScalarValue {
+    match dt {
+        DataType::Utf8 => ScalarValue::Utf8(Some(String::new())),
+        DataType::Int64 => ScalarValue::Int64(Some(0)),
+        _ => ScalarValue::Int32(Some(0)),
+    }
+}
+
+fn parse_python_result(s: &str, dt: &DataType) -> datafusion::common::Result<ScalarValue> {
+    match dt {
+        DataType::Utf8 => Ok(ScalarValue::Utf8(Some(s.to_string()))),
+        DataType::Int64 => Ok(ScalarValue::Int64(Some(s.parse().unwrap_or(0)))),
+        _ => Ok(ScalarValue::Int32(Some(s.parse().unwrap_or(0)))),
     }
 }

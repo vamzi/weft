@@ -87,6 +87,9 @@ pub struct WeftService {
     pub workers: Vec<String>,
     /// Python UDF artifact bytes from `AddArtifacts`.
     artifacts: udf::SharedArtifacts,
+    /// Buffered completed operation responses for ReattachExecute.
+    completed_ops:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<sc::ExecutePlanResponse>>>,
 }
 
 impl Default for WeftService {
@@ -116,6 +119,7 @@ impl WeftService {
             streaming: Arc::new(StreamingQueryManager::new()),
             workers: distributed::parse_worker_list(None),
             artifacts: Arc::new(std::sync::Mutex::new(udf::ArtifactStore::default())),
+            completed_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -259,6 +263,13 @@ impl WeftService {
         }
         responses.push(complete);
         Ok(responses)
+    }
+
+    fn buffer_operation(&self, operation_id: &str, responses: Vec<sc::ExecutePlanResponse>) {
+        self.completed_ops
+            .lock()
+            .expect("completed_ops poisoned")
+            .insert(operation_id.to_string(), responses);
     }
 
     /// Handle a PySpark `SqlCommand`. A query stays lazy — we return a `SqlCommandResult` whose
@@ -548,15 +559,22 @@ impl SparkConnectService for WeftService {
                 }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
                     // Register in DataFusion's UDF registry so SQL cells can call the UDF.
-                    let registry = self.engine.udf_registry();
-                    let mut reg = registry.lock().unwrap();
-                    udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
-                    drop(reg);
+                    {
+                        let registry = self.engine.udf_registry();
+                        let mut reg = registry.lock().unwrap();
+                        udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
+                    }
                     // Also store bytes + forward to pyworker so Python cells can invoke it.
-                    if let Some(sc::common_inline_user_defined_function::Function::PythonUdf(py_udf)) = rf.function.as_ref() {
+                    if let Some(sc::common_inline_user_defined_function::Function::PythonUdf(
+                        py_udf,
+                    )) = rf.function.as_ref()
+                    {
                         {
                             let mut arts = self.artifacts.lock().expect("artifacts poisoned");
-                            arts.insert(format!("__udf__{}", rf.function_name), py_udf.command.clone());
+                            arts.insert(
+                                format!("__udf__{}", rf.function_name),
+                                py_udf.command.clone(),
+                            );
                         }
                         if let Ok(base) = std::env::var("WEFT_PYWORKER_URL") {
                             let client = reqwest::Client::new();
@@ -588,6 +606,7 @@ impl SparkConnectService for WeftService {
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
 
+        self.buffer_operation(&operation_id, responses.clone());
         let stream = tokio_stream::iter(responses.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -823,7 +842,6 @@ impl SparkConnectService for WeftService {
                     sc::add_artifacts_response::ArtifactSummary {
                         name: name.clone(),
                         is_crc_successful: true,
-                        ..Default::default()
                     }
                 })
                 .collect()
@@ -865,10 +883,7 @@ impl SparkConnectService for WeftService {
                 let exists = arts.get(&name).is_some();
                 (
                     name,
-                    sc::artifact_statuses_response::ArtifactStatus {
-                        exists,
-                        ..Default::default()
-                    },
+                    sc::artifact_statuses_response::ArtifactStatus { exists },
                 )
             })
             .collect();
@@ -892,11 +907,31 @@ impl SparkConnectService for WeftService {
 
     async fn reattach_execute(
         &self,
-        _request: Request<sc::ReattachExecuteRequest>,
+        request: Request<sc::ReattachExecuteRequest>,
     ) -> std::result::Result<Response<Self::ReattachExecuteStream>, Status> {
-        // Phase 0 buffers nothing; a reattach just reports completion.
-        Err(Status::unimplemented(
-            "ReattachExecute buffer not implemented in Phase 0",
+        let req = request.into_inner();
+        if let Some(buf) = self
+            .completed_ops
+            .lock()
+            .expect("completed_ops poisoned")
+            .get(&req.operation_id)
+            .cloned()
+        {
+            let stream = tokio_stream::iter(buf.into_iter().map(Ok));
+            return Ok(Response::new(
+                Box::pin(stream) as Self::ReattachExecuteStream
+            ));
+        }
+        let complete = self.response(
+            &req.session_id,
+            &req.operation_id,
+            sc::execute_plan_response::ResponseType::ResultComplete(
+                sc::execute_plan_response::ResultComplete {},
+            ),
+        );
+        let stream = tokio_stream::iter(vec![Ok(complete)]);
+        Ok(Response::new(
+            Box::pin(stream) as Self::ReattachExecuteStream
         ))
     }
 
