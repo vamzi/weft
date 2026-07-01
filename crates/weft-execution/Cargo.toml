@@ -11,6 +11,7 @@ rust-version.workspace = true
 weft-common = { workspace = true }
 weft-physical = { workspace = true }
 weft-loom = { workspace = true }
+weft-observability = { workspace = true }
 arrow-flight = "58"
 tonic = "0.14"  # must match arrow-flight 58's tonic (its FlightService trait is over 0.14 types)
 prost = "0.14" # shuffle control envelope; pinned to arrow-flight 58's prost major
