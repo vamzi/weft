@@ -128,10 +128,12 @@ pub fn arrow_type_to_hive(dt: &DataType) -> Option<String> {
 ///
 /// Returns `Error::Unsupported` naming the first column whose type [`arrow_type_to_hive`] can't
 /// map, rather than silently dropping or misdeclaring it.
+pub type HiveColumns = Vec<(String, String)>;
+
 pub fn schema_to_columns(
     schema: &Schema,
     partition_columns: &[String],
-) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+) -> Result<(HiveColumns, HiveColumns)> {
     let mut data_cols = Vec::new();
     let mut part_cols = Vec::new();
     for field in schema.fields() {

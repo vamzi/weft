@@ -193,14 +193,15 @@ impl SchemaProvider for WeftSchemaProvider {
 /// A single persistent background thread (created lazily, once, for the process lifetime) with
 /// its own `current_thread` Tokio runtime, used to run CTAS write futures from `register_table`'s
 /// sync entry point without spawning a new OS thread + runtime on every call.
+type CtasJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>;
+
 struct CtasWriter {
-    jobs: std::sync::mpsc::Sender<Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>>,
+    jobs: std::sync::mpsc::Sender<CtasJob>,
 }
 
 impl CtasWriter {
     fn new() -> Self {
-        let (tx, rx) =
-            std::sync::mpsc::channel::<Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>>();
+        let (tx, rx) = std::sync::mpsc::channel::<CtasJob>();
         std::thread::Builder::new()
             .name("weft-ctas-writer".to_string())
             .spawn(move || {
