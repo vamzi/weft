@@ -32,6 +32,7 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::arrow::ipc::writer::StreamWriter;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
+use weft_observability::{AppStateStore, QueryTracker, SharedStore};
 use weft_proto::spark::connect as sc;
 use weft_streaming::StreamingQueryManager;
 
@@ -48,10 +49,14 @@ const MAX_MSG: usize = 256 * 1024 * 1024;
 const CHUNK_ROWS: usize = 8192;
 
 /// Server configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// TCP port. Sail uses 50051; Spark's own server defaults to 15002.
     pub port: u16,
+    /// Monitoring UI HTTP port (Spark default 4040). `None` disables the UI server.
+    pub ui_port: Option<u16>,
+    /// Shared observability store for the UI. Created automatically when `ui_port` is set.
+    pub observability: Option<SharedStore>,
     /// Catalogs to declare at startup, as flat `spark.sql.catalog.<name>.*` entries (e.g.
     /// `spark.sql.catalog.prod.type=hive`). Seeds the session config so external catalogs are
     /// live before the first client connects; clients can still add more via the `Config` RPC.
@@ -65,6 +70,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 50051,
+            ui_port: Some(4040),
+            observability: None,
             catalogs: std::collections::HashMap::new(),
             workers: distributed::parse_worker_list(None),
         }
@@ -90,6 +97,8 @@ pub struct WeftService {
     /// Buffered completed operation responses for ReattachExecute.
     completed_ops:
         std::sync::Mutex<std::collections::HashMap<String, Vec<sc::ExecutePlanResponse>>>,
+    /// Runtime observability store (jobs, stages, SQL plans).
+    observability: SharedStore,
 }
 
 impl Default for WeftService {
@@ -101,6 +110,11 @@ impl Default for WeftService {
 impl WeftService {
     /// Build a service with a fresh DataFusion-backed engine.
     pub fn new() -> Self {
+        Self::with_store(Arc::new(AppStateStore::new()))
+    }
+
+    /// Build with an explicit observability store (tests, history server).
+    pub fn with_store(observability: SharedStore) -> Self {
         // Seed the defaults PySpark reads during normal operation (Arrow→pandas timezone; the
         // local-relation cache threshold `createDataFrame` parses as an int).
         let mut config = std::collections::HashMap::new();
@@ -120,7 +134,13 @@ impl WeftService {
             workers: distributed::parse_worker_list(None),
             artifacts: Arc::new(std::sync::Mutex::new(udf::ArtifactStore::default())),
             completed_ops: std::sync::Mutex::new(std::collections::HashMap::new()),
+            observability,
         }
+    }
+
+    /// Access the observability store.
+    pub fn observability(&self) -> &SharedStore {
+        &self.observability
     }
 
     fn workers_from_config(&self) -> Vec<String> {
@@ -149,11 +169,12 @@ impl WeftService {
             ..Default::default()
         })
     }
-
-    /// Build with full server configuration (workers, catalogs, port).
     pub fn with_config(config: ServerConfig) -> Self {
-        let service = Self::new();
-        let mut svc = service;
+        let store = config
+            .observability
+            .clone()
+            .unwrap_or_else(|| Arc::new(AppStateStore::new()));
+        let mut svc = Self::with_store(store);
         if !config.catalogs.is_empty() {
             svc.config
                 .lock()
@@ -164,7 +185,13 @@ impl WeftService {
         if !config.workers.is_empty() {
             svc.workers = config.workers;
         }
+        svc.sync_observability_env();
         svc
+    }
+
+    fn sync_observability_env(&self) {
+        let snapshot = self.config.lock().expect("config poisoned").clone();
+        self.observability.set_environment(snapshot);
     }
 
     /// Build with a pre-configured engine (tests and embedded driver setups).
@@ -285,7 +312,39 @@ impl WeftService {
         let relation = if is_query(sql) {
             sql_relation(sql)
         } else {
-            let batches = self.engine.sql(sql).await.map_err(err_to_status)?;
+            let tracker = QueryTracker::begin(
+                self.observability.clone(),
+                operation_id,
+                truncate_sql(sql),
+            );
+            if let Ok(plan) = self.engine.logical_plan(sql).await {
+                if let Ok(text) = self.engine.explain(&plan, true).await {
+                    tracker.set_plan(text, None);
+                }
+            }
+            let mut tracker = tracker;
+            tracker.begin_local_stage("command", 1);
+            let task_id = self.observability.alloc_task_id();
+            tracker.task_started(0, task_id, "driver");
+            let start = std::time::Instant::now();
+            let batches = match self.engine.sql(sql).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracker.finish_error(e.to_string());
+                    return Err(err_to_status(e));
+                }
+            };
+            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+            tracker.task_finished(
+                0,
+                task_id,
+                "driver",
+                start.elapsed().as_millis() as i64,
+                rows,
+                0,
+                0,
+            );
+            tracker.finish_success(rows);
             let data = encode_ipc_multi(&batches)
                 .map_err(|e| Status::internal(format!("arrow ipc encode: {e}")))?;
             sc::Relation {
@@ -400,13 +459,16 @@ impl WeftService {
     async fn eval_relation(
         &self,
         rel: &sc::Relation,
+        operation_id: Option<&str>,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
         if let Some(sc::relation::RelType::ShowString(s)) = rel.rel_type.as_ref() {
             let child = s
                 .input
                 .as_deref()
                 .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
-            let batches = self.base_relation_batches(child).await?;
+            let batches = self
+                .base_relation_batches(child, operation_id)
+                .await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
             return Ok(vec![show_string_batch(text)]);
         }
@@ -414,35 +476,68 @@ impl WeftService {
         if let Some(sc::relation::RelType::Catalog(cat)) = rel.rel_type.as_ref() {
             return catalog::handle_catalog(&self.engine, &self.registry, cat).await;
         }
-        self.base_relation_batches(rel).await
+        self.base_relation_batches(rel, operation_id).await
     }
 
-    /// Evaluate a `Sql` or `LocalRelation` to record batches, always carrying the schema (an empty
-    /// result yields one zero-row batch so the client still receives a typed, non-null table).
+    /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks.
     async fn base_relation_batches(
         &self,
         rel: &sc::Relation,
+        operation_id: Option<&str>,
     ) -> std::result::Result<Vec<RecordBatch>, Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
                 let udf_json = self.engine.export_udfs_json();
+                let description = truncate_sql(&sql.query);
+                let tracker = operation_id.map(|op| {
+                    QueryTracker::begin(self.observability.clone(), op, description.clone())
+                });
+                if let Some(ref t) = tracker {
+                    if let Ok(plan) = self.engine.logical_plan(&sql.query).await {
+                        if let Ok(text) = self.engine.explain(&plan, true).await {
+                            t.set_plan(text, None);
+                        }
+                    }
+                }
                 if let Some(dist) = distributed::try_run_distributed(
                     &self.engine,
                     &workers,
                     &sql.query,
                     &[],
                     Some(&udf_json),
+                    tracker.as_ref(),
                 )
                 .await
                 .map_err(err_to_status)?
                 {
+                    if let Some(t) = tracker {
+                        let rows: i64 = dist.iter().map(|b| b.num_rows() as i64).sum();
+                        t.finish_success(rows);
+                    }
                     return Ok(dist);
                 }
-                let mut batches = self.engine.sql(&sql.query).await.map_err(err_to_status)?;
-                // A 0-row result must still carry its schema so the client gets a typed (empty)
-                // table. Re-derive the schema only for queries — `engine.schema` plans via
-                // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
+                let local_tracker = tracker.map(|t| {
+                    let mut t = t;
+                    t.begin_local_stage("local", 1);
+                    t
+                });
+                let task_id = local_tracker
+                    .as_ref()
+                    .map(|_| self.observability.alloc_task_id());
+                if let (Some(ref t), Some(tid)) = (&local_tracker, task_id) {
+                    t.task_started(0, tid, "driver");
+                }
+                let start = std::time::Instant::now();
+                let mut batches = match self.engine.sql(&sql.query).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if let Some(t) = local_tracker {
+                            t.finish_error(e.to_string());
+                        }
+                        return Err(err_to_status(e));
+                    }
+                };
                 if batches.is_empty() && is_query(&sql.query) {
                     let schema = self
                         .engine
@@ -450,6 +545,19 @@ impl WeftService {
                         .await
                         .map_err(err_to_status)?;
                     batches.push(RecordBatch::new_empty(schema));
+                }
+                let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                if let (Some(t), Some(tid)) = (local_tracker, task_id) {
+                    t.task_finished(
+                        0,
+                        tid,
+                        "driver",
+                        start.elapsed().as_millis() as i64,
+                        rows,
+                        0,
+                        0,
+                    );
+                    t.finish_success(rows);
                 }
                 Ok(batches)
             }
@@ -471,19 +579,54 @@ impl WeftService {
             _ => {
                 let plan = translate::to_plan(self.engine.ctx(), rel).await?;
                 let schema = Arc::new(plan.schema().as_arrow().clone());
-                let batches = self
-                    .engine
-                    .execute_logical_plan(plan)
-                    .await
-                    .map_err(err_to_status)?;
-                // Spark has no unsigned types; cast unsigned columns (e.g. row_number's UInt64) to
-                // signed so the Arrow IPC the client reads is representable.
+                let tracker = operation_id.map(|op| {
+                    QueryTracker::begin(self.observability.clone(), op, "DataFrame")
+                });
+                if let Some(ref t) = tracker {
+                    if let Ok(text) = self.engine.explain(&plan, true).await {
+                        t.set_plan(text, None);
+                    }
+                }
+                let local_tracker = tracker.map(|t| {
+                    let mut t = t;
+                    t.begin_local_stage("dataframe", 1);
+                    t
+                });
+                let task_id = local_tracker
+                    .as_ref()
+                    .map(|_| self.observability.alloc_task_id());
+                if let (Some(ref t), Some(tid)) = (&local_tracker, task_id) {
+                    t.task_started(0, tid, "driver");
+                }
+                let start = std::time::Instant::now();
+                let batches = match self.engine.execute_logical_plan(plan).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if let Some(t) = local_tracker {
+                            t.finish_error(e.to_string());
+                        }
+                        return Err(err_to_status(e));
+                    }
+                };
                 let mut batches = batches
                     .into_iter()
                     .map(signed_columns)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 if batches.is_empty() {
                     batches.push(RecordBatch::new_empty(signed_schema(&schema)));
+                }
+                let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                if let (Some(t), Some(tid)) = (local_tracker, task_id) {
+                    t.task_finished(
+                        0,
+                        tid,
+                        "driver",
+                        start.elapsed().as_millis() as i64,
+                        rows,
+                        0,
+                        0,
+                    );
+                    t.finish_success(rows);
                 }
                 Ok(batches)
             }
@@ -600,7 +743,9 @@ impl SparkConnectService for WeftService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let batches = self.eval_relation(rel).await?;
+                let batches = self
+                    .eval_relation(rel, Some(&operation_id))
+                    .await?;
                 self.stream_batches(&session_id, &operation_id, &batches)?
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
@@ -713,6 +858,7 @@ impl SparkConnectService for WeftService {
                 }
                 // A `spark.sql.catalog.*` change may have declared a new catalog — reconcile.
                 self.sync_catalogs();
+                self.sync_observability_env();
                 Vec::new()
             }
             Some(OpType::Get(get)) => get.keys.iter().map(|k| self.config_get(k)).collect(),
@@ -979,9 +1125,49 @@ impl SparkConnectService for WeftService {
 
     async fn get_status(
         &self,
-        _request: Request<sc::GetStatusRequest>,
+        request: Request<sc::GetStatusRequest>,
     ) -> std::result::Result<Response<sc::GetStatusResponse>, Status> {
-        Ok(Response::new(sc::GetStatusResponse::default()))
+        let req = request.into_inner();
+        let mut response = sc::GetStatusResponse {
+            session_id: req.session_id,
+            server_side_session_id: self.server_session_id.clone(),
+            ..Default::default()
+        };
+        if let Some(op_req) = req.operation_status {
+            let ids: Vec<String> = if op_req.operation_ids.is_empty() {
+                self.observability
+                    .all_operation_states()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            } else {
+                op_req.operation_ids
+            };
+            for op_id in ids {
+                if let Some(state) = self.observability.operation_state(&op_id) {
+                    let proto_state = match state {
+                        weft_observability::OperationState::Running => {
+                            sc::get_status_response::operation_status::OperationState::Running as i32
+                        }
+                        weft_observability::OperationState::Succeeded => {
+                            sc::get_status_response::operation_status::OperationState::Succeeded
+                                as i32
+                        }
+                        weft_observability::OperationState::Failed => {
+                            sc::get_status_response::operation_status::OperationState::Failed as i32
+                        }
+                    };
+                    response.operation_statuses.push(
+                        sc::get_status_response::OperationStatus {
+                            operation_id: op_id,
+                            state: proto_state,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Response::new(response))
     }
 }
 
@@ -1013,8 +1199,15 @@ fn sql_relation(query: &str) -> sc::Relation {
     }
 }
 
-/// Does this SQL produce a result set (lazy), as opposed to running for a side effect (eager)?
-/// First-keyword heuristic over the SQL surface Weft supports.
+fn truncate_sql(s: &str) -> String {
+    let t = s.trim().replace('\n', " ");
+    if t.chars().count() <= 120 {
+        t
+    } else {
+        format!("{}…", t.chars().take(119).collect::<String>())
+    }
+}
+
 fn is_query(sql: &str) -> bool {
     let kw = sql
         .trim_start()
@@ -1290,7 +1483,31 @@ fn err_to_status(e: Error) -> Status {
 /// Start the Spark Connect server and serve until the process is killed.
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let port = config.port;
-    serve_instance(WeftService::with_config(config), port).await
+    let ui_port = config.ui_port;
+    let store = config
+        .observability
+        .clone()
+        .unwrap_or_else(|| Arc::new(AppStateStore::new()));
+    let mut cfg = config;
+    cfg.observability = Some(store.clone());
+    let service = WeftService::with_config(cfg);
+
+    if let Some(ui_port) = ui_port {
+        let ui_store = store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = weft_ui_server::serve(weft_ui_server::UiServerConfig {
+                port: ui_port,
+                store: ui_store,
+            })
+            .await
+            {
+                eprintln!("weft ui server error: {e}");
+            }
+        });
+        eprintln!("Weft UI listening on http://0.0.0.0:{ui_port}");
+    }
+
+    serve_instance(service, port).await
 }
 
 /// Serve a pre-built service instance (tests with a seeded engine).

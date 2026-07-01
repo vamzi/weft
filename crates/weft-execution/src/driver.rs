@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
+use weft_observability::{ExecutionEvent, SharedStore, StageStatus, TaskStatus, now_ms};
 
 use crate::aqe::{aqe_enabled, coalesced_partitions};
 use crate::flight::{clear_worker_stages, pull_bucket_with_retry};
@@ -121,24 +122,39 @@ pub async fn run_distributed(
     cluster: &Cluster,
     plan: &DistributedPlan,
 ) -> Result<Vec<RecordBatch>> {
-    run_stages(cluster, &plan.into_stages()).await
+    run_stages_obs(cluster, &plan.into_stages(), None, None).await
 }
 
 pub async fn run_distributed_with_membership(
     membership: Arc<dyn ClusterMembership>,
     plan: &DistributedPlan,
 ) -> Result<Vec<RecordBatch>> {
-    run_stages(&Cluster::from_membership(membership), &plan.into_stages()).await
+    run_stages_obs(
+        &Cluster::from_membership(membership),
+        &plan.into_stages(),
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn run_stages_with_membership(
     membership: Arc<dyn ClusterMembership>,
     stages: &[StageDef],
 ) -> Result<Vec<RecordBatch>> {
-    run_stages(&Cluster::from_membership(membership), stages).await
+    run_stages_obs(&Cluster::from_membership(membership), stages, None, None).await
 }
 
 pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<RecordBatch>> {
+    run_stages_obs(cluster, stages, None, None).await
+}
+
+pub async fn run_stages_obs(
+    cluster: &Cluster,
+    stages: &[StageDef],
+    store: Option<SharedStore>,
+    operation_id: Option<String>,
+) -> Result<Vec<RecordBatch>> {
     let lineage = Arc::new(StageLineage::new());
     let stage_map: HashMap<u32, StageDef> =
         stages.iter().map(|s| (s.stage_id, s.clone())).collect();
@@ -173,14 +189,79 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
             let ticket = stage_ticket(stage, i as u32, np, &cluster, true);
             let membership = cluster.membership.clone();
             let ep = endpoint.clone();
+            let host = ep
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string();
             let lineage = lineage.clone();
             let stage_map = stage_map.clone();
+            let store_c = store.clone();
+            let op_c = operation_id.clone();
+            let stage_id = stage.stage_id as i32;
+            let task_id = store
+                .as_ref()
+                .map(|s| s.alloc_task_id())
+                .unwrap_or(i as i64);
+            if let (Some(ref s), Some(ref op)) = (&store_c, &op_c) {
+                s.emit(ExecutionEvent::TaskStarted {
+                    operation_id: op.clone(),
+                    stage_id,
+                    task_id,
+                    executor_id: host.to_string(),
+                    launch_time_ms: now_ms(),
+                });
+            }
             futs.push(async move {
-                run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await
+                let start = std::time::Instant::now();
+                let result = run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
+                if let (Some(s), Some(op)) = (store_c, op_c) {
+                    match &result {
+                        Ok(batches) => {
+                            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                            s.emit(ExecutionEvent::TaskFinished {
+                                operation_id: op,
+                                stage_id,
+                                task_id,
+                                executor_id: host.clone(),
+                                status: TaskStatus::Success,
+                                duration_ms: start.elapsed().as_millis() as i64,
+                                shuffle_read_bytes: 0,
+                                shuffle_write_bytes: rows * 8,
+                                output_rows: rows,
+                            });
+                        }
+                        Err(_) => {
+                            s.emit(ExecutionEvent::TaskFinished {
+                                operation_id: op,
+                                stage_id,
+                                task_id,
+                                executor_id: host.clone(),
+                                status: TaskStatus::Failed,
+                                duration_ms: start.elapsed().as_millis() as i64,
+                                shuffle_read_bytes: 0,
+                                shuffle_write_bytes: 0,
+                                output_rows: 0,
+                            });
+                        }
+                    }
+                }
+                result
             });
         }
         for r in futures::future::join_all(futs).await {
             r?;
+        }
+        if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
+            s.emit(ExecutionEvent::StageFinished {
+                operation_id: op.clone(),
+                stage_id: stage.stage_id as i32,
+                status: StageStatus::Complete,
+                completion_time_ms: now_ms(),
+                shuffle_read_bytes: 0,
+                shuffle_write_bytes: 0,
+                input_rows: 0,
+                output_rows: 0,
+            });
         }
         // AQE: sample bucket row counts after producer stage when enabled.
         if aqe_enabled() {
@@ -194,6 +275,14 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
             }
             if let Ok(new_p) = coalesced_partitions(cluster.worker_count(), np, &counts) {
                 if new_p < cluster.num_partitions {
+                    if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
+                        s.emit(ExecutionEvent::AqeCoalesced {
+                            operation_id: op.clone(),
+                            stage_id: stage.stage_id as i32,
+                            old_partitions: cluster.num_partitions,
+                            new_partitions: new_p,
+                        });
+                    }
                     cluster.num_partitions = new_p;
                 }
             }
