@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use weft_catalog::hive_types::columns_to_schema;
+use weft_catalog::arrow::datatypes::SchemaRef;
+use weft_catalog::hive_types::{columns_to_schema, format_serde, schema_to_columns};
 use weft_catalog::{CatalogProvider, Error, Result, TableFormat, TableMetadata};
 
 /// A Glue catalog connection, addressed by its registered `name` and AWS `region`.
@@ -22,6 +23,10 @@ pub struct GlueCatalog {
     name: String,
     region: String,
     aws_bin: String,
+    /// `s3://bucket/prefix` root new tables are written under (`{warehouse}/{db}/{table}/`) when a
+    /// `CREATE TABLE ... AS SELECT` doesn't specify an explicit `LOCATION`. `None` means CTAS
+    /// against this catalog must supply an explicit location (see `create_table`).
+    warehouse: Option<String>,
 }
 
 impl GlueCatalog {
@@ -30,16 +35,20 @@ impl GlueCatalog {
         name: impl Into<String>,
         region: impl Into<String>,
         aws_bin: Option<String>,
+        warehouse: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
             region: region.into(),
             aws_bin: aws_bin.unwrap_or_else(|| "aws".to_string()),
+            warehouse,
         }
     }
 
-    /// Build from a flat options map (`region` only) — the shape used by both the gateway connection
-    /// request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to `us-west-2`.
+    /// Build from a flat options map (`region`, `warehouse`) — the shape used by both the gateway
+    /// connection request and the `spark.sql.catalog.<name>.*` startup config. `region` defaults to
+    /// `us-west-2`; `warehouse` (e.g. `s3://bucket/prefix`, the Spark/Iceberg connection-option
+    /// convention) is optional — CTAS against this catalog needs it (or an explicit `LOCATION`).
     ///
     /// SECURITY: the AWS CLI path is **never** taken from `options` (which can be attacker-supplied
     /// via `POST /api/connections`). It is sourced only from the operator-controlled `WEFT_AWS_BIN`
@@ -51,7 +60,8 @@ impl GlueCatalog {
             .cloned()
             .unwrap_or_else(|| "us-west-2".to_string());
         let aws_bin = std::env::var("WEFT_AWS_BIN").ok();
-        Self::new(name, region, aws_bin)
+        let warehouse = options.get("warehouse").cloned();
+        Self::new(name, region, aws_bin, warehouse)
     }
 
     /// Run `aws glue <args> --region <region> --output json` and return stdout.
@@ -161,6 +171,101 @@ impl CatalogProvider for GlueCatalog {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,
         })
+    }
+
+    async fn create_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        schema: SchemaRef,
+        format: TableFormat,
+        location: Option<String>,
+        partition_columns: &[String],
+    ) -> Result<TableMetadata> {
+        let db = single_db(namespace)?;
+        let location = self.resolve_create_location(db, table, location)?;
+        let table_input = build_table_input(table, &location, &schema, format, partition_columns)?;
+        let table_input_json = serde_json::to_string(&table_input)
+            .map_err(|e| Error::Io(format!("serialize Glue TableInput: {e}")))?;
+
+        self.glue(&[
+            "create-table",
+            "--database-name",
+            db,
+            "--table-input",
+            &table_input_json,
+        ])
+        .await?;
+
+        let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
+            .with_schema(schema)
+            .with_partition_columns(partition_columns.to_vec());
+        Ok(md)
+    }
+}
+
+impl GlueCatalog {
+    /// Resolve the storage location for a table being created: the explicit `location` if given,
+    /// else `{warehouse}/{db}/{table}/`, else an error naming what's missing.
+    fn resolve_create_location(&self, db: &str, table: &str, location: Option<String>) -> Result<String> {
+        match location {
+            Some(l) => Ok(l),
+            None => {
+                let warehouse = self.warehouse.as_deref().ok_or_else(|| {
+                    Error::Plan(format!(
+                        "catalog `{}` has no `warehouse` configured and no explicit LOCATION given",
+                        self.name
+                    ))
+                })?;
+                Ok(format!("{}/{db}/{table}/", warehouse.trim_end_matches('/')))
+            }
+        }
+    }
+}
+
+/// Build the Glue `create-table --table-input` JSON body for a new table at `location` with
+/// `schema`/`format`/`partition_columns`. A pure function (no I/O) so it's independently
+/// unit-testable without shelling out to the `aws` CLI.
+fn build_table_input(
+    table: &str,
+    location: &str,
+    schema: &weft_catalog::arrow::datatypes::Schema,
+    format: TableFormat,
+    partition_columns: &[String],
+) -> Result<serde_json::Value> {
+    let serde = format_serde(format)?;
+    let (data_cols, part_cols) = schema_to_columns(schema, partition_columns)?;
+    let to_json = |cols: &[(String, String)]| {
+        cols.iter()
+            .map(|(name, ty)| serde_json::json!({"Name": name, "Type": ty}))
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({
+        "Name": table,
+        "StorageDescriptor": {
+            "Location": location,
+            "Columns": to_json(&data_cols),
+            "InputFormat": serde.input_format,
+            "OutputFormat": serde.output_format,
+            "SerdeInfo": {
+                "SerializationLibrary": serde.serde_lib,
+                "Parameters": serde.serde_params.iter().copied().collect::<HashMap<_, _>>(),
+            },
+        },
+        "PartitionKeys": to_json(&part_cols),
+        "Parameters": { "classification": classification_for(format) },
+    }))
+}
+
+/// The Glue/Athena `classification` table parameter for a physical format (the same convention
+/// `load_table` reads back via `Parameters.classification`).
+fn classification_for(format: TableFormat) -> &'static str {
+    match format {
+        TableFormat::Parquet => "parquet",
+        TableFormat::Csv => "csv",
+        TableFormat::Json => "json",
+        TableFormat::Delta => "delta",
+        TableFormat::Iceberg => "iceberg",
     }
 }
 
@@ -295,5 +400,80 @@ mod tests {
             Error::Io(msg) => assert!(msg.contains("Could not connect")),
             other => panic!("expected Error::Io, got {other:?}"),
         }
+    }
+
+    // `build_table_input` / `resolve_create_location` back `GlueCatalog::create_table` (CTAS write
+    // support) — tested as pure functions so no `aws` CLI invocation is needed.
+
+    fn sample_schema() -> weft_catalog::arrow::datatypes::Schema {
+        use weft_catalog::arrow::datatypes::{DataType, Field};
+        weft_catalog::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("dt", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn build_table_input_shapes_parquet_table_correctly() {
+        let schema = sample_schema();
+        let v = build_table_input(
+            "orders",
+            "s3://bucket/db/orders/",
+            &schema,
+            TableFormat::Parquet,
+            &["dt".to_string()],
+        )
+        .expect("built");
+        assert_eq!(v["Name"], "orders");
+        assert_eq!(v["StorageDescriptor"]["Location"], "s3://bucket/db/orders/");
+        assert_eq!(
+            v["StorageDescriptor"]["Columns"],
+            json!([{"Name": "id", "Type": "bigint"}, {"Name": "name", "Type": "string"}])
+        );
+        assert_eq!(
+            v["PartitionKeys"],
+            json!([{"Name": "dt", "Type": "string"}])
+        );
+        assert_eq!(
+            v["StorageDescriptor"]["SerdeInfo"]["SerializationLibrary"],
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+        );
+        assert_eq!(v["Parameters"]["classification"], "parquet");
+    }
+
+    #[test]
+    fn build_table_input_rejects_lakehouse_write_formats() {
+        let schema = sample_schema();
+        for format in [TableFormat::Delta, TableFormat::Iceberg] {
+            let err = build_table_input("t", "s3://bucket/t/", &schema, format, &[]).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_create_location_prefers_explicit_location() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, Some("s3://wh".to_string()));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", Some("s3://explicit/t/".to_string()))
+                .unwrap(),
+            "s3://explicit/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_falls_back_to_warehouse() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, Some("s3://wh/".to_string()));
+        assert_eq!(
+            cat.resolve_create_location("db", "t", None).unwrap(),
+            "s3://wh/db/t/"
+        );
+    }
+
+    #[test]
+    fn resolve_create_location_errors_without_warehouse_or_location() {
+        let cat = GlueCatalog::new("glue", "us-west-2", None, None);
+        let err = cat.resolve_create_location("db", "t", None).unwrap_err();
+        assert!(matches!(err, Error::Plan(_)));
     }
 }

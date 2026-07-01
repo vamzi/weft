@@ -14,6 +14,7 @@
 //! reads, so inferring everything is the safe choice.
 
 use crate::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use crate::{Error, Result, TableFormat};
 
 /// Build an Arrow [`Schema`] from an ordered list of `(column_name, hive_type_string)` pairs
 /// (data columns first, then partition columns).
@@ -93,6 +94,102 @@ fn parse_decimal_args(args: &str) -> Option<(u8, i8)> {
         return None;
     }
     Some((p, s))
+}
+
+/// The reverse of [`hive_type_to_arrow`]: map an Arrow [`DataType`] to the Hive/Glue type string a
+/// `CREATE TABLE` (Glue `create-table` / Hive Metastore `create_table`) declares it as. Used when
+/// writing a CTAS result's schema back to an external catalog. Returns `None` for a type this
+/// mapping can't faithfully declare (e.g. `List`/`Struct`/`Map`) — the caller should surface this
+/// as `Error::Unsupported` rather than silently guessing a lossy Hive type.
+pub fn arrow_type_to_hive(dt: &DataType) -> Option<String> {
+    Some(match dt {
+        DataType::Int64 => "bigint".to_string(),
+        DataType::Int32 => "int".to_string(),
+        DataType::Int16 => "smallint".to_string(),
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "string".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Date32 | DataType::Date64 => "date".to_string(),
+        // Hive `timestamp` has no unit/timezone distinction — every Arrow timestamp variant
+        // declares the same Hive type string (the engine's writer controls the physical encoding).
+        DataType::Timestamp(_, _) => "timestamp".to_string(),
+        DataType::Binary | DataType::LargeBinary => "binary".to_string(),
+        DataType::Decimal128(p, s) => format!("decimal({p},{s})"),
+        _ => return None,
+    })
+}
+
+/// The reverse of [`columns_to_schema`]: split an Arrow [`Schema`] into `(data_columns,
+/// partition_columns)` — each an ordered list of `(name, hive_type_string)` pairs — for building a
+/// Glue `TableInput`/Hive `Table` write request. `partition_columns` names the fields (already
+/// present in `schema`) that are partition keys rather than data columns.
+///
+/// Returns `Error::Unsupported` naming the first column whose type [`arrow_type_to_hive`] can't
+/// map, rather than silently dropping or misdeclaring it.
+pub fn schema_to_columns(
+    schema: &Schema,
+    partition_columns: &[String],
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    let mut data_cols = Vec::new();
+    let mut part_cols = Vec::new();
+    for field in schema.fields() {
+        let ty = arrow_type_to_hive(field.data_type()).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "column `{}` has type {:?}, which cannot be declared to an external catalog",
+                field.name(),
+                field.data_type()
+            ))
+        })?;
+        if partition_columns.iter().any(|p| p == field.name()) {
+            part_cols.push((field.name().clone(), ty));
+        } else {
+            data_cols.push((field.name().clone(), ty));
+        }
+    }
+    Ok((data_cols, part_cols))
+}
+
+/// The Hive SerDe/InputFormat/OutputFormat triple (plus SerDe parameters) a `CREATE TABLE`
+/// declares for a given physical format — identical whether the table is fronted by AWS Glue or a
+/// native Hive Metastore, since both speak the same Hive storage-descriptor vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub struct HiveSerde {
+    pub input_format: &'static str,
+    pub output_format: &'static str,
+    pub serde_lib: &'static str,
+    pub serde_params: &'static [(&'static str, &'static str)],
+}
+
+/// Look up the [`HiveSerde`] for a CTAS write target format. Only `Parquet`/`Csv`/`Json` are
+/// supported write targets today — `Delta`/`Iceberg` need a real commit protocol (transaction log
+/// / manifest+snapshot) rather than a plain SerDe declaration, so they return `Unsupported`.
+pub fn format_serde(format: TableFormat) -> Result<HiveSerde> {
+    match format {
+        TableFormat::Parquet => Ok(HiveSerde {
+            input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+            output_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+            serde_lib: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+            serde_params: &[],
+        }),
+        TableFormat::Csv => Ok(HiveSerde {
+            input_format: "org.apache.hadoop.mapred.TextInputFormat",
+            output_format: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+            serde_lib: "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+            serde_params: &[("field.delim", ",")],
+        }),
+        TableFormat::Json => Ok(HiveSerde {
+            input_format: "org.apache.hadoop.mapred.TextInputFormat",
+            output_format: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+            serde_lib: "org.apache.hive.hcatalog.data.JsonSerDe",
+            serde_params: &[],
+        }),
+        TableFormat::Delta | TableFormat::Iceberg => Err(Error::Unsupported(format!(
+            "{format:?} is not a supported CTAS write target yet (needs a real commit protocol, \
+             not a plain SerDe declaration)"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +290,81 @@ mod tests {
             ("tags".to_string(), "array<string>".to_string()),
         ];
         assert_eq!(columns_to_schema(cols), None);
+    }
+
+    #[test]
+    fn arrow_type_to_hive_round_trips_hive_type_to_arrow() {
+        // Every scalar hive_type_to_arrow maps FROM should round-trip back to an equivalent
+        // (not necessarily byte-identical, e.g. "long"→Int64→"bigint") Hive type string.
+        let cases = [
+            (DataType::Int64, "bigint"),
+            (DataType::Int32, "int"),
+            (DataType::Int16, "smallint"),
+            (DataType::Int8, "tinyint"),
+            (DataType::Float64, "double"),
+            (DataType::Float32, "float"),
+            (DataType::Utf8, "string"),
+            (DataType::Boolean, "boolean"),
+            (DataType::Date32, "date"),
+            (DataType::Timestamp(TimeUnit::Microsecond, None), "timestamp"),
+            (DataType::Binary, "binary"),
+            (DataType::Decimal128(15, 2), "decimal(15,2)"),
+        ];
+        for (arrow, hive) in cases {
+            assert_eq!(arrow_type_to_hive(&arrow).as_deref(), Some(hive), "{arrow:?}");
+            // And the forward mapping accepts what we just produced.
+            assert_eq!(hive_type_to_arrow(hive), Some(arrow.clone()), "{hive}");
+        }
+    }
+
+    #[test]
+    fn arrow_type_to_hive_rejects_complex_types() {
+        assert_eq!(
+            arrow_type_to_hive(&DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Int32,
+                true
+            )))),
+            None
+        );
+    }
+
+    #[test]
+    fn schema_to_columns_splits_data_and_partition_columns() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("dt", DataType::Utf8, true),
+        ]);
+        let (data, parts) = schema_to_columns(&schema, &["dt".to_string()]).expect("mapped");
+        assert_eq!(
+            data,
+            vec![
+                ("id".to_string(), "bigint".to_string()),
+                ("name".to_string(), "string".to_string()),
+            ]
+        );
+        assert_eq!(parts, vec![("dt".to_string(), "string".to_string())]);
+    }
+
+    #[test]
+    fn schema_to_columns_rejects_unmappable_type() {
+        let schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]);
+        let err = schema_to_columns(&schema, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn format_serde_covers_write_targets_and_rejects_lakehouse_formats() {
+        for format in [TableFormat::Parquet, TableFormat::Csv, TableFormat::Json] {
+            assert!(format_serde(format).is_ok(), "{format:?}");
+        }
+        for format in [TableFormat::Delta, TableFormat::Iceberg] {
+            assert!(matches!(format_serde(format), Err(Error::Unsupported(_))), "{format:?}");
+        }
     }
 }
