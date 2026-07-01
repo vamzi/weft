@@ -1,16 +1,14 @@
 //! Route distributable SQL through the driver/worker cluster.
 
-use std::sync::Arc;
-
 use weft_common::{Error, Result};
 use weft_execution::driver::{run_stages, Cluster};
 use weft_execution::flight::sync_udfs_to_worker;
-use weft_execution::membership::StaticMembership;
+use weft_execution::membership::resolve_membership;
 use weft_execution::plan::plan_distributed;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
-/// If `workers` is non-empty and `sql` is auto-splittable, run distributed and return batches.
+/// If workers or K8s service discovery is configured and `sql` is auto-splittable, run distributed.
 /// Returns `Ok(None)` when the query should fall back to single-node execution.
 pub async fn try_run_distributed(
     engine: &Engine,
@@ -19,7 +17,9 @@ pub async fn try_run_distributed(
     replicated: &[&str],
     udf_json: Option<&str>,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    if workers.is_empty() {
+    let membership = resolve_membership(workers);
+    let endpoints = membership.endpoints();
+    if endpoints.is_empty() {
         return Ok(None);
     }
 
@@ -30,12 +30,11 @@ pub async fn try_run_distributed(
     };
 
     if let Some(json) = udf_json.filter(|s| !s.is_empty() && *s != "[]") {
-        for ep in workers {
+        for ep in &endpoints {
             sync_udfs_to_worker(ep.clone(), json).await?;
         }
     }
 
-    let membership = Arc::new(StaticMembership::new(workers.to_vec()));
     let cluster = Cluster::from_membership(membership);
     let mut batches = run_stages(&cluster, &dq.stages).await?;
 

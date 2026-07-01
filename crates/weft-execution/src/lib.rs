@@ -11,6 +11,7 @@ pub mod driver;
 pub mod flight;
 pub mod membership;
 pub mod plan;
+pub mod scheduler;
 pub mod shuffle;
 
 use std::sync::Arc;

@@ -14,8 +14,9 @@ use std::sync::Arc;
 use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
-use crate::flight::{clear_worker_stages, run_stage_on_worker};
+use crate::flight::clear_worker_stages;
 use crate::membership::{ClusterMembership, StaticMembership};
+use crate::scheduler::run_stage_with_retry;
 use crate::shuffle::protocol::StageTicket;
 
 /// Number of hash-shuffle partitions for the next query.
@@ -34,7 +35,7 @@ pub struct Cluster {
     pub workers: Vec<String>,
     /// Hash-shuffle partition count (may exceed worker count).
     pub num_partitions: u32,
-    membership: Arc<dyn ClusterMembership>,
+    pub(crate) membership: Arc<dyn ClusterMembership>,
 }
 
 impl Cluster {
@@ -60,8 +61,9 @@ impl Cluster {
         }
     }
 
-    /// Wrap an existing trait object reference.
+    /// Wrap an existing trait object reference (preserves live membership for DNS refresh).
     pub fn from_membership_ref(membership: &dyn ClusterMembership) -> Self {
+        // Caller should prefer `from_membership(Arc<...>)`; this path clones endpoints once.
         Self::from_membership(Arc::new(StaticMembership::new(membership.endpoints())))
     }
 
@@ -161,23 +163,59 @@ pub async fn run_stages(cluster: &Cluster, stages: &[StageDef]) -> Result<Vec<Re
     for stage in stages.iter().filter(|s| s.stage_id != output.stage_id) {
         let mut futs = Vec::new();
         for (i, endpoint) in cluster.workers.iter().enumerate() {
-            futs.push(run_stage_on_worker(
-                endpoint.clone(),
-                stage_ticket(stage, i as u32, w, cluster, true),
-            ));
+            let ticket = stage_ticket(stage, i as u32, w, cluster, true);
+            let membership = cluster.membership.clone();
+            let ep = endpoint.clone();
+            futs.push(async move { run_stage_with_retry(&membership, ep, ticket).await });
         }
         for r in futures::future::join_all(futs).await {
             r?;
         }
     }
 
-    // Output stage: one invocation per shuffle partition on its rendezvous owner.
+    // Output stage: per-worker scatter (global agg) or per-partition rendezvous shuffle.
+    let scatter_output =
+        output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
-    for p in 0..w {
-        let endpoint = cluster.owner_endpoint(p)?;
-        let part =
-            run_stage_on_worker(endpoint, stage_ticket(output, p, w, cluster, false)).await?;
-        out.extend(part);
+    if scatter_output {
+        let mut futs = Vec::new();
+        for (i, endpoint) in cluster.workers.iter().enumerate() {
+            let ticket = stage_ticket(output, i as u32, w, cluster, false);
+            let membership = cluster.membership.clone();
+            let ep = endpoint.clone();
+            futs.push(async move { run_stage_with_retry(&membership, ep, ticket).await });
+        }
+        for r in futures::future::join_all(futs).await {
+            out.extend(r?);
+        }
+    } else {
+        // Group partitions by rendezvous owner so concurrent tasks on the same worker do not
+        // race on the shared `shuffle_input` registration table.
+        let mut by_endpoint: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for p in 0..w {
+            let endpoint = cluster.owner_endpoint(p)?;
+            by_endpoint.entry(endpoint).or_default().push(p);
+        }
+        let mut ep_futs = Vec::new();
+        for (endpoint, parts) in by_endpoint {
+            let membership = cluster.membership.clone();
+            let output = output.clone();
+            let cluster = cluster.clone();
+            ep_futs.push(async move {
+                let mut local = Vec::new();
+                for p in parts {
+                    let ticket = stage_ticket(&output, p, w, &cluster, false);
+                    local.extend(
+                        run_stage_with_retry(&membership, endpoint.clone(), ticket).await?,
+                    );
+                }
+                Ok::<_, Error>(local)
+            });
+        }
+        for r in futures::future::join_all(ep_futs).await {
+            out.extend(r?);
+        }
     }
 
     // Evict stage caches on all workers after the query completes.

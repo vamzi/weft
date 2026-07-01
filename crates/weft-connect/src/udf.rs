@@ -129,8 +129,12 @@ impl ScalarUDFImpl for PythonUdf {
 }
 
 fn eval_python_udf_scalar(name: &str, command: &[u8]) -> datafusion::common::Result<ScalarValue> {
-    if std::env::var("WEFT_ALLOW_PYTHON_UDF").ok().as_deref() != Some("1") {
-        let _ = (name, command);
+    let allow = std::env::var("WEFT_ALLOW_PYTHON_UDF")
+        .ok()
+        .as_deref()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !allow {
         return Ok(ScalarValue::Int32(Some(1)));
     }
     let dir = std::env::temp_dir().join("weft-pyudf");
@@ -139,7 +143,11 @@ fn eval_python_udf_scalar(name: &str, command: &[u8]) -> datafusion::common::Res
     std::fs::write(&script, command).ok();
     let out = std::process::Command::new("python3")
         .arg("-c")
-        .arg("import pickle,sys; print(pickle.loads(open(sys.argv[1],'rb').read())())")
+        .arg(
+            "import pickle,sys; \
+             udf=pickle.loads(open(sys.argv[1],'rb').read()); \
+             print(udf())",
+        )
         .arg(&script)
         .output();
     match out {

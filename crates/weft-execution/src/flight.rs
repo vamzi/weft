@@ -40,6 +40,8 @@ use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
 /// Flight `do_action` type: register session UDF definitions (JSON payload).
 pub const ACTION_REGISTER_UDFS: &str = "register_udfs";
+/// Flight `do_action` type: liveness probe (driver heartbeats).
+pub const ACTION_HEALTH: &str = "health";
 
 /// One stage's cached output: schema + partitioned buckets (memory or spilled).
 type CachedStage = (SchemaRef, BucketCache);
@@ -269,6 +271,12 @@ impl FlightService for Worker {
                 };
                 Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
             }
+            ACTION_HEALTH => {
+                let body = arrow_flight::Result {
+                    body: b"ok".to_vec().into(),
+                };
+                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+            }
             other => Err(Status::unimplemented(format!(
                 "flight do_action `{other}` not implemented"
             ))),
@@ -370,6 +378,11 @@ pub async fn clear_worker_stages(endpoint: String) -> Result<()> {
 /// Push UDF definitions to a worker before stage execution.
 pub async fn sync_udfs_to_worker(endpoint: String, udf_json: &str) -> Result<()> {
     do_action(endpoint, ACTION_REGISTER_UDFS, udf_json.as_bytes()).await
+}
+
+/// Liveness probe — returns `Ok(())` when the worker responds to `ACTION_HEALTH`.
+pub async fn health_check_worker(endpoint: String) -> Result<()> {
+    do_action(endpoint, ACTION_HEALTH, b"").await
 }
 
 async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<()> {

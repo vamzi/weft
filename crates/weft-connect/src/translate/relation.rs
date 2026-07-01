@@ -8,6 +8,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::unparser::Unparser;
 use tonic::Status;
 use weft_proto::spark::connect as sc;
 
@@ -114,6 +115,9 @@ async fn translate(ctx: &SessionContext, rel: &sc::Relation) -> Result<LogicalPl
             child(ctx, &r.input).await
         }
         RelType::Hint(h) => child(ctx, &h.input).await,
+        RelType::Describe(d) => stat_describe(ctx, d).await,
+        RelType::Summary(s) => stat_summary(ctx, s).await,
+        RelType::Crosstab(c) => stat_crosstab(ctx, c).await,
         other => Err(Status::unimplemented(format!(
             "relation not supported yet: {}",
             rel_name(other)
@@ -839,7 +843,105 @@ async fn na_replace(ctx: &SessionContext, r: &sc::NaReplace) -> Result<LogicalPl
 }
 
 fn build(b: datafusion::error::Result<LogicalPlanBuilder>) -> Result<LogicalPlan, Status> {
-    b.and_then(|b| b.build()).map_err(plan_err)
+    b.map_err(plan_err)?.build().map_err(plan_err)
+}
+
+/// `df.describe()` — per-column count/min/max/mean/stddev for numeric columns.
+async fn stat_describe(ctx: &SessionContext, d: &sc::StatDescribe) -> Result<LogicalPlan, Status> {
+    let input = child(ctx, &d.input).await?;
+    let schema = input.schema();
+    let cols: Vec<String> = if d.cols.is_empty() {
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    } else {
+        d.cols.clone()
+    };
+    if cols.is_empty() {
+        return Err(inval("StatDescribe: no columns"));
+    }
+    let sub = Unparser::default()
+        .plan_to_sql(&input)
+        .map_err(|e| inval(format!("describe unparse: {e}")))?
+        .to_string();
+    let mut parts = Vec::new();
+    for summary in ["count", "mean", "stddev", "min", "max"] {
+        let mut sel = vec![format!("'{summary}' AS summary")];
+        for c in &cols {
+            let field = schema
+                .fields()
+                .iter()
+                .find(|f| f.name() == c)
+                .ok_or_else(|| inval(format!("describe: unknown column `{c}`")))?;
+            let expr = match (summary, field.data_type()) {
+                ("count", _) => format!("count(`{c}`)"),
+                ("mean", dt) if is_numeric(dt) => format!("avg(CAST(`{c}` AS DOUBLE))"),
+                ("stddev", dt) if is_numeric(dt) => {
+                    format!("stddev(CAST(`{c}` AS DOUBLE))")
+                }
+                ("min", _) => format!("min(`{c}`)"),
+                ("max", _) => format!("max(`{c}`)"),
+                _ => "NULL".to_string(),
+            };
+            sel.push(format!("{expr} AS `{c}`"));
+        }
+        parts.push(format!("SELECT {} FROM ({sub}) AS _t", sel.join(", ")));
+    }
+    let sql = parts.join(" UNION ALL ");
+    ctx.sql(&sql)
+        .await
+        .map_err(plan_err)?
+        .into_unoptimized_plan()
+        .pipe(Ok)
+}
+
+/// `df.summary()` — extended statistics (subset of Spark's summary).
+async fn stat_summary(ctx: &SessionContext, s: &sc::StatSummary) -> Result<LogicalPlan, Status> {
+    let d = sc::StatDescribe {
+        input: s.input.clone(),
+        cols: s.statistics.clone(),
+    };
+    stat_describe(ctx, &d).await
+}
+
+/// `df.stat.crosstab(col1, col2)` — pivot count of col2 values per col1.
+async fn stat_crosstab(ctx: &SessionContext, c: &sc::StatCrosstab) -> Result<LogicalPlan, Status> {
+    let input = child(ctx, &c.input).await?;
+    let sub = Unparser::default()
+        .plan_to_sql(&input)
+        .map_err(|e| inval(format!("crosstab unparse: {e}")))?
+        .to_string();
+    let sql = format!(
+        "SELECT `{c1}`, `{c2}`, count(*) AS n FROM ({sub}) AS _t GROUP BY `{c1}`, `{c2}`",
+        c1 = c.col1,
+        c2 = c.col2
+    );
+    ctx.sql(&sql)
+        .await
+        .map_err(plan_err)?
+        .into_unoptimized_plan()
+        .pipe(Ok)
+}
+
+fn is_numeric(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+    )
 }
 
 fn plan_err(e: datafusion::error::DataFusionError) -> Status {

@@ -15,6 +15,8 @@
 //!
 //! [`Role::Driver`]: crate::Role
 
+use std::sync::Arc;
+
 #[cfg(feature = "k8s")]
 pub mod k8s;
 
@@ -76,6 +78,18 @@ impl ClusterMembership for StaticMembership {
     fn endpoints(&self) -> Vec<WorkerEndpoint> {
         self.endpoints.clone()
     }
+}
+
+/// Resolve cluster membership for distributed execution.
+///
+/// Priority: `WEFT_WORKER_SERVICE` (K8s headless Service DNS, `k8s` feature) → static
+/// `WEFT_WORKERS` / config list.
+pub fn resolve_membership(static_workers: &[WorkerEndpoint]) -> Arc<dyn ClusterMembership> {
+    #[cfg(feature = "k8s")]
+    if let Some(k8s) = k8s::K8sMembership::from_env() {
+        return Arc::new(k8s);
+    }
+    Arc::new(StaticMembership::new(static_workers.to_vec()))
 }
 
 #[cfg(test)]

@@ -66,7 +66,11 @@ pub async fn plan_distributed(
 ) -> Result<DistributedQuery> {
     let lp = engine.logical_plan(sql).await?;
     let peeled = peel(&lp)?;
-    aggregation_stages(&peeled, replicated)
+    if peeled.agg.group_expr.is_empty() {
+        global_aggregation_stages(&peeled, replicated)
+    } else {
+        aggregation_stages(&peeled, replicated)
+    }
 }
 
 /// The top of the plan above the aggregate: the output projection (if any) plus the trailing
@@ -127,11 +131,6 @@ fn peel(lp: &LogicalPlan) -> Result<Peeled<'_>> {
 /// Build the two-stage partial→final plan for a grouped aggregation.
 fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuery> {
     let agg = p.agg;
-    if agg.group_expr.is_empty() {
-        return Err(Error::Unsupported(
-            "auto-distribute: ungrouped/global aggregation not yet supported".into(),
-        ));
-    }
     // Broadcast-join safety: the partial stage runs the join locally per worker, so exactly one base
     // table may be sharded; every other must be replicated in full on every worker. (Zero sharded
     // tables would duplicate the fully-replicated result across workers; two+ need a shuffle join.)
@@ -217,6 +216,103 @@ fn aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuer
             },
         ],
         finalize_sql: build_finalize(p)?,
+    })
+}
+
+/// Global (ungrouped) aggregation: partial per worker, gather on driver, finalize combines.
+fn global_aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<DistributedQuery> {
+    let agg = p.agg;
+    let tables = base_tables(&agg.input);
+    let sharded: Vec<&String> = tables
+        .iter()
+        .filter(|t| !replicated.contains(&t.as_str()))
+        .collect();
+    if sharded.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "auto-distribute: global agg needs exactly one sharded base table, \
+             found {} sharded among {tables:?}",
+            sharded.len()
+        )));
+    }
+    let input_sql = Unparser::default()
+        .plan_to_sql(&agg.input)
+        .map_err(|e| Error::Unsupported(format!("auto-distribute: unparse input: {e}")))?
+        .to_string();
+    let tail = input_sql
+        .strip_prefix("SELECT * ")
+        .ok_or_else(|| Error::Unsupported("auto-distribute: non-trivial aggregate input".into()))?;
+    let tail = sanitize_generated_sql(tail);
+
+    let aggs = agg
+        .aggr_expr
+        .iter()
+        .map(AggSpec::classify)
+        .collect::<Result<Vec<_>>>()?;
+    if aggs.iter().any(|a| a.distinct) {
+        return Err(Error::Unsupported(
+            "auto-distribute: global COUNT(DISTINCT) not supported".into(),
+        ));
+    }
+
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for (i, a) in agg.aggr_expr.iter().enumerate() {
+        remap.insert(a.schema_name().to_string(), format!("r{i}"));
+    }
+
+    let mut psel: Vec<String> = Vec::new();
+    let mut combine: Vec<String> = Vec::new();
+    for (i, a) in aggs.iter().enumerate() {
+        match a.func.as_str() {
+            "sum" => {
+                psel.push(format!("sum({}) AS a{i}", a.arg_sql));
+                combine.push(format!("sum(a{i}) AS r{i}"));
+            }
+            "count" => {
+                psel.push(format!("count({}) AS a{i}", a.arg_sql));
+                combine.push(format!("sum(a{i}) AS r{i}"));
+            }
+            "min" => {
+                psel.push(format!("min({}) AS a{i}", a.arg_sql));
+                combine.push(format!("min(a{i}) AS r{i}"));
+            }
+            "max" => {
+                psel.push(format!("max({}) AS a{i}", a.arg_sql));
+                combine.push(format!("max(a{i}) AS r{i}"));
+            }
+            "avg" => {
+                psel.push(format!(
+                    "sum({}) AS a{i}s, count({}) AS a{i}c",
+                    a.arg_sql, a.arg_sql
+                ));
+                combine.push(format!(
+                    "(CAST(sum(a{i}s) AS DOUBLE) / NULLIF(sum(a{i}c), 0)) AS r{i}"
+                ));
+            }
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "auto-distribute: global aggregate `{other}` not supported"
+                )))
+            }
+        }
+    }
+
+    let partial_sql = sanitize_generated_sql(&format!("SELECT {} {tail}", psel.join(", ")));
+    let inner = format!("SELECT {} FROM result", combine.join(", "));
+    let mut finalize = wrap_output(p, &inner, &remap)?;
+    if let Some(fin) = build_finalize(p)? {
+        if let Some(rest) = fin.strip_prefix("SELECT * FROM result") {
+            finalize = format!("SELECT * FROM ({finalize}) AS combined{rest}");
+        }
+    }
+
+    Ok(DistributedQuery {
+        stages: vec![StageDef {
+            stage_id: 0,
+            sql: partial_sql,
+            upstream_stage_ids: vec![],
+            hash_key_cols: vec![],
+        }],
+        finalize_sql: Some(finalize),
     })
 }
 

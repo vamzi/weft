@@ -27,6 +27,73 @@ pub fn scan(_uri: &str, _req: &ScanRequest) -> Result<()> {
     Ok(())
 }
 
+/// Write Arrow record batches to a Parquet file (create or overwrite).
+pub fn write_parquet(path: &str, batches: &[arrow::record_batch::RecordBatch]) -> Result<()> {
+    use std::fs::File;
+    use std::sync::Arc;
+    use arrow::datatypes::Schema;
+    use parquet::arrow::ArrowWriter;
+
+    if batches.is_empty() {
+        let schema = Arc::new(Schema::empty());
+        let file = File::create(path).map_err(|e| Error::Io(format!("create {path}: {e}")))?;
+        let writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| Error::Io(format!("parquet writer: {e}")))?;
+        writer
+            .close()
+            .map_err(|e| Error::Io(format!("parquet close: {e}")))?;
+        return Ok(());
+    }
+    let file = File::create(path).map_err(|e| Error::Io(format!("create {path}: {e}")))?;
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None)
+        .map_err(|e| Error::Io(format!("parquet writer: {e}")))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| Error::Io(format!("parquet write: {e}")))?;
+    }
+    writer
+        .close()
+        .map_err(|e| Error::Io(format!("parquet close: {e}")))?;
+    Ok(())
+}
+
+/// Append a new Parquet data file to a Delta table by writing a JSON add action to `_delta_log`.
+pub fn delta_append(
+    table_path: &str,
+    relative_path: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Result<()> {
+    use std::path::Path;
+
+    let base = Path::new(table_path);
+    let data_path = base.join(relative_path);
+    if let Some(parent) = data_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Io(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    write_parquet(data_path.to_str().unwrap(), batches)?;
+
+    let log_dir = base.join("_delta_log");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| Error::Io(format!("mkdir {}: {e}", log_dir.display())))?;
+    let version = std::fs::read_dir(&log_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    let commit = log_dir.join(format!("{version:020}.json"));
+    let action = serde_json::json!({
+        "add": {
+            "path": relative_path.replace('\\', "/"),
+            "size": std::fs::metadata(base.join(relative_path)).map(|m| m.len()).unwrap_or(0),
+            "modificationTime": chrono::Utc::now().timestamp_millis(),
+            "dataChange": true
+        }
+    });
+    std::fs::write(&commit, format!("{action}\n"))
+        .map_err(|e| Error::Io(format!("write {}: {e}", commit.display())))?;
+    Ok(())
+}
+
 /// Resolve a Delta Lake table to its active data-file paths by replaying the JSON transaction
 /// log (`_delta_log/*.json`): `add` actions introduce files, `remove` actions retire them.
 ///
@@ -277,5 +344,23 @@ mod tests {
         let files = iceberg_active_files(dir.to_str().unwrap()).unwrap();
         assert_eq!(files, vec![data]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_parquet_roundtrip() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+                .unwrap();
+        write_parquet(path.to_str().unwrap(), &[batch]).unwrap();
+        assert!(path.exists());
     }
 }

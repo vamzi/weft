@@ -806,12 +806,18 @@ impl SparkConnectService for WeftService {
 
     async fn reattach_execute(
         &self,
-        _request: Request<sc::ReattachExecuteRequest>,
+        request: Request<sc::ReattachExecuteRequest>,
     ) -> std::result::Result<Response<Self::ReattachExecuteStream>, Status> {
-        // Phase 0 buffers nothing; a reattach just reports completion.
-        Err(Status::unimplemented(
-            "ReattachExecute buffer not implemented in Phase 0",
-        ))
+        let req = request.into_inner();
+        let complete = self.response(
+            &req.session_id,
+            &req.operation_id,
+            sc::execute_plan_response::ResponseType::ResultComplete(
+                sc::execute_plan_response::ResultComplete {},
+            ),
+        );
+        let stream = tokio_stream::iter(vec![Ok(complete)]);
+        Ok(Response::new(Box::pin(stream) as Self::ReattachExecuteStream))
     }
 
     async fn release_execute(

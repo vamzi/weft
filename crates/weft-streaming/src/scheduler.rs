@@ -8,9 +8,10 @@ use tokio::sync::RwLock;
 use weft_loom::Engine;
 
 use crate::checkpoint::{CheckpointState, CheckpointStore};
+use crate::config::StreamQueryConfig;
 use crate::query::{QueryProgress, QueryStatus, StreamingQuery, StreamingQueryId};
-use crate::sink::{MemorySink, Sink};
-use crate::source::{MemoryRateSource, Source};
+use crate::sink::{FileSink, MemorySink, Sink};
+use crate::source::{FileSource, KafkaSource, MemoryRateSource, Source};
 
 /// Trigger mode for micro-batch execution.
 #[derive(Debug, Clone)]
@@ -51,14 +52,28 @@ impl StreamingQueryManager {
         checkpoint_location: String,
         trigger: Trigger,
     ) -> StreamingQueryId {
+        self.start_with_config(name, checkpoint_location, trigger, StreamQueryConfig::default())
+            .await
+    }
+
+    /// Start a streaming query with explicit source/sink configuration from Spark Connect.
+    pub async fn start_with_config(
+        &self,
+        name: String,
+        checkpoint_location: String,
+        trigger: Trigger,
+        config: StreamQueryConfig,
+    ) -> StreamingQueryId {
         let q = StreamingQuery::new(name.clone(), checkpoint_location.clone());
         let id = q.query_id.clone();
         let checkpoint = CheckpointStore::new(&checkpoint_location);
         let _ = checkpoint.init_for_query(&id);
+        let source: Box<dyn Source> = build_source(&config);
+        let sink: Box<dyn Sink> = build_sink(&config);
         let managed = ManagedQuery {
             query: q,
-            source: Box::new(MemoryRateSource::new(10, 1)),
-            sink: Box::new(MemorySink::new()),
+            source,
+            sink,
             checkpoint,
             trigger,
         };
@@ -154,6 +169,47 @@ impl StreamingQueryManager {
 impl Default for StreamingQueryManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn build_source(config: &StreamQueryConfig) -> Box<dyn Source> {
+    match config.source_format.to_ascii_lowercase().as_str() {
+        "parquet" | "json" | "csv" => {
+            let path = config
+                .source_options
+                .get("path")
+                .cloned()
+                .or_else(|| config.sink_path.clone())
+                .unwrap_or_else(|| "/tmp/weft-stream-in".into());
+            Box::new(FileSource::new(path, &config.source_format))
+        }
+        "kafka" => Box::new(KafkaSource::from_options(&config.source_options)),
+        "rate" => {
+            let rows = config
+                .source_options
+                .get("rowsPerSecond")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            Box::new(MemoryRateSource::new(rows, u64::MAX))
+        }
+        _ => Box::new(MemoryRateSource::new(10, 1)),
+    }
+}
+
+fn build_sink(config: &StreamQueryConfig) -> Box<dyn Sink> {
+    if let Some(path) = &config.sink_path {
+        return Box::new(FileSink::new(path, &config.sink_format));
+    }
+    match config.sink_format.to_ascii_lowercase().as_str() {
+        "parquet" | "json" | "csv" => {
+            let path = config
+                .source_options
+                .get("checkpointLocation")
+                .map(|c| format!("{c}/output"))
+                .unwrap_or_else(|| "/tmp/weft-stream-out".into());
+            Box::new(FileSink::new(path, &config.sink_format))
+        }
+        _ => Box::new(MemorySink::new()),
     }
 }
 

@@ -4,13 +4,15 @@
 //! triggers, checkpoint metadata, and query lifecycle management.
 
 mod checkpoint;
+mod config;
 mod query;
 mod scheduler;
 mod sink;
 mod source;
 
 pub use checkpoint::CheckpointStore;
+pub use config::StreamQueryConfig;
 pub use query::{QueryProgress, QueryStatus, StreamingQuery, StreamingQueryId};
 pub use scheduler::{StreamingQueryManager, Trigger};
 pub use sink::{FileSink, MemorySink, Sink};
-pub use source::{FileSource, MemoryRateSource, Source};
+pub use source::{FileSource, KafkaSource, MemoryRateSource, Source};

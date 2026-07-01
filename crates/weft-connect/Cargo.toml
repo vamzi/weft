@@ -15,10 +15,11 @@ weft-sql = { workspace = true }
 weft-analyzer = { workspace = true }
 weft-optimizer = { workspace = true }
 weft-physical = { workspace = true }
-weft-execution = { workspace = true }
+weft-execution = { workspace = true, features = ["k8s"] }
 weft-catalog = { workspace = true }
 weft-catalog-hive = { workspace = true }
 weft-catalog-glue = { workspace = true }
+weft-catalog-rest = { workspace = true }
 weft-loom = { workspace = true }
 weft-streaming = { workspace = true }
 datafusion = "54"  # lower Spark Connect relations/expressions to DataFusion logical plans
