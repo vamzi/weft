@@ -27,12 +27,6 @@ impl ArtifactStore {
         self.files.insert(path, data);
     }
 
-    pub fn append_last(&mut self, data: &[u8]) {
-        if let Some((_, buf)) = self.files.iter_mut().last() {
-            buf.extend_from_slice(data);
-        }
-    }
-
     #[allow(dead_code)]
     pub fn get(&self, path: &str) -> Option<&[u8]> {
         self.files.get(path).map(|v| v.as_slice())

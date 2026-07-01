@@ -842,7 +842,6 @@ impl SparkConnectService for WeftService {
                     sc::add_artifacts_response::ArtifactSummary {
                         name: name.clone(),
                         is_crc_successful: true,
-                        ..Default::default()
                     }
                 })
                 .collect()
@@ -884,10 +883,7 @@ impl SparkConnectService for WeftService {
                 let exists = arts.get(&name).is_some();
                 (
                     name,
-                    sc::artifact_statuses_response::ArtifactStatus {
-                        exists,
-                        ..Default::default()
-                    },
+                    sc::artifact_statuses_response::ArtifactStatus { exists },
                 )
             })
             .collect();
