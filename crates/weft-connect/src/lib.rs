@@ -558,10 +558,35 @@ impl SparkConnectService for WeftService {
                     )]
                 }
                 Some(sc::command::CommandType::RegisterFunction(rf)) => {
+                    // Register in DataFusion's UDF registry so SQL cells can call the UDF.
                     {
                         let registry = self.engine.udf_registry();
                         let mut reg = registry.lock().unwrap();
                         udf::register_connect_udf(self.engine.ctx(), &mut reg, rf)?;
+                    }
+                    // Also store bytes + forward to pyworker so Python cells can invoke it.
+                    if let Some(sc::common_inline_user_defined_function::Function::PythonUdf(
+                        py_udf,
+                    )) = rf.function.as_ref()
+                    {
+                        {
+                            let mut arts = self.artifacts.lock().expect("artifacts poisoned");
+                            arts.insert(
+                                format!("__udf__{}", rf.function_name),
+                                py_udf.command.clone(),
+                            );
+                        }
+                        if let Ok(base) = std::env::var("WEFT_PYWORKER_URL") {
+                            let client = reqwest::Client::new();
+                            let _ = client
+                                .post(format!("{base}/udfs"))
+                                .header("X-Udf-Name", rf.function_name.as_str())
+                                .header("X-Session-Id", session_id.as_str())
+                                .header("X-Eval-Type", py_udf.eval_type.to_string())
+                                .body(py_udf.command.clone())
+                                .send()
+                                .await;
+                        }
                     }
                     vec![self.response(
                         &session_id,
@@ -762,47 +787,114 @@ impl SparkConnectService for WeftService {
         &self,
         request: Request<tonic::Streaming<sc::AddArtifactsRequest>>,
     ) -> std::result::Result<Response<sc::AddArtifactsResponse>, Status> {
-        let mut stream = request.into_inner();
-        let mut pending: Vec<sc::AddArtifactsRequest> = Vec::new();
-        while let Some(msg) = stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(e.message()))?
-        {
-            pending.push(msg);
-        }
-        let mut store = self.artifacts.lock().expect("artifacts poisoned");
         use sc::add_artifacts_request::Payload;
-        for msg in pending {
-            match msg.payload {
+
+        let mut stream = request.into_inner();
+        let mut collected: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        let mut pending: Option<(String, Vec<u8>, i64)> = None;
+        let mut spark_session_id = String::new();
+
+        while let Some(req) = stream.message().await? {
+            if spark_session_id.is_empty() && !req.session_id.is_empty() {
+                spark_session_id = req.session_id.clone();
+            }
+            match req.payload {
                 Some(Payload::Batch(batch)) => {
-                    for art in batch.artifacts {
-                        if let Some(chunk) = art.data {
-                            store.insert(art.name, chunk.data.to_vec());
-                        }
+                    for artifact in batch.artifacts {
+                        let data = artifact.data.map(|c| c.data).unwrap_or_default();
+                        collected.insert(artifact.name, data);
                     }
                 }
                 Some(Payload::BeginChunk(begin)) => {
-                    let data = begin
-                        .initial_chunk
-                        .map(|c| c.data.to_vec())
-                        .unwrap_or_default();
-                    store.insert(begin.name.clone(), data);
+                    let initial = begin.initial_chunk.map(|c| c.data).unwrap_or_default();
+                    // num_chunks=0 is malformed; treat it as 1 chunk already in initial_chunk.
+                    let remaining = (begin.num_chunks - 1).max(0);
+                    pending = Some((begin.name, initial, remaining));
                 }
                 Some(Payload::Chunk(chunk)) => {
-                    store.append_last(&chunk.data);
+                    let done = if let Some((_, ref mut buf, ref mut remaining)) = pending {
+                        buf.extend_from_slice(&chunk.data);
+                        *remaining -= 1;
+                        *remaining <= 0
+                    } else {
+                        false
+                    };
+                    if done {
+                        let (name, buf, _) = pending.take().unwrap();
+                        collected.insert(name, buf);
+                    }
                 }
                 None => {}
             }
         }
-        Ok(Response::new(sc::AddArtifactsResponse::default()))
+        // Flush any still-pending partial upload (shouldn't happen with a well-formed client).
+        if let Some((name, buf, _)) = pending.take() {
+            collected.insert(name, buf);
+        }
+
+        let summaries: Vec<sc::add_artifacts_response::ArtifactSummary> = {
+            let mut store = self.artifacts.lock().expect("artifacts poisoned");
+            collected
+                .iter()
+                .map(|(name, bytes)| {
+                    store.insert(name.clone(), bytes.clone());
+                    sc::add_artifacts_response::ArtifactSummary {
+                        name: name.clone(),
+                        is_crc_successful: true,
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        };
+
+        if let Ok(base) = std::env::var("WEFT_PYWORKER_URL") {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_default();
+            for (name, bytes) in &collected {
+                let _ = client
+                    .post(format!("{base}/artifacts"))
+                    .header("X-Artifact-Name", name.as_str())
+                    .header("X-Session-Id", spark_session_id.as_str())
+                    .body(bytes.clone())
+                    .send()
+                    .await;
+            }
+        }
+
+        Ok(Response::new(sc::AddArtifactsResponse {
+            server_side_session_id: self.server_session_id.clone(),
+            artifacts: summaries,
+            ..Default::default()
+        }))
     }
 
     async fn artifact_status(
         &self,
-        _request: Request<sc::ArtifactStatusesRequest>,
+        request: Request<sc::ArtifactStatusesRequest>,
     ) -> std::result::Result<Response<sc::ArtifactStatusesResponse>, Status> {
-        Ok(Response::new(sc::ArtifactStatusesResponse::default()))
+        let req = request.into_inner();
+        let arts = self.artifacts.lock().expect("artifacts poisoned");
+        let statuses = req
+            .names
+            .into_iter()
+            .map(|name| {
+                let exists = arts.get(&name).is_some();
+                (
+                    name,
+                    sc::artifact_statuses_response::ArtifactStatus {
+                        exists,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        Ok(Response::new(sc::ArtifactStatusesResponse {
+            statuses,
+            ..Default::default()
+        }))
     }
 
     async fn interrupt(
