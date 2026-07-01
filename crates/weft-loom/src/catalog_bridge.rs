@@ -18,9 +18,11 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::common::{DataFusionError, Result as DfResult};
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::context::SessionState;
 use datafusion::prelude::SessionContext;
 use weft_catalog::{CatalogProvider as WeftCatalog, TableFormat, TableMetadata};
@@ -152,6 +154,165 @@ impl SchemaProvider for WeftSchemaProvider {
             .expect("tables poisoned")
             .contains_key(name)
     }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let catalog = self.catalog.clone();
+        let namespace = self.namespace.clone();
+        let ctx = self.ctx.clone();
+        let name_for_worker = name.clone();
+
+        // `register_table` is a sync fn (DataFusion's trait), but the write path is all async
+        // (Glue CLI / Hive Thrift / object-store puts). `Handle::current().block_on(...)` would
+        // panic under a single-thread runtime (e.g. plain `#[tokio::test]`, used throughout this
+        // file's own tests) — so this dispatches to a single persistent background worker thread
+        // (see `ctas_writer`) instead of spawning a fresh OS thread + runtime per call, which is
+        // safe under any caller runtime flavor but also bounds CTAS write concurrency to one at a
+        // time process-wide (a deliberately rare, non-hot-path DDL operation).
+        let provider = ctas_writer().run(move |rt| {
+            rt.block_on(register_table_async(
+                catalog,
+                ctx,
+                namespace,
+                name_for_worker,
+                table,
+            ))
+        })??;
+
+        self.tables
+            .lock()
+            .expect("tables poisoned")
+            .insert(name, provider.clone());
+        Ok(Some(provider))
+    }
+}
+
+/// A single persistent background thread (created lazily, once, for the process lifetime) with
+/// its own `current_thread` Tokio runtime, used to run CTAS write futures from `register_table`'s
+/// sync entry point without spawning a new OS thread + runtime on every call.
+type CtasJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send>;
+
+struct CtasWriter {
+    jobs: std::sync::mpsc::Sender<CtasJob>,
+}
+
+impl CtasWriter {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<CtasJob>();
+        std::thread::Builder::new()
+            .name("weft-ctas-writer".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build CTAS writer runtime");
+                for job in rx {
+                    // A panicking job must not take this thread down with it — every other
+                    // catalog/session shares this single process-wide writer, so one bad CTAS
+                    // (e.g. an internal panic in a dependency) would otherwise permanently break
+                    // CTAS writes for everyone until the process restarts. `run`'s caller already
+                    // gets a clean "CTAS writer thread died" error for THIS call (the boxed job's
+                    // `result_tx` is dropped mid-unwind, closing its channel), so the only extra
+                    // work needed here is keeping the loop itself alive for the NEXT job.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&rt)));
+                }
+            })
+            .expect("spawn CTAS writer thread");
+        Self { jobs: tx }
+    }
+
+    /// Run `f` (which calls `rt.block_on(...)` itself) on the writer thread and block the caller
+    /// until it completes, returning its result.
+    fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&tokio::runtime::Runtime) -> T + Send + 'static,
+    ) -> DfResult<T> {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        self.jobs
+            .send(Box::new(move |rt| {
+                let _ = result_tx.send(f(rt));
+            }))
+            .map_err(|_| {
+                DataFusionError::Execution("CTAS writer thread unavailable".to_string())
+            })?;
+        result_rx
+            .recv()
+            .map_err(|_| DataFusionError::Execution("CTAS writer thread died".to_string()))
+    }
+}
+
+fn ctas_writer() -> &'static CtasWriter {
+    static WRITER: std::sync::OnceLock<CtasWriter> = std::sync::OnceLock::new();
+    WRITER.get_or_init(CtasWriter::new)
+}
+
+/// The async body of `WeftSchemaProvider::register_table`: extract the CTAS result's schema and
+/// data from `table` (always a `MemTable` — what DataFusion's native `CREATE TABLE ... AS SELECT`
+/// produces), ask the catalog to declare the table (`CatalogProvider::create_table`), physically
+/// write the data to the resolved location, then build a REAL `TableProvider` over those durable
+/// files (not the transient `MemTable`) so a subsequent `SELECT` — same session or a new one —
+/// reads genuine external-catalog data.
+async fn register_table_async(
+    catalog: Arc<dyn WeftCatalog>,
+    ctx: Arc<SessionContext>,
+    namespace: Vec<String>,
+    name: String,
+    table: Arc<dyn TableProvider>,
+) -> DfResult<Arc<dyn TableProvider>> {
+    let (schema, batches) = extract_mem_table_data(&table).await?;
+
+    let metadata = catalog
+        .create_table(
+            &namespace,
+            &name,
+            schema.clone(),
+            TableFormat::Parquet,
+            None,
+            &[],
+        )
+        .await
+        .map_err(weft_to_df)?;
+
+    let state = ctx.state();
+    write_batches_to_location(
+        &state,
+        &metadata.location,
+        metadata.format,
+        &schema,
+        batches,
+    )
+    .await?;
+
+    metadata_to_provider(&state, &metadata).await
+}
+
+/// Extract `(schema, batches)` from a `TableProvider` that's always a `MemTable` on this path
+/// (DataFusion's `CreateMemoryTable` DDL handling always wraps the CTAS `SELECT`'s output that
+/// way before calling `register_table`). Falls back to a full `scan` + `collect` if that ever
+/// changes, so this doesn't silently break on a DataFusion upgrade.
+async fn extract_mem_table_data(
+    table: &Arc<dyn TableProvider>,
+) -> DfResult<(SchemaRef, Vec<RecordBatch>)> {
+    // `TableProvider: Any` (a supertrait), so a `&dyn TableProvider` upcasts to `&dyn Any` for
+    // downcasting — this DataFusion version doesn't expose a dedicated `as_any()` method.
+    let any: &dyn std::any::Any = table.as_ref();
+    if let Some(mem) = any.downcast_ref::<MemTable>() {
+        let schema = mem.schema();
+        let mut batches = Vec::new();
+        for partition in &mem.batches {
+            batches.extend(partition.read().await.iter().cloned());
+        }
+        return Ok((schema, batches));
+    }
+    // Defensive fallback: scan the provider directly.
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let plan = table.scan(&state, None, &[], None).await?;
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((table.schema(), batches))
 }
 
 /// Turn resolved table metadata into a readable DataFusion `TableProvider`.
@@ -247,6 +408,99 @@ fn ensure_remote_store(
         }
         Err(e) => eprintln!("warn: could not register S3 object store for `{bucket}`: {e}"),
     }
+}
+
+/// Write `batches` as a single file at `location` in `format` (Parquet/Csv/Json — the only CTAS
+/// write targets; any other format is a bug upstream since `hive_types::format_serde` already
+/// rejects Delta/Iceberg before a catalog's `create_table` is ever called). Serializes in memory
+/// then `put`s through the session's `object_store` for `location`'s scheme, so this works for
+/// `s3://` (registered via [`ensure_remote_store`]) exactly like `file://`/bare local paths
+/// (DataFusion's default object-store registry resolves those to `LocalFileSystem` with no
+/// explicit registration needed) — unlike the local-only `ArrowWriter`-to-`std::fs::File` CTAS
+/// writer used by the (unrelated) local-warehouse `CREATE TABLE ... USING <fmt>` path.
+async fn write_batches_to_location(
+    state: &SessionState,
+    location: &str,
+    format: TableFormat,
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> DfResult<()> {
+    use datafusion::datasource::listing::ListingTableUrl;
+    use object_store::ObjectStoreExt;
+
+    let url = ListingTableUrl::parse(location)
+        .map_err(|e| DataFusionError::Plan(format!("bad table location `{location}`: {e}")))?;
+    ensure_remote_store(state, &url);
+    let store = state.runtime_env().object_store(&url)?;
+
+    let ext = match format {
+        TableFormat::Parquet => "parquet",
+        TableFormat::Csv => "csv",
+        TableFormat::Json => "json",
+        TableFormat::Delta | TableFormat::Iceberg => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{format:?} is not a supported CTAS write target"
+            )));
+        }
+    };
+    let bytes = encode_batches(format, schema, &batches)?;
+    let path = url.prefix().clone().join(format!("part-00000.{ext}"));
+    store
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("write `{location}`: {e}")))?;
+    Ok(())
+}
+
+/// Serialize `batches` into an in-memory buffer in `format` (Parquet/Csv/Json).
+fn encode_batches(
+    format: TableFormat,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> DfResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    match format {
+        TableFormat::Parquet => {
+            let mut writer =
+                datafusion::parquet::arrow::ArrowWriter::try_new(&mut buf, schema.clone(), None)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("build parquet writer: {e}"))
+                    })?;
+            for b in batches {
+                writer
+                    .write(b)
+                    .map_err(|e| DataFusionError::Execution(format!("write parquet batch: {e}")))?;
+            }
+            writer
+                .close()
+                .map_err(|e| DataFusionError::Execution(format!("close parquet writer: {e}")))?;
+        }
+        TableFormat::Csv => {
+            let mut writer = datafusion::arrow::csv::Writer::new(&mut buf);
+            for b in batches {
+                writer
+                    .write(b)
+                    .map_err(|e| DataFusionError::Execution(format!("write csv batch: {e}")))?;
+            }
+        }
+        TableFormat::Json => {
+            let mut writer = datafusion::arrow::json::LineDelimitedWriter::new(&mut buf);
+            for b in batches {
+                writer
+                    .write(b)
+                    .map_err(|e| DataFusionError::Execution(format!("write json batch: {e}")))?;
+            }
+            writer
+                .finish()
+                .map_err(|e| DataFusionError::Execution(format!("finish json writer: {e}")))?;
+        }
+        TableFormat::Delta | TableFormat::Iceberg => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{format:?} is not a supported CTAS write target"
+            )));
+        }
+    }
+    Ok(buf)
 }
 
 /// Build a Parquet listing table over an explicit set of files (the Delta/Iceberg seam).
@@ -394,6 +648,103 @@ mod tests {
             .value(0);
         assert_eq!((c, s), (4, 10));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake EXTERNAL catalog whose `create_table` writes to a local temp dir (no real Glue/Hive
+    /// — exercises the `register_table` write path end to end: downcast the `MemTable` → declare
+    /// the table → write real Parquet files → build a durable `ListingTable` provider).
+    struct WritableFakeCatalog {
+        dir: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl WeftCatalog for WritableFakeCatalog {
+        fn name(&self) -> &str {
+            "fakewrite"
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+            Ok(vec![vec!["ns".to_string()]])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+            // Real Glue/Hive would already know about a table `create_table` just declared; this
+            // fake mimics that by checking whether `create_table`'s write path actually landed
+            // files under the same location convention it used.
+            let db = ns.first().cloned().unwrap_or_default();
+            let dir = self.dir.join(&db).join(table);
+            if dir.is_dir() {
+                Ok(TableMetadata::new(
+                    format!("fakewrite.{db}.{table}"),
+                    format!("file://{}/", dir.to_string_lossy()),
+                    TableFormat::Parquet,
+                ))
+            } else {
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
+            }
+        }
+        async fn create_table(
+            &self,
+            namespace: &[String],
+            table: &str,
+            schema: SchemaRef,
+            format: TableFormat,
+            location: Option<String>,
+            partition_columns: &[String],
+        ) -> CatResult<TableMetadata> {
+            let db = namespace.first().cloned().unwrap_or_default();
+            let location = location
+                .unwrap_or_else(|| format!("file://{}/{db}/{table}/", self.dir.to_string_lossy()));
+            Ok(
+                TableMetadata::new(format!("fakewrite.{db}.{table}"), location, format)
+                    .with_schema(schema)
+                    .with_partition_columns(partition_columns.to_vec()),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn ctas_against_external_catalog_writes_durable_data() {
+        let base = std::env::temp_dir().join(format!("weft-cat-write-{}", std::process::id()));
+
+        {
+            let engine = crate::Engine::new();
+            engine.register_catalog(
+                "fakewrite",
+                Arc::new(WritableFakeCatalog { dir: base.clone() }),
+            );
+            // No `USING <fmt>` clause — falls straight through to DataFusion's native
+            // `CreateMemoryTable` DDL handling, which is exactly the path that used to fail with
+            // "schema provider does not support registering tables" for an external catalog.
+            engine
+                .sql("CREATE TABLE fakewrite.ns.newtable AS SELECT 1 AS x UNION ALL SELECT 2 AS x")
+                .await
+                .unwrap();
+        } // `engine` (and its in-memory MemTable) dropped here.
+
+        // A brand-new Engine/session proves the data is durable on disk, not just cached in the
+        // first Engine's transient MemTable.
+        let engine2 = crate::Engine::new();
+        engine2.register_catalog(
+            "fakewrite",
+            Arc::new(WritableFakeCatalog { dir: base.clone() }),
+        );
+        let batches = engine2
+            .sql("SELECT SUM(x) AS s FROM fakewrite.ns.newtable")
+            .await
+            .unwrap();
+        let s = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(s, 3);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

@@ -160,6 +160,38 @@ pub trait CatalogProvider: Send + Sync {
             .iter()
             .any(|ns| ns.last() == Some(last)))
     }
+
+    /// Create a new table in `namespace` backed by `schema`/`format`, physically stored at
+    /// `location` (or a catalog-chosen default location when `None`), with `partition_columns`
+    /// appended after the data columns. Called by the DataFusion bridge's `register_table` when a
+    /// `CREATE TABLE ... AS SELECT` targets this catalog — the caller writes the actual data files
+    /// separately and only needs the returned [`TableMetadata`] (in particular its `location`) to
+    /// know where.
+    ///
+    /// Default: `Unsupported`, so a read-only provider (or any future third-party one) keeps
+    /// compiling without implementing writes.
+    async fn create_table(
+        &self,
+        namespace: &[String],
+        table: &str,
+        schema: SchemaRef,
+        format: TableFormat,
+        location: Option<String>,
+        partition_columns: &[String],
+    ) -> Result<TableMetadata> {
+        let _ = (
+            namespace,
+            table,
+            schema,
+            format,
+            location,
+            partition_columns,
+        );
+        Err(Error::Unsupported(format!(
+            "catalog `{}` does not support creating tables",
+            self.name()
+        )))
+    }
 }
 
 /// The per-session set of named catalogs plus the current catalog / namespace pointers.
