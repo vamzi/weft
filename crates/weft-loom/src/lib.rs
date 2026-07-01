@@ -1674,12 +1674,14 @@ impl Engine {
         // DDL fails to plan/execute (exotic column types, etc.) we fall through to the normal path,
         // which reproduces the original parse error — so an unsupported CREATE stays in exactly the
         // bucket it failed in before (never a regression).
-        if let Some(low) = spark_create_table::lower_create_table_using(query, &self.warehouse) {
+        if let Some(low) = spark_create_table::lower_create_table_using(query, &self.warehouse)
+            .filter(|l| !self.name_targets_external_catalog(&l.name))
+        {
             if self.run_create_external(&low).await.is_ok() {
                 return Ok(vec![]);
             }
-        } else if let Some(ctas) =
-            spark_create_table::lower_create_table_ctas(query, &self.warehouse)
+        } else if let Some(ctas) = spark_create_table::lower_create_table_ctas(query, &self.warehouse)
+            .filter(|c| !self.name_targets_external_catalog(&c.name))
         {
             if self.run_create_table_ctas(&ctas).await.is_ok() {
                 return Ok(vec![]);
@@ -2059,6 +2061,25 @@ impl Engine {
         self.ctx.register_catalog(name, bridge);
     }
 
+    /// Whether `name`'s leading (possibly backtick-quoted) dotted segment names a registered
+    /// external catalog. Used to bail out of the local-warehouse `CREATE TABLE ... USING <fmt>`
+    /// lowerings (`spark_create_table::lower_create_table_using`/`lower_create_table_ctas`) when
+    /// the target is actually qualified with an external catalog (e.g.
+    /// `CREATE TABLE glue.db.t USING parquet AS SELECT ...`) — otherwise that lowering would
+    /// silently write to the local warehouse under the default catalog instead of routing to the
+    /// external catalog's real `CatalogProvider::create_table` (via `catalog_bridge`'s
+    /// `register_table`, which the un-qualified/no-`USING` CTAS path already reaches).
+    fn name_targets_external_catalog(&self, name: &str) -> bool {
+        let first = match name.strip_prefix('`') {
+            Some(rest) => rest.split('`').next().unwrap_or(rest),
+            None => name.split('.').next().unwrap_or(name),
+        };
+        self.weft_catalogs
+            .lock()
+            .expect("weft_catalogs poisoned")
+            .contains_key(first)
+    }
+
     /// Serve a parsed catalog-listing statement directly from the registered weft catalogs.
     ///
     /// The output column names are load-bearing — a downstream gateway parser keys off them:
@@ -2403,6 +2424,50 @@ mod tests {
     #[tokio::test]
     async fn create_table_using_csv_roundtrips_with_nulls() {
         roundtrip_fmt("csv").await;
+    }
+
+    /// A registered catalog whose `create_table` is unimplemented (inherits the trait default) —
+    /// enough to prove `CREATE TABLE <cat>.ns.t USING <fmt> AS SELECT ...` routes to the EXTERNAL
+    /// catalog's `create_table` (and fails there, since this stub doesn't implement it) instead of
+    /// silently lowering to a local-warehouse `CREATE EXTERNAL TABLE` write, which is what used to
+    /// happen for this exact spelling before `name_targets_external_catalog` was wired in.
+    struct StubExternalCatalog;
+
+    #[async_trait::async_trait]
+    impl weft_catalog::CatalogProvider for StubExternalCatalog {
+        fn name(&self) -> &str {
+            "extcat"
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> weft_catalog::Result<Vec<Vec<String>>> {
+            Ok(vec![])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> weft_catalog::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn load_table(
+            &self,
+            ns: &[String],
+            table: &str,
+        ) -> weft_catalog::Result<weft_catalog::TableMetadata> {
+            Err(Error::Plan(format!("no such table: {}.{table}", ns.join("."))))
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_external_catalog_ctas_skips_local_warehouse_lowering() {
+        let engine = Engine::new();
+        engine.register_catalog("extcat", Arc::new(StubExternalCatalog));
+
+        // Before this fix, this exact spelling (qualified name + `USING <fmt>` + `AS SELECT`)
+        // would silently lower to a local-warehouse `CREATE EXTERNAL TABLE`, writing under
+        // `warehouse/extcat_ns_t/` instead of routing to `extcat`'s catalog at all.
+        let _ = engine
+            .sql("CREATE TABLE extcat.ns.t USING parquet AS SELECT 1 AS x")
+            .await;
+        assert!(
+            !engine.warehouse.join("extcat_ns_t").exists(),
+            "must not fall back to writing the local warehouse for an external-catalog-qualified name"
+        );
     }
 
     #[tokio::test]

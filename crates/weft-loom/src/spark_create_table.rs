@@ -30,6 +30,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Lowered {
     pub ddl: String,
     pub table_dir: PathBuf,
+    /// The parsed (possibly qualified) table name, verbatim — lets the caller check whether its
+    /// first segment names a registered external catalog before committing to this local-warehouse
+    /// lowering (see `Engine::sql`'s use of this via `name_targets_external_catalog`).
+    pub name: String,
 }
 
 const FORMATS: &[&str] = &["parquet", "orc", "csv", "json"];
@@ -87,7 +91,7 @@ pub(crate) fn lower_create_table_using(sql: &str, warehouse: &Path) -> Option<Lo
         "CREATE EXTERNAL TABLE {ine}{name} {cols} STORED AS {} LOCATION '{location}'",
         fmt_l.to_uppercase()
     );
-    Some(Lowered { ddl, table_dir })
+    Some(Lowered { ddl, table_dir, name })
 }
 
 /// A CTAS lowering: materialize `select_sql` into `table_dir`, then run `ddl`.
@@ -96,6 +100,8 @@ pub(crate) struct LoweredCtas {
     pub fmt: String,
     pub ddl: String,
     pub table_dir: PathBuf,
+    /// The parsed (possibly qualified) table name, verbatim — see `Lowered::name`.
+    pub name: String,
 }
 
 /// Return lowering for `CREATE TABLE [IF NOT EXISTS] name USING fmt AS SELECT …`.
@@ -142,6 +148,7 @@ pub(crate) fn lower_create_table_ctas(sql: &str, warehouse: &Path) -> Option<Low
         fmt: fmt_l,
         ddl,
         table_dir,
+        name,
     })
 }
 
