@@ -64,13 +64,28 @@ impl GlueCatalog {
             .await
             .map_err(|e| Error::Io(format!("exec aws glue: {e}")))?;
         if !out.status.success() {
-            return Err(Error::Io(format!(
-                "aws glue {}: {}",
-                args.first().copied().unwrap_or(""),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+            let action = args.first().copied().unwrap_or("");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(classify_glue_failure(action, stderr.trim()));
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
+/// Classify a failed `aws glue <action>` invocation's stderr.
+///
+/// The AWS CLI reports a missing database/table as `EntityNotFoundException` — an expected
+/// "doesn't exist" signal (e.g. probed by CTAS to decide whether to create vs. fail), not a
+/// genuine failure. That case maps to [`Error::Plan`], which `weft-loom`'s catalog bridge (and
+/// `CatalogProvider::table_exists`'s default impl) already treats as "not found" rather than a
+/// hard error. Every other failure (auth, network, throttling, missing binary output, ...) keeps
+/// mapping to [`Error::Io`] so it still surfaces as a real error instead of being silently
+/// swallowed as "table missing".
+fn classify_glue_failure(action: &str, stderr: &str) -> Error {
+    if stderr.contains("EntityNotFoundException") {
+        Error::Plan(format!("aws glue {action}: {stderr}"))
+    } else {
+        Error::Io(format!("aws glue {action}: {stderr}"))
     }
 }
 
@@ -247,5 +262,38 @@ mod tests {
             columns_to_schema(glue_column_pairs(data.as_array(), None)),
             None
         );
+    }
+
+    // `classify_glue_failure` is what lets a CTAS's "does the target table already exist?" probe
+    // (`get-table`) tell "doesn't exist yet, go ahead and create it" (EntityNotFoundException)
+    // apart from a genuine failure that must still surface as an error.
+
+    #[test]
+    fn entity_not_found_classifies_as_not_found() {
+        let stderr = "An error occurred (EntityNotFoundException) when calling the GetTable \
+                       operation: Entity Not Found";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Plan(msg) => assert!(msg.contains("EntityNotFoundException")),
+            other => panic!("expected Error::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn access_denied_classifies_as_io_error() {
+        let stderr = "An error occurred (AccessDeniedException) when calling the GetTable \
+                       operation: User is not authorized";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Io(msg) => assert!(msg.contains("AccessDeniedException")),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generic_failure_classifies_as_io_error() {
+        let stderr = "Could not connect to the endpoint URL";
+        match classify_glue_failure("get-table", stderr) {
+            Error::Io(msg) => assert!(msg.contains("Could not connect")),
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
     }
 }
