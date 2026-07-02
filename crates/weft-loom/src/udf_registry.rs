@@ -39,6 +39,17 @@ impl UdfRegistry {
         self.defs.insert(def.name.to_lowercase(), def);
     }
 
+    /// The (lowercased) names of every session UDF registered so far. Backs `SHOW FUNCTIONS`.
+    pub fn names(&self) -> Vec<String> {
+        self.defs.keys().cloned().collect()
+    }
+
+    /// Look up a session UDF's definition by (case-insensitive) name. Backs
+    /// `DESCRIBE FUNCTION` reporting the SQL body for session-defined functions.
+    pub fn get(&self, name: &str) -> Option<UdfDef> {
+        self.defs.get(&name.to_lowercase()).cloned()
+    }
+
     pub fn export_json(&self) -> String {
         let list: Vec<&UdfDef> = self.defs.values().collect();
         serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())

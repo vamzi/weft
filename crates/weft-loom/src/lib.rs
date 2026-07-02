@@ -1506,6 +1506,19 @@ fn window_frame_is_full_partition(spec: &datafusion::sql::sqlparser::ast::Window
 /// with the process id) so concurrent engines never share table storage.
 static WAREHOUSE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Metadata for a table created locally via `CREATE TABLE ... USING <fmt>` (including CTAS),
+/// captured at CREATE time since `spark_create_table`'s lowering rewrites the statement to a plain
+/// `CREATE EXTERNAL TABLE` that DataFusion's own catalog has no way to recover `COMMENT`/
+/// `TBLPROPERTIES`/partitioning from. Consulted by later `SHOW CREATE TABLE`/`SHOW TBLPROPERTIES`/
+/// `DESCRIBE EXTENDED` work via [`Engine::created_table_meta`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CreatedTableMeta {
+    pub format: String,
+    pub comment: Option<String>,
+    pub properties: HashMap<String, String>,
+    pub partition_columns: Vec<String>,
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -1529,6 +1542,19 @@ pub struct Engine {
     weft_catalogs: Mutex<HashMap<String, Arc<dyn weft_catalog::CatalogProvider>>>,
     /// User-defined functions registered in this session (SQL `CREATE FUNCTION`, Connect sync).
     udf_registry: udf_registry::SharedUdfRegistry,
+    /// The session's current catalog + current namespace ("current database"), set by `USE` and
+    /// consulted for defaulting unqualified names in SHOW/DESCRIBE (see [`Engine::sql`]'s `USE`
+    /// interception and [`Engine::current_catalog_and_namespace`]). Mirrors the shape of
+    /// [`weft_catalog::CatalogRegistry`]'s current-catalog/-namespace pointers, but is owned
+    /// directly by the engine rather than by `weft-connect`'s separate Catalog-RPC registry.
+    current: Mutex<(String, Vec<String>)>,
+    /// Metadata for tables created locally via `CREATE TABLE ... USING <fmt>` (see
+    /// [`CreatedTableMeta`]), keyed by the table name as written in the `CREATE TABLE` statement.
+    /// `spark_create_table`'s lowering rewrites the statement into a plain `CREATE EXTERNAL TABLE`
+    /// that DataFusion's catalog cannot answer `COMMENT`/`TBLPROPERTIES` from, so this is captured
+    /// separately at CREATE time. Consulted by later SHOW/DESCRIBE work via
+    /// [`Engine::created_table_meta`].
+    created_tables: Mutex<HashMap<String, CreatedTableMeta>>,
 }
 
 impl Engine {
@@ -1568,6 +1594,16 @@ impl Engine {
             // `"..."` as an identifier, which mis-parses Spark string literals like
             // `next_day("2015-07-23", "Mon")`.
             opts.sql_parser.dialect = datafusion::common::config::Dialect::Databricks;
+            // Name DataFusion's own auto-created default catalog/schema `spark_catalog`/`default`
+            // (DataFusion's own defaults are `datafusion`/`public`) so they're the *same* catalog
+            // and namespace weft's own bookkeeping (`Engine::current`, `weft_catalog::DEFAULT_
+            // CATALOG`/`DEFAULT_NAMESPACE`) already names them — not just cosmetically matching
+            // Spark's own naming, but load-bearing: `Engine::run_show`'s SHOW COLUMNS/TABLES/
+            // CREATE TABLE handlers build literal `spark_catalog.default.<table>`-qualified SQL
+            // and `<default>.<schema>` lookups from that bookkeeping, which would silently resolve
+            // to nothing (or the wrong schema) against DataFusion's differently-named defaults.
+            opts.catalog.default_catalog = weft_catalog::DEFAULT_CATALOG.to_string();
+            opts.catalog.default_schema = weft_catalog::DEFAULT_NAMESPACE.to_string();
             // Spark's default NULL ordering treats NULL as the smallest value (ASC → NULLS FIRST,
             // DESC → NULLS LAST), whereas DataFusion defaults to Postgres's `nulls_max` (ASC →
             // NULLS LAST). Matching Spark makes weft's implicit ORDER BY (including window-function
@@ -1632,6 +1668,11 @@ impl Engine {
             temp_views: Mutex::new(HashSet::new()),
             weft_catalogs: Mutex::new(HashMap::new()),
             udf_registry: Arc::new(Mutex::new(udf_registry::UdfRegistry::new())),
+            current: Mutex::new((
+                weft_catalog::DEFAULT_CATALOG.to_string(),
+                vec![weft_catalog::DEFAULT_NAMESPACE.to_string()],
+            )),
+            created_tables: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1673,6 +1714,24 @@ impl Engine {
         if let Some(show) = parse_show(query) {
             return self.run_show(&show).await;
         }
+        // `DESCRIBE`/`DESC` (table columns, `QUERY`, `DATABASE`/`SCHEMA`, `CATALOG`, `FUNCTION`)
+        // — same interception style as `SHOW` above, and for the same reason: DataFusion's native
+        // `DESCRIBE` only understands a bare table/query and returns its own column shape
+        // (`column_name, data_type, is_nullable`) instead of Spark's (`col_name, data_type,
+        // comment`), with none of `EXTENDED`/`DATABASE`/`CATALOG`/`FUNCTION` support. `parse_describe`
+        // returns `None` for anything that isn't one of these forms, leaving every other statement
+        // untouched.
+        if let Some(describe) = parse_describe(query) {
+            return self.run_describe(&describe).await;
+        }
+        // `USE [CATALOG] <name>` / `USE <catalog>.<namespace>` sets the session's current
+        // catalog/namespace, consulted by later SHOW/DESCRIBE work for defaulting unqualified
+        // names. Handled here (rather than DataFusion's planner) since weft's current-catalog
+        // state lives on `Engine`, not in DataFusion's session config. `parse_use` returns `None`
+        // for anything that isn't one of these forms.
+        if let Some(use_stmt) = parse_use(query) {
+            return self.run_use(&use_stmt).await;
+        }
         // SQL user-defined functions: `CREATE [OR REPLACE] FUNCTION … RETURN …`
         if let Some(def) = udf_registry::try_create_function(query) {
             let mut reg = self.udf_registry.lock().unwrap();
@@ -1710,6 +1769,15 @@ impl Engine {
             .filter(|l| !self.name_targets_external_catalog(&l.name))
         {
             if self.run_create_external(&low).await.is_ok() {
+                self.created_tables.lock().unwrap().insert(
+                    created_table_key(&low.name),
+                    CreatedTableMeta {
+                        format: low.format.clone(),
+                        comment: low.comment.clone(),
+                        properties: low.properties.clone(),
+                        partition_columns: Vec::new(),
+                    },
+                );
                 return Ok(vec![]);
             }
         } else if let Some(ctas) =
@@ -1717,6 +1785,15 @@ impl Engine {
                 .filter(|c| !self.name_targets_external_catalog(&c.name))
         {
             if self.run_create_table_ctas(&ctas).await.is_ok() {
+                self.created_tables.lock().unwrap().insert(
+                    created_table_key(&ctas.name),
+                    CreatedTableMeta {
+                        format: ctas.fmt.clone(),
+                        comment: ctas.comment.clone(),
+                        properties: ctas.properties.clone(),
+                        partition_columns: Vec::new(),
+                    },
+                );
                 return Ok(vec![]);
             }
         } else if spark_create_table::is_insert(query) {
@@ -2124,18 +2201,49 @@ impl Engine {
             .any(|k| k.eq_ignore_ascii_case(first))
     }
 
-    /// Serve a parsed catalog-listing statement directly from the registered weft catalogs.
+    /// Serve a parsed catalog-listing/`SHOW` statement directly from the registered weft catalogs
+    /// (and, for the built-in `spark_catalog`, the DataFusion bridge + [`Engine::created_tables`]).
     ///
-    /// The output column names are load-bearing — a downstream gateway parser keys off them:
+    /// The output column names are load-bearing — a downstream gateway parser keys off them, and
+    /// each shape matches Spark's own `SHOW …` schema:
+    /// - `SHOW CATALOGS` → one `catalog` (Utf8) column;
     /// - `SHOW DATABASES`/`SHOW SCHEMAS`[ `IN <cat>`] → one `namespace` (Utf8) column;
-    /// - `SHOW TABLES IN <cat>[.<db>]` → three columns `namespace` (Utf8), `tableName` (Utf8),
-    ///   `isTemporary` (Boolean, always false), matching Spark.
+    /// - `SHOW TABLES`[ `IN|FROM <cat>[.<db>]`][ `LIKE '<pattern>'`] → `namespace`/`tableName`/
+    ///   `isTemporary` (Boolean, always false — weft's catalog-backed listings never distinguish);
+    /// - `SHOW COLUMNS IN|FROM <table>[ IN|FROM <db>]` → one `col_name` (Utf8) column;
+    /// - `SHOW VIEWS`[ `IN|FROM <db>`][ `LIKE '<pattern>'`] → `namespace`/`viewName`/`isTemporary`;
+    /// - `SHOW TBLPROPERTIES <table>[('key')]` → `key`/`value` (Utf8) columns;
+    /// - `SHOW TABLE EXTENDED [IN|FROM <db>] LIKE '<pattern>'` → `namespace`/`tableName`/
+    ///   `isTemporary`/`information`;
+    /// - `SHOW CREATE TABLE <table>[ AS SERDE]` → one `createtab_stmt` (Utf8) column — see
+    ///   [`reconstruct_create_table_ddl`];
+    /// - `SHOW PARTITIONS <table>[ PARTITION (…)]` → one `partition` (Utf8) column;
+    /// - `SHOW FUNCTIONS[ LIKE '<pattern>']` → one `function` (Utf8) column.
     ///
-    /// An unknown catalog yields an empty (0-row) result of the right shape rather than an error.
+    /// An unknown catalog/namespace/pattern yields an empty (0-row) result of the right shape
+    /// rather than an error for the listing forms (`Catalogs`/`Databases`/`Tables`/`Views`/
+    /// `Partitions`); a single-table lookup that can't resolve (`Columns`/`TblProperties`/
+    /// `CreateTable`) returns a `TABLE_OR_VIEW_NOT_FOUND`-style [`Error::Plan`] instead, matching
+    /// Spark's own analysis error for those forms.
     async fn run_show(&self, show: &ShowStmt) -> Result<Vec<RecordBatch>> {
         match show {
+            ShowStmt::Catalogs => {
+                let mut names: Vec<String> = self
+                    .weft_catalogs
+                    .lock()
+                    .expect("weft_catalogs poisoned")
+                    .keys()
+                    .cloned()
+                    .collect();
+                names.push(weft_catalog::DEFAULT_CATALOG.to_string());
+                names.sort();
+                names.dedup();
+                Ok(vec![single_col_batch("catalog", names)?])
+            }
             ShowStmt::Databases { catalog: None } => {
-                // Union of every registered catalog's top-level namespaces.
+                // The built-in catalog's own namespaces, plus the union of every registered
+                // external catalog's top-level namespaces.
+                let mut namespaces = self.builtin_namespaces();
                 let cats: Vec<Arc<dyn weft_catalog::CatalogProvider>> = self
                     .weft_catalogs
                     .lock()
@@ -2143,7 +2251,6 @@ impl Engine {
                     .values()
                     .cloned()
                     .collect();
-                let mut namespaces = Vec::new();
                 for cat in cats {
                     let nss = cat
                         .list_namespaces(&[])
@@ -2156,33 +2263,49 @@ impl Engine {
                 Ok(vec![namespace_batch(namespaces)?])
             }
             ShowStmt::Databases { catalog: Some(cat) } => {
-                let provider = self.weft_catalog(cat);
-                let namespaces = match provider {
-                    Some(p) => p
-                        .list_namespaces(&[])
-                        .await
-                        .map_err(|e| Error::Execution(e.to_string()))?
-                        .into_iter()
-                        .map(|ns| ns.join("."))
-                        .collect(),
-                    // Unknown catalog → empty result, not an error.
-                    None => Vec::new(),
+                let namespaces = if cat == weft_catalog::DEFAULT_CATALOG {
+                    self.builtin_namespaces()
+                } else {
+                    match self.weft_catalog(cat) {
+                        Some(p) => p
+                            .list_namespaces(&[])
+                            .await
+                            .map_err(|e| Error::Execution(e.to_string()))?
+                            .into_iter()
+                            .map(|ns| ns.join("."))
+                            .collect(),
+                        // Unknown catalog → empty result, not an error.
+                        None => Vec::new(),
+                    }
                 };
                 Ok(vec![namespace_batch(namespaces)?])
             }
-            ShowStmt::Tables { catalog, database } => {
-                let provider = self.weft_catalog(catalog);
+            ShowStmt::Tables {
+                catalog,
+                database,
+                like,
+            } => {
+                let (cat, db) = match catalog {
+                    Some(c) => (c.clone(), database.clone()),
+                    // Bare `SHOW TABLES`/`SHOW TABLES LIKE '…'` — default to the session's current
+                    // catalog + (last segment of the) current namespace.
+                    None => {
+                        let (cur_cat, cur_ns) = self.current_catalog_and_namespace();
+                        let ns = database.clone().or_else(|| cur_ns.into_iter().next_back());
+                        (cur_cat, ns)
+                    }
+                };
                 let mut rows: Vec<(String, String)> = Vec::new();
-                if let Some(p) = provider {
-                    match database {
+                if let Some(p) = self.weft_catalog(&cat) {
+                    match &db {
                         // `SHOW TABLES IN <cat>.<db>` — tables directly in that namespace.
-                        Some(db) => {
+                        Some(d) => {
                             let tables = p
-                                .list_tables(std::slice::from_ref(db))
+                                .list_tables(std::slice::from_ref(d))
                                 .await
                                 .map_err(|e| Error::Execution(e.to_string()))?;
                             for t in tables {
-                                rows.push((db.clone(), t));
+                                rows.push((d.clone(), t));
                             }
                         }
                         // `SHOW TABLES IN <cat>` — union across the catalog's top-level namespaces.
@@ -2203,8 +2326,483 @@ impl Engine {
                             }
                         }
                     }
+                } else if cat == weft_catalog::DEFAULT_CATALOG {
+                    // The built-in catalog isn't a `weft_catalog::CatalogProvider` — its tables
+                    // (temp views + `CREATE TABLE … USING` tables) live on the DataFusion bridge.
+                    let namespaces: Vec<String> = match &db {
+                        Some(d) => vec![d.clone()],
+                        None => self.builtin_namespaces(),
+                    };
+                    for ns in namespaces {
+                        for t in self.builtin_table_names(&ns) {
+                            rows.push((ns.clone(), t));
+                        }
+                    }
+                }
+                if let Some(pat) = like {
+                    rows.retain(|(_, t)| sql_like_match(pat, t));
                 }
                 Ok(vec![tables_batch(rows)?])
+            }
+            ShowStmt::Columns { table, namespace } => {
+                let mut segments = parse_qualified_name(table);
+                if let Some(ns) = namespace {
+                    // An explicit `FROM <db>` clause names the namespace directly — keep only the
+                    // table's own bare (unqualified) name and requalify it under `ns`.
+                    let bare_table = segments.pop().unwrap_or_default();
+                    segments = parse_qualified_name(ns);
+                    segments.push(bare_table);
+                }
+                let (cat, ns, tbl) = self.resolve_table_ref(&segments);
+                let qualified = if cat == weft_catalog::DEFAULT_CATALOG {
+                    format!("{}.{tbl}", ns.join("."))
+                } else {
+                    format!("{cat}.{}.{tbl}", ns.join("."))
+                };
+                let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
+                let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                Ok(vec![single_col_batch("col_name", names)?])
+            }
+            ShowStmt::Views { database, like } => {
+                let (_, cur_ns) = self.current_catalog_and_namespace();
+                let ns = database.clone().unwrap_or_else(|| {
+                    cur_ns
+                        .into_iter()
+                        .next_back()
+                        .unwrap_or_else(|| weft_catalog::DEFAULT_NAMESPACE.to_string())
+                });
+                let temp_set = self.temp_views.lock().expect("temp_views poisoned").clone();
+                let mut names: HashSet<String> = HashSet::new();
+                // Session temp views only apply to a bare `SHOW VIEWS`/`LIKE …` — an explicit
+                // `IN|FROM <db>` clause names a persistent-view namespace, which temp views (a
+                // session-global namespace of their own) never belong to.
+                if database.is_none() {
+                    names.extend(temp_set.iter().cloned());
+                }
+                let default = self.default_catalog_name();
+                if let Some(cat) = self.ctx.catalog(&default) {
+                    if let Some(schema) = cat.schema(&ns) {
+                        for t in schema.table_names() {
+                            if let Ok(Some(datafusion::datasource::TableType::View)) =
+                                schema.table_type(&t).await
+                            {
+                                names.insert(t);
+                            }
+                        }
+                    }
+                }
+                let mut rows: Vec<(String, String, bool)> = names
+                    .into_iter()
+                    .map(|n| {
+                        let is_temp = temp_set.contains(&n);
+                        (ns.clone(), n, is_temp)
+                    })
+                    .collect();
+                if let Some(pat) = like {
+                    rows.retain(|(_, n, _)| sql_like_match(pat, n));
+                }
+                rows.sort_by(|a, b| a.1.cmp(&b.1));
+                Ok(vec![views_batch(rows)?])
+            }
+            ShowStmt::TblProperties { table, key } => {
+                let segments = parse_qualified_name(table);
+                let (cat, ns, tbl) = self.resolve_table_ref(&segments);
+                let qualified = format!("{cat}.{}.{tbl}", ns.join("."));
+                let props: HashMap<String, String> = if cat == weft_catalog::DEFAULT_CATALOG {
+                    self.created_table_meta(&tbl)
+                        .map(|m| m.properties)
+                        .unwrap_or_default()
+                } else {
+                    self.load_catalog_table(&cat, &ns, &tbl).await?.properties
+                };
+                let rows: Vec<(String, String)> = match key {
+                    Some(k) => match props.get(k) {
+                        Some(v) => vec![(k.clone(), redact_property_value(k, v))],
+                        None => vec![(
+                            k.clone(),
+                            format!("Table {qualified} does not have property: {k}"),
+                        )],
+                    },
+                    None => {
+                        let mut kv: Vec<(String, String)> = props
+                            .into_iter()
+                            .map(|(k, v)| {
+                                let redacted = redact_property_value(&k, &v);
+                                (k, redacted)
+                            })
+                            .collect();
+                        kv.sort_by(|a, b| a.0.cmp(&b.0));
+                        kv
+                    }
+                };
+                Ok(vec![key_value_batch(rows)?])
+            }
+            ShowStmt::TableExtended { database, like } => {
+                let (cur_cat, cur_ns) = self.current_catalog_and_namespace();
+                let ns = database.clone().unwrap_or_else(|| {
+                    cur_ns
+                        .into_iter()
+                        .next_back()
+                        .unwrap_or_else(|| weft_catalog::DEFAULT_NAMESPACE.to_string())
+                });
+                let mut names: Vec<String> = self.builtin_table_names(&ns);
+                names.retain(|t| sql_like_match(like, t));
+                let mut rows: Vec<(String, String, bool, String)> = Vec::new();
+                for name in names {
+                    let info = match self.created_table_meta(&name) {
+                        Some(meta) => format!(
+                            "Catalog: {cur_cat}\nDatabase: {ns}\nTable: {name}\nProvider: {}\nComment: {}\nTable Properties: [{}]\n",
+                            meta.format,
+                            meta.comment.clone().unwrap_or_default(),
+                            format_properties(&meta.properties)
+                        ),
+                        None => format!("Catalog: {cur_cat}\nDatabase: {ns}\nTable: {name}\n"),
+                    };
+                    rows.push((ns.clone(), name, false, info));
+                }
+                Ok(vec![table_extended_batch(rows)?])
+            }
+            ShowStmt::CreateTable { table } => {
+                let segments = parse_qualified_name(table);
+                let (cat, ns, tbl) = self.resolve_table_ref(&segments);
+                let qualified = format!("{cat}.{}.{tbl}", ns.join("."));
+                if cat == weft_catalog::DEFAULT_CATALOG {
+                    let meta = self.created_table_meta(&tbl).ok_or_else(|| {
+                        Error::Plan(format!(
+                            "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be \
+                             found"
+                        ))
+                    })?;
+                    let schema = self.schema(&format!("SELECT * FROM {tbl}")).await?;
+                    let ddl = reconstruct_create_table_ddl(
+                        &qualified,
+                        &schema,
+                        &meta.format,
+                        &meta.partition_columns,
+                        None,
+                        meta.comment.as_deref(),
+                        &meta.properties,
+                    );
+                    Ok(vec![single_col_batch("createtab_stmt", vec![ddl])?])
+                } else {
+                    let md = self.load_catalog_table(&cat, &ns, &tbl).await?;
+                    let schema = md
+                        .schema
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+                    let ddl = reconstruct_create_table_ddl(
+                        &qualified,
+                        &schema,
+                        table_format_str(md.format),
+                        &md.partition_columns,
+                        Some(&md.location),
+                        md.comment.as_deref(),
+                        &md.properties,
+                    );
+                    Ok(vec![single_col_batch("createtab_stmt", vec![ddl])?])
+                }
+            }
+            ShowStmt::Partitions { table, spec } => {
+                let segments = parse_qualified_name(table);
+                let (cat, ns, tbl) = self.resolve_table_ref(&segments);
+                if cat == weft_catalog::DEFAULT_CATALOG {
+                    // Local `CREATE TABLE … USING` tables never carry partition info (v1 doesn't
+                    // lower `PARTITIONED BY`) — empty, not an error.
+                    return Ok(vec![single_col_batch("partition", Vec::new())?]);
+                }
+                let md = self.load_catalog_table(&cat, &ns, &tbl).await?;
+                if md.partition_columns.is_empty() {
+                    return Ok(vec![single_col_batch("partition", Vec::new())?]);
+                }
+                let parts = list_hive_partitions(&md.location, &md.partition_columns, spec);
+                Ok(vec![single_col_batch("partition", parts)?])
+            }
+            ShowStmt::Functions { like } => {
+                let mut names: HashSet<String> = self
+                    .udf_registry
+                    .lock()
+                    .expect("udf_registry poisoned")
+                    .names()
+                    .into_iter()
+                    .collect();
+                let state = self.ctx.state();
+                names.extend(state.scalar_functions().keys().cloned());
+                names.extend(state.aggregate_functions().keys().cloned());
+                names.extend(state.window_functions().keys().cloned());
+                let mut list: Vec<String> = names.into_iter().collect();
+                if let Some(pat) = like {
+                    list.retain(|n| sql_like_match(pat, n));
+                }
+                list.sort();
+                Ok(vec![single_col_batch("function", list)?])
+            }
+        }
+    }
+
+    /// Serve a parsed `DESCRIBE`/`DESC` statement directly, mirroring [`Engine::run_show`]'s
+    /// interception style and data sources (`created_tables` for locally-created tables,
+    /// `weft_catalog::TableMetadata` for catalog-backed ones, [`Engine::schema`] for column
+    /// resolution). Output shapes:
+    /// - `Table`/`Query` → `struct<col_name:string,data_type:string,comment:string>`, matching
+    ///   Spark's own `DESCRIBE` shape (`spark-tests/results/describe.sql.out`,
+    ///   `describe-query.sql.out`). `EXTENDED`/`FORMATTED` append a blank row plus a
+    ///   `# Detailed Table Information` block with whatever fields weft can answer; unavailable
+    ///   fields (`Owner`, `Created Time`, `Serde Library`, …) are omitted rather than fabricated.
+    ///   `AS JSON` (only legal combined with `EXTENDED`/`FORMATTED`, matching Spark's
+    ///   `DESCRIBE_JSON_NOT_EXTENDED` rule) instead returns a single `json_metadata` column with a
+    ///   best-effort JSON object of the same known fields.
+    /// - `Database`/`Catalog` → two-column `info_name`/`info_value`.
+    /// - `Function` → one `function_desc` column, one line per fact known about the function.
+    async fn run_describe(&self, describe: &DescribeStmt) -> Result<Vec<RecordBatch>> {
+        match describe {
+            DescribeStmt::Table {
+                name,
+                extended,
+                partition: _partition,
+                as_json,
+            } => {
+                if *as_json && !*extended {
+                    return Err(Error::Plan(
+                        "[DESCRIBE_JSON_NOT_EXTENDED] DESC TABLE ... AS JSON is only supported \
+                         with EXTENDED/FORMATTED"
+                            .into(),
+                    ));
+                }
+                let segments = parse_qualified_name(name);
+                let (cat, ns, tbl) = self.resolve_table_ref(&segments);
+                let qualified = if cat == weft_catalog::DEFAULT_CATALOG {
+                    format!("{}.{tbl}", ns.join("."))
+                } else {
+                    format!("{cat}.{}.{tbl}", ns.join("."))
+                };
+                let schema = self.schema(&format!("SELECT * FROM {qualified}")).await?;
+                // Metadata for the detailed/JSON forms: local `CREATE TABLE ... USING` tables read
+                // from `created_tables` (format known → reported as `MANAGED`, weft never lowers an
+                // explicit `LOCATION`); catalog-backed tables read from `TableMetadata` (always
+                // reported as `EXTERNAL`, since they live outside weft's own managed warehouse).
+                let (fmt_opt, comment, properties, partition_columns, location, is_local) =
+                    if cat == weft_catalog::DEFAULT_CATALOG {
+                        match self.created_table_meta(&tbl) {
+                            Some(meta) => (
+                                Some(meta.format),
+                                meta.comment,
+                                meta.properties,
+                                meta.partition_columns,
+                                None,
+                                true,
+                            ),
+                            None => (None, None, HashMap::new(), Vec::new(), None, true),
+                        }
+                    } else {
+                        let md = self.load_catalog_table(&cat, &ns, &tbl).await?;
+                        (
+                            Some(table_format_str(md.format).to_string()),
+                            md.comment,
+                            md.properties,
+                            md.partition_columns,
+                            Some(md.location),
+                            false,
+                        )
+                    };
+                if *as_json {
+                    let json = serde_json::json!({
+                        "table_name": tbl,
+                        "catalog_name": cat,
+                        "namespace": ns,
+                        "columns": schema
+                            .fields()
+                            .iter()
+                            .map(|f| serde_json::json!({
+                                "name": f.name(),
+                                "type": spark_ddl_type(f.data_type()).to_lowercase(),
+                                "nullable": f.is_nullable(),
+                            }))
+                            .collect::<Vec<_>>(),
+                        "location": location,
+                        "type": if is_local { "MANAGED" } else { "EXTERNAL" },
+                        "provider": fmt_opt,
+                        "comment": comment,
+                        "table_properties": properties,
+                        "partition_columns": partition_columns,
+                    });
+                    return Ok(vec![single_col_batch(
+                        "json_metadata",
+                        vec![json.to_string()],
+                    )?]);
+                }
+                let mut rows: Vec<(String, String, String)> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name().clone(),
+                            spark_ddl_type(f.data_type()).to_lowercase(),
+                            String::new(),
+                        )
+                    })
+                    .collect();
+                if !partition_columns.is_empty() {
+                    rows.push((
+                        "# Partition Information".to_string(),
+                        String::new(),
+                        String::new(),
+                    ));
+                    rows.push((
+                        "# col_name".to_string(),
+                        "data_type".to_string(),
+                        "comment".to_string(),
+                    ));
+                    for pc in &partition_columns {
+                        let dtype = schema
+                            .field_with_name(pc)
+                            .map(|f| spark_ddl_type(f.data_type()).to_lowercase())
+                            .unwrap_or_default();
+                        rows.push((pc.clone(), dtype, String::new()));
+                    }
+                }
+                if *extended {
+                    rows.push((String::new(), String::new(), String::new()));
+                    rows.push((
+                        "# Detailed Table Information".to_string(),
+                        String::new(),
+                        String::new(),
+                    ));
+                    rows.push(("Catalog".to_string(), cat.clone(), String::new()));
+                    rows.push(("Database".to_string(), ns.join("."), String::new()));
+                    rows.push(("Table".to_string(), tbl.clone(), String::new()));
+                    if let Some(fmt) = &fmt_opt {
+                        rows.push((
+                            "Type".to_string(),
+                            if is_local { "MANAGED" } else { "EXTERNAL" }.to_string(),
+                            String::new(),
+                        ));
+                        rows.push(("Provider".to_string(), fmt.clone(), String::new()));
+                    }
+                    if let Some(c) = &comment {
+                        rows.push(("Comment".to_string(), c.clone(), String::new()));
+                    }
+                    if !properties.is_empty() {
+                        rows.push((
+                            "Table Properties".to_string(),
+                            format!("[{}]", format_properties(&properties)),
+                            String::new(),
+                        ));
+                    }
+                    if let Some(loc) = &location {
+                        rows.push(("Location".to_string(), loc.clone(), String::new()));
+                    }
+                    if !partition_columns.is_empty() {
+                        rows.push((
+                            "Partition Columns".to_string(),
+                            format!("[{}]", partition_columns.join(", ")),
+                            String::new(),
+                        ));
+                    }
+                }
+                Ok(vec![describe_batch(rows)?])
+            }
+            DescribeStmt::Query { stmt } => {
+                let schema = self.schema(stmt).await?;
+                let rows: Vec<(String, String, String)> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name().clone(),
+                            spark_ddl_type(f.data_type()).to_lowercase(),
+                            String::new(),
+                        )
+                    })
+                    .collect();
+                Ok(vec![describe_batch(rows)?])
+            }
+            DescribeStmt::Database { catalog, name } => {
+                let cat = catalog
+                    .clone()
+                    .unwrap_or_else(|| self.current_catalog_and_namespace().0);
+                let exists = if cat == weft_catalog::DEFAULT_CATALOG {
+                    self.builtin_namespaces().iter().any(|n| n == name)
+                } else {
+                    match self.weft_catalog(&cat) {
+                        Some(p) => p
+                            .namespace_exists(std::slice::from_ref(name))
+                            .await
+                            .unwrap_or(false),
+                        None => false,
+                    }
+                };
+                if !exists {
+                    return Err(Error::Plan(format!(
+                        "[SCHEMA_NOT_FOUND] The schema `{name}` cannot be found"
+                    )));
+                }
+                // weft's `CatalogProvider` trait has no namespace-level comment/location/owner
+                // concept, so those fields are left blank rather than fabricated.
+                let rows = vec![
+                    ("Namespace Name".to_string(), name.clone()),
+                    ("Comment".to_string(), String::new()),
+                    ("Location".to_string(), String::new()),
+                    ("Owner".to_string(), String::new()),
+                ];
+                Ok(vec![two_col_batch("info_name", "info_value", rows)?])
+            }
+            DescribeStmt::Catalog { name } => {
+                if !self.catalog_registered(name) {
+                    return Err(Error::Plan(format!(
+                        "[CATALOG_NOT_FOUND] The catalog `{name}` not found"
+                    )));
+                }
+                Ok(vec![two_col_batch(
+                    "info_name",
+                    "info_value",
+                    vec![("Catalog Name".to_string(), name.clone())],
+                )?])
+            }
+            DescribeStmt::Function { name, extended } => {
+                let bare = parse_qualified_name(name)
+                    .into_iter()
+                    .next_back()
+                    .unwrap_or_else(|| name.clone());
+                let mut rows: Vec<String> = Vec::new();
+                if let Some(def) = self
+                    .udf_registry
+                    .lock()
+                    .expect("udf_registry poisoned")
+                    .get(&bare)
+                {
+                    rows.push(format!("Function: {}", def.name));
+                    rows.push("Class: SQL UDF".to_string());
+                    rows.push(format!(
+                        "Usage: {}({}) RETURNS {}",
+                        def.name,
+                        def.param_names.join(", "),
+                        def.return_type
+                    ));
+                    if *extended {
+                        rows.push(format!(
+                            "Extended Usage: {}",
+                            def.sql_body.clone().unwrap_or_default()
+                        ));
+                    }
+                } else {
+                    let state = self.ctx.state();
+                    let lower = bare.to_lowercase();
+                    let is_builtin = state.scalar_functions().contains_key(lower.as_str())
+                        || state.aggregate_functions().contains_key(lower.as_str())
+                        || state.window_functions().contains_key(lower.as_str());
+                    if !is_builtin {
+                        return Err(Error::Plan(format!(
+                            "[UNRESOLVED_ROUTINE] Cannot resolve function `{bare}`"
+                        )));
+                    }
+                    rows.push(format!("Function: {bare}"));
+                    rows.push("Class: N/A".to_string());
+                    rows.push("Usage: N/A".to_string());
+                    if *extended {
+                        rows.push("Extended Usage: N/A".to_string());
+                    }
+                }
+                Ok(vec![single_col_batch("function_desc", rows)?])
             }
         }
     }
@@ -2214,6 +2812,130 @@ impl Engine {
         self.weft_catalogs
             .lock()
             .expect("weft_catalogs poisoned")
+            .get(name)
+            .cloned()
+    }
+
+    /// Whether `name` is a registered catalog — either an external [`weft_catalog::CatalogProvider`]
+    /// (`register_catalog`) or the built-in `spark_catalog`.
+    fn catalog_registered(&self, name: &str) -> bool {
+        name == weft_catalog::DEFAULT_CATALOG
+            || self
+                .weft_catalogs
+                .lock()
+                .expect("weft_catalogs poisoned")
+                .contains_key(name)
+    }
+
+    /// Apply a parsed `USE` statement, updating the session's current catalog/namespace.
+    /// `USE` produces no result rows (Spark's `struct<>`).
+    async fn run_use(&self, stmt: &UseStmt) -> Result<Vec<RecordBatch>> {
+        match stmt {
+            UseStmt::Catalog { catalog } => {
+                if !self.catalog_registered(catalog) {
+                    return Err(Error::Plan(format!(
+                        "[CATALOG_NOT_FOUND] The catalog `{catalog}` not found"
+                    )));
+                }
+                let mut current = self.current.lock().expect("current poisoned");
+                current.0 = catalog.clone();
+            }
+            UseStmt::Namespace { catalog, namespace } => {
+                if let Some(cat) = catalog {
+                    if !self.catalog_registered(cat) {
+                        return Err(Error::Plan(format!(
+                            "[CATALOG_NOT_FOUND] The catalog `{cat}` not found"
+                        )));
+                    }
+                }
+                let mut current = self.current.lock().expect("current poisoned");
+                if let Some(cat) = catalog {
+                    current.0 = cat.clone();
+                }
+                current.1 = namespace.clone();
+            }
+        }
+        Ok(vec![])
+    }
+
+    /// The session's current catalog + current namespace, set by `USE` (default:
+    /// `spark_catalog`/`default`). Consulted by [`Engine::run_show`] (and later `DESCRIBE` work) to
+    /// default unqualified catalog/namespace-relative names.
+    fn current_catalog_and_namespace(&self) -> (String, Vec<String>) {
+        self.current.lock().expect("current poisoned").clone()
+    }
+
+    /// Resolve a (possibly qualified) dotted name — as returned by [`parse_qualified_name`] — to an
+    /// explicit `(catalog, namespace, table)` triple, defaulting unspecified parts from
+    /// [`Engine::current_catalog_and_namespace`]. Mirrors Spark's own multi-part name resolution:
+    /// - `[table]` (unqualified) → current catalog, current (possibly multi-part) namespace;
+    /// - `[ns, table]` → current catalog, namespace `[ns]` (overrides only the last namespace
+    ///   segment, matching Spark's `USE`d-database convention);
+    /// - `[cat, ns.., table]` (3+ segments) → every segment explicit.
+    ///
+    /// Used by every single-table `SHOW`/`DESCRIBE` form (`Columns`, `TblProperties`, `CreateTable`,
+    /// `Partitions`, …) so they all default unqualified names the same way.
+    fn resolve_table_ref(&self, segments: &[String]) -> (String, Vec<String>, String) {
+        let (cur_cat, cur_ns) = self.current_catalog_and_namespace();
+        match segments.len() {
+            0 => (cur_cat, cur_ns, String::new()),
+            1 => (cur_cat, cur_ns, segments[0].clone()),
+            2 => (cur_cat, vec![segments[0].clone()], segments[1].clone()),
+            _ => {
+                let last = segments.len() - 1;
+                (
+                    segments[0].clone(),
+                    segments[1..last].to_vec(),
+                    segments[last].clone(),
+                )
+            }
+        }
+    }
+
+    /// Resolve one table's [`weft_catalog::TableMetadata`] from a registered external catalog,
+    /// mapping an unregistered catalog name onto a `TABLE_OR_VIEW_NOT_FOUND`-style [`Error::Plan`]
+    /// — the shape every caller (`SHOW COLUMNS`/`TBLPROPERTIES`/`CREATE TABLE`/`PARTITIONS`) wants
+    /// for a table it can't resolve.
+    ///
+    /// A `load_table` failure is *not* blanket-mapped to "not found": providers (e.g. Glue's
+    /// `classify_glue_failure`) already distinguish a genuine "doesn't exist" ([`Error::Plan`])
+    /// from a real backend failure — auth, throttling, network — surfaced as [`Error::Io`]/
+    /// [`Error::Execution`]/[`Error::Unsupported`]. Collapsing the latter into "not found" would
+    /// hide the real cause from the user; only an already-`Plan` error is rewritten to the
+    /// qualified `TABLE_OR_VIEW_NOT_FOUND` message, everything else passes through unchanged.
+    async fn load_catalog_table(
+        &self,
+        catalog: &str,
+        namespace: &[String],
+        table: &str,
+    ) -> Result<weft_catalog::TableMetadata> {
+        let qualified = format!("{catalog}.{}.{table}", namespace.join("."));
+        let provider = self.weft_catalog(catalog).ok_or_else(|| {
+            Error::Plan(format!(
+                "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
+            ))
+        })?;
+        provider
+            .load_table(namespace, table)
+            .await
+            .map_err(|e| match e {
+                Error::Plan(_) => Error::Plan(format!(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
+                )),
+                other => other,
+            })
+    }
+
+    /// Look up the [`CreatedTableMeta`] captured for a table created locally via
+    /// `CREATE TABLE ... USING <fmt>` (including CTAS), keyed by the table name as written in the
+    /// `CREATE TABLE` statement. Returns `None` for catalog-backed (Hive/Glue) tables and for any
+    /// name never seen by a successful local `CREATE TABLE`. Consumed by [`Engine::run_show`]'s
+    /// `SHOW CREATE TABLE`/`SHOW TBLPROPERTIES`/`SHOW TABLE EXTENDED` handling (and later
+    /// `DESCRIBE EXTENDED`).
+    pub fn created_table_meta(&self, name: &str) -> Option<CreatedTableMeta> {
+        self.created_tables
+            .lock()
+            .expect("created_tables poisoned")
             .get(name)
             .cloned()
     }
@@ -2254,32 +2976,100 @@ impl Engine {
     }
 }
 
-/// A parsed catalog-listing statement (see [`parse_show`]).
+/// A parsed catalog-listing/`SHOW` statement (see [`parse_show`]).
 #[derive(Debug, PartialEq, Eq)]
 enum ShowStmt {
+    /// `SHOW CATALOGS`.
+    Catalogs,
     /// `SHOW DATABASES`/`SHOW SCHEMAS`, optionally `IN <catalog>`.
     Databases { catalog: Option<String> },
-    /// `SHOW TABLES IN <catalog>[.<database>]`.
+    /// `SHOW TABLES`, optionally `IN|FROM <catalog>[.<database>]` and/or `LIKE '<pattern>'` (or
+    /// Spark's bare-pattern shorthand with no `LIKE` keyword). `catalog`/`database` both absent
+    /// defaults to the session's current catalog/namespace (see [`Engine::resolve_table_ref`]-style
+    /// defaulting, applied directly in [`Engine::run_show`]).
     Tables {
-        catalog: String,
+        catalog: Option<String>,
         database: Option<String>,
+        like: Option<String>,
     },
+    /// `SHOW COLUMNS IN|FROM <table>[ IN|FROM <namespace>]`.
+    Columns {
+        table: String,
+        namespace: Option<String>,
+    },
+    /// `SHOW VIEWS`, optionally `IN|FROM <database>` and/or `LIKE '<pattern>'`. Always answered
+    /// from the built-in default catalog (session temp views + persistent views) — Spark's
+    /// `SHOW VIEWS` grammar has no cross-catalog form.
+    Views {
+        database: Option<String>,
+        like: Option<String>,
+    },
+    /// `SHOW TBLPROPERTIES <table>[('key')]`.
+    TblProperties { table: String, key: Option<String> },
+    /// `SHOW TABLE EXTENDED [IN|FROM <database>] LIKE '<pattern>'[ PARTITION (…)]` (the trailing
+    /// `PARTITION` clause is accepted but not yet reflected in the result — see
+    /// [`parse_show_table_extended`]).
+    TableExtended {
+        database: Option<String>,
+        like: String,
+    },
+    /// `SHOW CREATE TABLE <table>[ AS SERDE]` — the core bug fix (see
+    /// [`reconstruct_create_table_ddl`]).
+    CreateTable { table: String },
+    /// `SHOW PARTITIONS <table>[ PARTITION (k=v, …)]`.
+    Partitions {
+        table: String,
+        spec: Vec<(String, String)>,
+    },
+    /// `SHOW FUNCTIONS[ LIKE '<pattern>']`.
+    Functions { like: Option<String> },
 }
 
-/// Recognize the catalog-listing `SHOW` statements weft answers itself, returning `None` for
-/// anything else (so it flows through normal planning untouched). Tolerant by design: keywords are
-/// case-insensitive, identifiers may be backtick-quoted or bare, a trailing `;` and extra
-/// whitespace are ignored. Deliberately does NOT match bare `SHOW TABLES` (no `IN`) — that has no
-/// unambiguous cross-catalog meaning and is left to the normal path.
+/// Recognize the `SHOW` statements weft answers itself, returning `None` for anything else (so it
+/// flows through normal planning untouched — never a regression for a form this doesn't cover
+/// yet). Tolerant by design, matching [`parse_use`]'s conventions: keywords are case-insensitive,
+/// identifiers may be backtick-quoted or bare, a trailing `;` and extra whitespace are ignored.
+///
+/// Parens are space-padded before tokenizing (`tbl("p1")` → `tbl ( "p1" )`) so every sub-parser
+/// below can work on plain whitespace-split tokens even when Spark's grammar allows a clause to
+/// butt directly against an adjacent paren — safe here because none of SHOW's patterns/keys/specs
+/// legitimately contain a literal `(`/`)`.
+/// Pad every `(`/`)` with surrounding whitespace so a simple `split_whitespace()` tokenizer sees
+/// them as standalone tokens (used to parse `SHOW PARTITIONS ... PARTITION (k=v, ...)`-style
+/// parenthesized tails) — except inside a single-quoted string literal, where a literal paren
+/// (e.g. `SHOW TABLES LIKE 'foo(bar)'`) must stay part of the quoted token, not get split apart.
+fn pad_parens_outside_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_quote = false;
+    for ch in s.chars() {
+        match ch {
+            '\'' => {
+                in_quote = !in_quote;
+                out.push(ch);
+            }
+            '(' | ')' if !in_quote => {
+                out.push(' ');
+                out.push(ch);
+                out.push(' ');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn parse_show(query: &str) -> Option<ShowStmt> {
     let trimmed = query.trim().trim_end_matches(';').trim();
-    let mut words = trimmed.split_whitespace();
+    let spaced = pad_parens_outside_quotes(trimmed);
+    let mut words = spaced.split_whitespace();
     if !words.next()?.eq_ignore_ascii_case("show") {
         return None;
     }
     let kind = words.next()?;
     let rest: Vec<&str> = words.collect();
-    if kind.eq_ignore_ascii_case("databases") || kind.eq_ignore_ascii_case("schemas") {
+    if kind.eq_ignore_ascii_case("catalogs") {
+        rest.is_empty().then_some(ShowStmt::Catalogs)
+    } else if kind.eq_ignore_ascii_case("databases") || kind.eq_ignore_ascii_case("schemas") {
         match rest.as_slice() {
             [] => Some(ShowStmt::Databases { catalog: None }),
             [in_kw, name] if in_kw.eq_ignore_ascii_case("in") => {
@@ -2292,17 +3082,480 @@ fn parse_show(query: &str) -> Option<ShowStmt> {
             _ => None,
         }
     } else if kind.eq_ignore_ascii_case("tables") {
-        match rest.as_slice() {
-            [in_kw, name] if in_kw.eq_ignore_ascii_case("in") => {
-                let mut segs = parse_qualified_name(name).into_iter();
-                let catalog = segs.next()?;
-                let database = segs.next();
-                Some(ShowStmt::Tables { catalog, database })
-            }
-            _ => None,
-        }
+        parse_show_tables(&rest)
+    } else if kind.eq_ignore_ascii_case("table") {
+        parse_show_table_extended(&rest)
+    } else if kind.eq_ignore_ascii_case("columns") {
+        parse_show_columns(&rest)
+    } else if kind.eq_ignore_ascii_case("views") {
+        parse_show_views(&rest)
+    } else if kind.eq_ignore_ascii_case("tblproperties") {
+        parse_show_tblproperties(&rest)
+    } else if kind.eq_ignore_ascii_case("create") {
+        parse_show_create_table(&rest)
+    } else if kind.eq_ignore_ascii_case("partitions") {
+        parse_show_partitions(&rest)
+    } else if kind.eq_ignore_ascii_case("functions") {
+        parse_show_functions(&rest)
     } else {
         None
+    }
+}
+
+/// `SHOW TABLES`[ `IN|FROM <cat>[.<db>]`][ `LIKE '<pattern>'` | bare `'<pattern>'`].
+fn parse_show_tables(rest: &[&str]) -> Option<ShowStmt> {
+    let (like, head) = take_trailing_like(rest);
+    match head {
+        [] => Some(ShowStmt::Tables {
+            catalog: None,
+            database: None,
+            like,
+        }),
+        [in_kw, name] if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") => {
+            let mut segs = parse_qualified_name(name).into_iter();
+            let catalog = segs.next()?;
+            let database = segs.next();
+            Some(ShowStmt::Tables {
+                catalog: Some(catalog),
+                database,
+                like,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `SHOW COLUMNS IN|FROM <table>[ IN|FROM <namespace>]`.
+fn parse_show_columns(rest: &[&str]) -> Option<ShowStmt> {
+    match rest {
+        [in_kw, table]
+            if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") =>
+        {
+            Some(ShowStmt::Columns {
+                table: (*table).to_string(),
+                namespace: None,
+            })
+        }
+        [in_kw1, table, in_kw2, ns]
+            if (in_kw1.eq_ignore_ascii_case("in") || in_kw1.eq_ignore_ascii_case("from"))
+                && (in_kw2.eq_ignore_ascii_case("in") || in_kw2.eq_ignore_ascii_case("from")) =>
+        {
+            Some(ShowStmt::Columns {
+                table: (*table).to_string(),
+                namespace: Some((*ns).to_string()),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `SHOW VIEWS`[ `IN|FROM <database>`][ `LIKE '<pattern>'` | bare `'<pattern>'`].
+fn parse_show_views(rest: &[&str]) -> Option<ShowStmt> {
+    let (like, head) = take_trailing_like(rest);
+    match head {
+        [] => Some(ShowStmt::Views {
+            database: None,
+            like,
+        }),
+        [in_kw, name] if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") => {
+            Some(ShowStmt::Views {
+                database: Some((*name).to_string()),
+                like,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `SHOW TBLPROPERTIES <table>[('key')]` (with or without whitespace before the paren — see
+/// [`parse_show`]'s paren-spacing normalization).
+fn parse_show_tblproperties(rest: &[&str]) -> Option<ShowStmt> {
+    match rest {
+        [table] => Some(ShowStmt::TblProperties {
+            table: (*table).to_string(),
+            key: None,
+        }),
+        [table, "(", key, ")"] => Some(ShowStmt::TblProperties {
+            table: (*table).to_string(),
+            key: Some(strip_quotes(key)),
+        }),
+        _ => None,
+    }
+}
+
+/// `SHOW TABLE EXTENDED [IN|FROM <database>] LIKE '<pattern>'[ PARTITION (…)]`. `LIKE` is
+/// mandatory in Spark's own grammar for this form; a bare `SHOW TABLE EXTENDED` (no `LIKE`) isn't
+/// matched here and falls through to the normal path. A trailing `PARTITION (…)` clause is parsed
+/// (so it doesn't break tokenization) but currently discarded — [`Engine::run_show`] answers with
+/// the unfiltered per-table listing rather than erroring.
+fn parse_show_table_extended(rest: &[&str]) -> Option<ShowStmt> {
+    let [ext_kw, tail @ ..] = rest else {
+        return None;
+    };
+    if !ext_kw.eq_ignore_ascii_case("extended") {
+        return None;
+    }
+    let mut i = 0;
+    let mut database = None;
+    if tail.len() > i + 1
+        && (tail[i].eq_ignore_ascii_case("in") || tail[i].eq_ignore_ascii_case("from"))
+    {
+        database = Some(tail[i + 1].to_string());
+        i += 2;
+    }
+    if tail.get(i)?.eq_ignore_ascii_case("like") {
+        i += 1;
+    } else {
+        return None;
+    }
+    let like = strip_quotes(tail.get(i)?);
+    // No trailing tokens after the LIKE pattern — matches `parse_describe`'s convention of
+    // rejecting (falling through, not silently ignoring) unrecognized trailing input.
+    if tail.len() != i + 1 {
+        return None;
+    }
+    Some(ShowStmt::TableExtended { database, like })
+}
+
+/// `SHOW CREATE TABLE <table>[ AS SERDE]`.
+fn parse_show_create_table(rest: &[&str]) -> Option<ShowStmt> {
+    let [tbl_kw, table, extra @ ..] = rest else {
+        return None;
+    };
+    if !tbl_kw.eq_ignore_ascii_case("table") {
+        return None;
+    }
+    match extra {
+        [] => Some(ShowStmt::CreateTable {
+            table: (*table).to_string(),
+        }),
+        // `AS SERDE` (Hive-serde output format) isn't distinguished from the plain form — weft
+        // has no serde-specific rendering, so both produce the same DDL reconstruction.
+        [as_kw, serde_kw]
+            if as_kw.eq_ignore_ascii_case("as") && serde_kw.eq_ignore_ascii_case("serde") =>
+        {
+            Some(ShowStmt::CreateTable {
+                table: (*table).to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `SHOW PARTITIONS <table>[ PARTITION (k=v, …)]`.
+fn parse_show_partitions(rest: &[&str]) -> Option<ShowStmt> {
+    match rest {
+        [] => None,
+        [table] => Some(ShowStmt::Partitions {
+            table: (*table).to_string(),
+            spec: Vec::new(),
+        }),
+        [table, part_kw, "(", tail @ .., ")"] if part_kw.eq_ignore_ascii_case("partition") => {
+            Some(ShowStmt::Partitions {
+                table: (*table).to_string(),
+                spec: parse_partition_spec_tokens(tail),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse `k = 'v', k2 = v2, …` tokens (as split by [`parse_show`]'s paren-spaced tokenizer) into
+/// `(key, value)` pairs. Best-effort: an entry that doesn't match `key = value` is simply dropped
+/// rather than failing the whole parse (mirrors `spark_create_table::parse_properties`'s leniency).
+fn parse_partition_spec_tokens(tokens: &[&str]) -> Vec<(String, String)> {
+    tokens
+        .join(" ")
+        .split(',')
+        .filter_map(|entry| {
+            let (k, v) = entry.split_once('=')?;
+            Some((k.trim().to_string(), strip_quotes(v.trim())))
+        })
+        .collect()
+}
+
+/// `SHOW FUNCTIONS[ LIKE '<pattern>']` (a `db.func`-qualified filter isn't supported — only the
+/// unqualified `LIKE` form).
+fn parse_show_functions(rest: &[&str]) -> Option<ShowStmt> {
+    let (like, head) = take_trailing_like(rest);
+    head.is_empty().then_some(ShowStmt::Functions { like })
+}
+
+/// True if `s` is wrapped in one matching pair of `'…'`/`"…"` quotes.
+fn is_quoted(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0]
+}
+
+/// Strip one layer of surrounding `'…'`/`"…"` quoting, if present; otherwise return `s` unchanged.
+fn strip_quotes(s: &str) -> String {
+    if is_quoted(s) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Pull a trailing `LIKE '<pattern>'` — or Spark's shorthand bare `'<pattern>'` with no `LIKE`
+/// keyword (e.g. `SHOW TABLES 'show_t*'`) — off the end of a SHOW statement's remaining tokens.
+/// Returns the unquoted pattern (if present) and the tokens that remain before it.
+fn take_trailing_like<'a>(rest: &'a [&'a str]) -> (Option<String>, &'a [&'a str]) {
+    match rest {
+        [head @ .., like_kw, pat] if like_kw.eq_ignore_ascii_case("like") => {
+            (Some(strip_quotes(pat)), head)
+        }
+        [head @ .., pat] if is_quoted(pat) => (Some(strip_quotes(pat)), head),
+        _ => (None, rest),
+    }
+}
+
+/// SQL `LIKE` glob match (`%` = any run of chars, `_` = exactly one char), case-sensitive — the
+/// filter every SHOW `LIKE '<pattern>'` clause applies to table/view/function names (see
+/// [`ShowStmt::Tables`]/[`ShowStmt::Views`]/[`ShowStmt::Functions`]). Classic two-pointer wildcard
+/// matching with backtracking on `%`, operating on `char`s so multi-byte names aren't corrupted.
+fn sql_like_match(pattern: &str, s: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut backtrack: Option<(usize, usize)> = None; // (pattern pos after '%', text pos '%' started matching at)
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            backtrack = Some((pi + 1, ti));
+            pi += 1;
+        } else if let Some((bp, bt)) = backtrack {
+            pi = bp;
+            ti = bt + 1;
+            backtrack = Some((bp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// A parsed `DESCRIBE`/`DESC` statement (see [`parse_describe`]). Mirrors [`ShowStmt`]'s shape and
+/// interception pattern.
+#[derive(Debug, PartialEq, Eq)]
+enum DescribeStmt {
+    /// `DESCRIBE|DESC [TABLE] [EXTENDED|FORMATTED] <table>[ PARTITION (k=v, …)][ AS JSON]` — the
+    /// common case. `partition` is parsed (so it doesn't break tokenization) but not yet reflected
+    /// in the result, matching [`parse_show_table_extended`]'s precedent for an accepted-but-not-
+    /// filtered trailing clause.
+    Table {
+        name: String,
+        extended: bool,
+        partition: Option<Vec<(String, String)>>,
+        as_json: bool,
+    },
+    /// `DESCRIBE|DESC QUERY <select>`, or a bare `DESCRIBE|DESC <select>` recognized because the
+    /// statement starts with a query keyword (`SELECT`/`WITH`/`VALUES`) rather than a table name.
+    Query { stmt: String },
+    /// `DESCRIBE|DESC DATABASE|SCHEMA [EXTENDED] [<catalog>.]<name>`.
+    Database {
+        catalog: Option<String>,
+        name: String,
+    },
+    /// `DESCRIBE|DESC CATALOG <name>`.
+    Catalog { name: String },
+    /// `DESCRIBE|DESC FUNCTION [EXTENDED] <name>`.
+    Function { name: String, extended: bool },
+}
+
+/// Recognize the `DESCRIBE`/`DESC` statements weft answers itself, returning `None` for anything
+/// else (so it flows through normal planning untouched — never a regression for a form this
+/// doesn't cover). Tolerant by design, matching [`parse_show`]'s conventions: keywords are
+/// case-insensitive, a trailing `;` and extra whitespace are ignored. Only intercepts a form once
+/// every trailing token is understood — any leftover, unrecognized tokens fall through rather than
+/// risk silently mis-parsing an exotic shape (e.g. Spark's unsupported
+/// `DESC FORMATTED t col AS JSON` per-column form).
+fn parse_describe(query: &str) -> Option<DescribeStmt> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    let kw = words.next()?;
+    if !(kw.eq_ignore_ascii_case("describe") || kw.eq_ignore_ascii_case("desc")) {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    let first = *rest.first()?;
+
+    if first.eq_ignore_ascii_case("database") || first.eq_ignore_ascii_case("schema") {
+        let mut i = 1;
+        if rest
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("extended"))
+        {
+            i += 1;
+        }
+        let name_tok = *rest.get(i)?;
+        if rest.get(i + 1).is_some() {
+            return None;
+        }
+        let mut segs = parse_qualified_name(name_tok).into_iter();
+        let seg0 = segs.next()?;
+        return match segs.next() {
+            Some(seg1) if segs.next().is_none() => Some(DescribeStmt::Database {
+                catalog: Some(seg0),
+                name: seg1,
+            }),
+            None => Some(DescribeStmt::Database {
+                catalog: None,
+                name: seg0,
+            }),
+            _ => None,
+        };
+    }
+    if first.eq_ignore_ascii_case("catalog") {
+        return match rest[1..] {
+            [name] => Some(DescribeStmt::Catalog {
+                name: name.to_string(),
+            }),
+            _ => None,
+        };
+    }
+    if first.eq_ignore_ascii_case("function") {
+        let mut i = 1;
+        let mut extended = false;
+        if rest
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("extended"))
+        {
+            extended = true;
+            i += 1;
+        }
+        return match rest[i..] {
+            [name] => Some(DescribeStmt::Function {
+                name: name.to_string(),
+                extended,
+            }),
+            _ => None,
+        };
+    }
+    if first.eq_ignore_ascii_case("query") {
+        let stmt = rest[1..].join(" ");
+        return (!stmt.is_empty()).then_some(DescribeStmt::Query { stmt });
+    }
+    if first.eq_ignore_ascii_case("select")
+        || first.eq_ignore_ascii_case("with")
+        || first.eq_ignore_ascii_case("values")
+    {
+        return Some(DescribeStmt::Query {
+            stmt: rest.join(" "),
+        });
+    }
+
+    // `[TABLE] [EXTENDED|FORMATTED] <table>[ PARTITION (…)][ AS JSON]`.
+    let mut i = 0;
+    if rest.get(i).is_some_and(|t| t.eq_ignore_ascii_case("table")) {
+        i += 1;
+    }
+    let mut extended = false;
+    if rest
+        .get(i)
+        .is_some_and(|t| t.eq_ignore_ascii_case("extended") || t.eq_ignore_ascii_case("formatted"))
+    {
+        extended = true;
+        i += 1;
+    }
+    let name = (*rest.get(i)?).to_string();
+    i += 1;
+    let spaced = rest[i..].join(" ").replace('(', " ( ").replace(')', " ) ");
+    let ptoks: Vec<&str> = spaced.split_whitespace().collect();
+    let mut j = 0;
+    let mut partition = None;
+    if ptoks
+        .first()
+        .is_some_and(|t| t.eq_ignore_ascii_case("partition"))
+        && ptoks.get(1) == Some(&"(")
+    {
+        let close = ptoks.iter().position(|t| *t == ")")?;
+        partition = Some(parse_partition_spec_tokens(&ptoks[2..close]));
+        j = close + 1;
+    }
+    let mut as_json = false;
+    if ptoks.get(j).is_some_and(|t| t.eq_ignore_ascii_case("as"))
+        && ptoks
+            .get(j + 1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("json"))
+    {
+        as_json = true;
+        j += 2;
+    }
+    if j != ptoks.len() {
+        // Leftover tokens weft doesn't understand (e.g. a per-column `DESC ... col AS JSON`) —
+        // don't guess, fall through untouched.
+        return None;
+    }
+    Some(DescribeStmt::Table {
+        name,
+        extended,
+        partition,
+        as_json,
+    })
+}
+
+/// A parsed `USE` statement (see [`parse_use`]).
+#[derive(Debug, PartialEq, Eq)]
+enum UseStmt {
+    /// `USE CATALOG <catalog>` — switch only the current catalog, namespace unchanged.
+    Catalog { catalog: String },
+    /// `USE <namespace>` (current catalog unchanged) or `USE <catalog>.<namespace>` (switches
+    /// both). Spark's default `USE <db>` behavior: a single unqualified segment changes only the
+    /// current database within the current catalog.
+    Namespace {
+        catalog: Option<String>,
+        namespace: Vec<String>,
+    },
+}
+
+/// Recognize `USE` statements, returning `None` for anything else (so it flows through normal
+/// planning untouched). Tolerant by design, following [`parse_show`]'s conventions: keywords are
+/// case-insensitive, identifiers may be backtick-quoted or bare, a trailing `;` and extra
+/// whitespace are ignored.
+///
+/// Recognized forms:
+/// - `USE CATALOG <catalog>` — catalog switch only.
+/// - `USE <catalog>.<namespace>` — a dotted name switches both catalog and namespace.
+/// - `USE <namespace>` — a single unqualified segment switches only the current namespace,
+///   matching Spark's `USE <db>`.
+fn parse_use(query: &str) -> Option<UseStmt> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("use") {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    match rest.as_slice() {
+        [kw, name] if kw.eq_ignore_ascii_case("catalog") => Some(UseStmt::Catalog {
+            catalog: parse_qualified_name(name).into_iter().next()?,
+        }),
+        [name] => {
+            let mut segs = parse_qualified_name(name).into_iter();
+            let first = segs.next()?;
+            match segs.next() {
+                // `USE <catalog>.<namespace...>` — everything after the first segment is the
+                // (possibly multi-part) namespace.
+                Some(second) => {
+                    let mut namespace = vec![second];
+                    namespace.extend(segs);
+                    Some(UseStmt::Namespace {
+                        catalog: Some(first),
+                        namespace,
+                    })
+                }
+                // `USE <namespace>` — current catalog unchanged.
+                None => Some(UseStmt::Namespace {
+                    catalog: None,
+                    namespace: vec![first],
+                }),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2325,31 +3578,132 @@ fn parse_qualified_name(name: &str) -> Vec<String> {
     segments.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
-/// Single-column `namespace` (Utf8) batch for the `SHOW DATABASES`/`SHOW SCHEMAS` forms.
-fn namespace_batch(namespaces: Vec<String>) -> Result<RecordBatch> {
+/// Normalize a `CREATE TABLE` statement's (possibly qualified, possibly backtick-quoted) name into
+/// the bare-table-name key `Engine::created_tables` is keyed by. Every lookup
+/// (`created_table_meta`) resolves its input through [`parse_qualified_name`] +
+/// [`Engine::resolve_table_ref`], which keeps only the final (unquoted) segment — so the insert
+/// side must strip backticks/qualification the same way, or `SHOW CREATE TABLE`/`SHOW
+/// TBLPROPERTIES`/`DESCRIBE EXTENDED` on a backtick-quoted or qualified `CREATE TABLE` name would
+/// silently miss the entry keyed by the raw, unnormalized source span.
+fn created_table_key(name: &str) -> String {
+    parse_qualified_name(name).pop().unwrap_or_default()
+}
+
+/// Single-column `Utf8` (non-null) batch — the shape shared by every SHOW form whose result is
+/// one bare name per row (`SHOW DATABASES`'s `namespace`, `SHOW CATALOGS`'s `catalog`,
+/// `SHOW COLUMNS`'s `col_name`, `SHOW PARTITIONS`'s `partition`, `SHOW FUNCTIONS`'s `function`,
+/// and `SHOW CREATE TABLE`'s single-row `createtab_stmt`).
+fn single_col_batch(field_name: &str, values: Vec<String>) -> Result<RecordBatch> {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     let schema = Arc::new(Schema::new(vec![Field::new(
-        "namespace",
+        field_name,
         DataType::Utf8,
         false,
     )]));
-    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(namespaces))])
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))])
         .map_err(|e| Error::Execution(e.to_string()))
 }
 
-/// Three-column `namespace`/`tableName`/`isTemporary` batch matching Spark's `SHOW TABLES`.
-fn tables_batch(rows: Vec<(String, String)>) -> Result<RecordBatch> {
+/// Single-column `namespace` (Utf8) batch for the `SHOW DATABASES`/`SHOW SCHEMAS` forms.
+fn namespace_batch(namespaces: Vec<String>) -> Result<RecordBatch> {
+    single_col_batch("namespace", namespaces)
+}
+
+/// Generic two-column `Utf8` (non-null) batch, column names given by the caller — shared by
+/// `SHOW TBLPROPERTIES` ([`key_value_batch`]'s `key`/`value`) and `DESCRIBE DATABASE`/
+/// `DESCRIBE CATALOG` ([`Engine::run_describe`]'s `info_name`/`info_value`).
+fn two_col_batch(col1: &str, col2: &str, rows: Vec<(String, String)>) -> Result<RecordBatch> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(col1, DataType::Utf8, false),
+        Field::new(col2, DataType::Utf8, false),
+    ]));
+    let firsts: Vec<String> = rows.iter().map(|(a, _)| a.clone()).collect();
+    let seconds: Vec<String> = rows.iter().map(|(_, b)| b.clone()).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(firsts)),
+            Arc::new(StringArray::from(seconds)),
+        ],
+    )
+    .map_err(|e| Error::Execution(e.to_string()))
+}
+
+/// Two-column `key`/`value` (Utf8) batch — `SHOW TBLPROPERTIES`.
+fn key_value_batch(rows: Vec<(String, String)>) -> Result<RecordBatch> {
+    two_col_batch("key", "value", rows)
+}
+
+/// Three-column `col_name`/`data_type`/`comment` (Utf8) batch — Spark's `DESCRIBE`/`DESC` shape,
+/// shared by [`DescribeStmt::Table`]'s plain/`EXTENDED` column listing and [`DescribeStmt::Query`].
+fn describe_batch(rows: Vec<(String, String, String)>) -> Result<RecordBatch> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("comment", DataType::Utf8, false),
+    ]));
+    let names: Vec<String> = rows.iter().map(|(n, _, _)| n.clone()).collect();
+    let types: Vec<String> = rows.iter().map(|(_, t, _)| t.clone()).collect();
+    let comments: Vec<String> = rows.iter().map(|(_, _, c)| c.clone()).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(types)),
+            Arc::new(StringArray::from(comments)),
+        ],
+    )
+    .map_err(|e| Error::Execution(e.to_string()))
+}
+
+/// Render a table-properties map as Spark's `[k=v, k2=v2]` bracketed, sorted-key display string —
+/// shared by `SHOW TABLE EXTENDED`'s `information` blob and `DESCRIBE EXTENDED`'s
+/// `Table Properties` row.
+fn format_properties(properties: &HashMap<String, String>) -> String {
+    let mut kv: Vec<String> = properties
+        .iter()
+        .map(|(k, v)| format!("{k}={}", redact_property_value(k, v)))
+        .collect();
+    kv.sort();
+    kv.join(", ")
+}
+
+/// Spark redacts any table-property (or `OPTIONS`) value whose *key* matches its default
+/// sensitive-config regex (`spark.sql.redaction.string.regex`, which defaults to
+/// `(?i)secret|password`) before it can appear in `SHOW CREATE TABLE`/`SHOW TBLPROPERTIES`/
+/// `DESCRIBE EXTENDED` output — otherwise a `TBLPROPERTIES ('password' = '...')` on a table
+/// would leak the literal credential back out through any of those statements. Golden:
+/// `spark-tests/results/show-tblproperties.sql.out` (`password\t*********(redacted)`).
+fn redact_property_value(key: &str, value: &str) -> String {
+    let k = key.to_ascii_lowercase();
+    if k.contains("secret") || k.contains("password") {
+        "*********(redacted)".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Three-column `namespace`/`<name_col>`/`isTemporary` batch shared by `SHOW TABLES`
+/// (`tableName`) and `SHOW VIEWS` (`viewName`).
+fn namespace_name_temp_batch(
+    name_col: &str,
+    rows: Vec<(String, String, bool)>,
+) -> Result<RecordBatch> {
     use arrow::array::{BooleanArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     let schema = Arc::new(Schema::new(vec![
         Field::new("namespace", DataType::Utf8, false),
-        Field::new("tableName", DataType::Utf8, false),
+        Field::new(name_col, DataType::Utf8, false),
         Field::new("isTemporary", DataType::Boolean, false),
     ]));
-    let namespaces: Vec<String> = rows.iter().map(|(ns, _)| ns.clone()).collect();
-    let names: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
-    let temp: Vec<bool> = vec![false; rows.len()];
+    let namespaces: Vec<String> = rows.iter().map(|(ns, _, _)| ns.clone()).collect();
+    let names: Vec<String> = rows.iter().map(|(_, n, _)| n.clone()).collect();
+    let temp: Vec<bool> = rows.iter().map(|(_, _, t)| *t).collect();
     RecordBatch::try_new(
         schema,
         vec![
@@ -2359,6 +3713,245 @@ fn tables_batch(rows: Vec<(String, String)>) -> Result<RecordBatch> {
         ],
     )
     .map_err(|e| Error::Execution(e.to_string()))
+}
+
+/// Three-column `namespace`/`tableName`/`isTemporary` batch matching Spark's `SHOW TABLES`.
+fn tables_batch(rows: Vec<(String, String)>) -> Result<RecordBatch> {
+    namespace_name_temp_batch(
+        "tableName",
+        rows.into_iter().map(|(ns, t)| (ns, t, false)).collect(),
+    )
+}
+
+/// Three-column `namespace`/`viewName`/`isTemporary` batch matching Spark's `SHOW VIEWS`.
+fn views_batch(rows: Vec<(String, String, bool)>) -> Result<RecordBatch> {
+    namespace_name_temp_batch("viewName", rows)
+}
+
+/// Four-column `namespace`/`tableName`/`isTemporary`/`information` batch — `SHOW TABLE EXTENDED`.
+fn table_extended_batch(rows: Vec<(String, String, bool, String)>) -> Result<RecordBatch> {
+    use arrow::array::{BooleanArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("namespace", DataType::Utf8, false),
+        Field::new("tableName", DataType::Utf8, false),
+        Field::new("isTemporary", DataType::Boolean, false),
+        Field::new("information", DataType::Utf8, false),
+    ]));
+    let namespaces: Vec<String> = rows.iter().map(|(ns, _, _, _)| ns.clone()).collect();
+    let names: Vec<String> = rows.iter().map(|(_, n, _, _)| n.clone()).collect();
+    let temp: Vec<bool> = rows.iter().map(|(_, _, t, _)| *t).collect();
+    let info: Vec<String> = rows.iter().map(|(_, _, _, i)| i.clone()).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(namespaces)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(BooleanArray::from(temp)),
+            Arc::new(StringArray::from(info)),
+        ],
+    )
+    .map_err(|e| Error::Execution(e.to_string()))
+}
+
+/// Lowercase provider name for a [`weft_catalog::TableFormat`], as `USING <fmt>` renders it.
+fn table_format_str(fmt: weft_catalog::TableFormat) -> &'static str {
+    use weft_catalog::TableFormat;
+    match fmt {
+        TableFormat::Parquet => "parquet",
+        TableFormat::Delta => "delta",
+        TableFormat::Iceberg => "iceberg",
+        TableFormat::Csv => "csv",
+        TableFormat::Json => "json",
+    }
+}
+
+/// Spark DDL type-name spelling for an Arrow [`DataType`](arrow::datatypes::DataType) — the column
+/// type syntax Spark's own `CREATE TABLE`/`SHOW CREATE TABLE` use (`INT`, `STRING`, `DECIMAL(p,s)`,
+/// `ARRAY<…>`, …). Used only by [`reconstruct_create_table_ddl`]; nested container types are
+/// rendered with the same recursive shape Spark uses, though exact nested-type formatting isn't
+/// pursued byte-for-byte (structural correctness is what `SHOW CREATE TABLE` needs — see
+/// `spark-tests/results/show-create-table.sql.out`).
+fn spark_ddl_type(dt: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 | DataType::UInt8 => "TINYINT".to_string(),
+        DataType::Int16 | DataType::UInt16 => "SMALLINT".to_string(),
+        DataType::Int32 | DataType::UInt32 => "INT".to_string(),
+        DataType::Int64 | DataType::UInt64 => "BIGINT".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "STRING".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "BINARY".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMP".to_string(),
+        DataType::Timestamp(_, None) => "TIMESTAMP_NTZ".to_string(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("DECIMAL({p},{s})"),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _) => format!("ARRAY<{}>", spark_ddl_type(f.data_type())),
+        DataType::Struct(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), spark_ddl_type(f.data_type())))
+                .collect();
+            format!("STRUCT<{}>", inner.join(","))
+        }
+        DataType::Map(entry, _) => match entry.data_type() {
+            DataType::Struct(kv) if kv.len() == 2 => format!(
+                "MAP<{},{}>",
+                spark_ddl_type(kv[0].data_type()),
+                spark_ddl_type(kv[1].data_type())
+            ),
+            _ => "MAP<STRING,STRING>".to_string(),
+        },
+        other => format!("{other:?}").to_uppercase(),
+    }
+}
+
+/// Reconstruct a Spark-shaped `CREATE TABLE …` DDL string for `SHOW CREATE TABLE`
+/// (`ShowStmt::CreateTable`) and — later — `DESCRIBE TABLE EXTENDED`. Pure formatting: every input
+/// is already resolved (qualified name, Arrow schema, format string, partition columns, an
+/// optional explicit location, an optional comment, and properties), so this has no I/O and can be
+/// shared by both call sites without either owning catalog access.
+///
+/// Matches the general shape of Spark's `SHOW CREATE TABLE` output (see
+/// `spark-tests/results/show-create-table.sql.out`): one column per line, `USING <fmt>`, then
+/// `PARTITIONED BY`/`LOCATION`/`COMMENT`/`TBLPROPERTIES` each on their own line when present.
+/// Exact byte-for-byte Spark formatting isn't attempted — properties are rendered in sorted-key
+/// order for determinism (Spark preserves declaration order, which weft doesn't track).
+fn reconstruct_create_table_ddl(
+    qualified_name: &str,
+    schema: &arrow::datatypes::Schema,
+    format: &str,
+    partition_columns: &[String],
+    location: Option<&str>,
+    comment: Option<&str>,
+    properties: &HashMap<String, String>,
+) -> String {
+    let mut out = format!("CREATE TABLE {qualified_name} (\n");
+    let cols: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("  {} {}", f.name(), spark_ddl_type(f.data_type())))
+        .collect();
+    out.push_str(&cols.join(",\n"));
+    out.push_str(")\n");
+    out.push_str(&format!("USING {}\n", format.to_lowercase()));
+    if !partition_columns.is_empty() {
+        out.push_str(&format!(
+            "PARTITIONED BY ({})\n",
+            partition_columns.join(", ")
+        ));
+    }
+    if let Some(loc) = location {
+        out.push_str(&format!("LOCATION '{}'\n", loc.replace('\'', "\\'")));
+    }
+    if let Some(c) = comment {
+        out.push_str(&format!("COMMENT '{}'\n", c.replace('\'', "\\'")));
+    }
+    if !properties.is_empty() {
+        let mut keys: Vec<&String> = properties.keys().collect();
+        keys.sort();
+        let body: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "  '{k}' = '{}'",
+                    redact_property_value(k, &properties[*k]).replace('\'', "\\'")
+                )
+            })
+            .collect();
+        out.push_str("TBLPROPERTIES (\n");
+        out.push_str(&body.join(",\n"));
+        out.push_str(")\n");
+    }
+    out.trim_end().to_string()
+}
+
+/// Best-effort hive-style partition directory listing under `location`, filtered by `spec` (a
+/// `PARTITION (k=v, …)` clause, possibly a subset of `partition_columns`) — backs
+/// `ShowStmt::Partitions` for catalog-backed (Hive/Glue) partitioned tables. Local filesystem only
+/// (`file://`/bare paths); any other scheme (`s3://`, `hdfs://`, …) returns empty rather than
+/// erroring, matching `SHOW PARTITIONS`'s "empty, not an error" contract for anything v1 can't
+/// introspect yet.
+fn list_hive_partitions(
+    location: &str,
+    partition_columns: &[String],
+    spec: &[(String, String)],
+) -> Vec<String> {
+    let Some(root) = local_fs_path(location) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk_hive_partitions(&root, partition_columns, spec, &mut Vec::new(), &mut out);
+    out.sort();
+    out
+}
+
+/// Convert a storage URI to a local filesystem path, or `None` for a scheme that isn't locally
+/// listable (`s3://`, `hdfs://`, …). Handles both `file:///abs` (RFC form) and Hive's `file:/abs`
+/// (single-slash, as the Metastore returns it), as well as bare paths.
+fn local_fs_path(location: &str) -> Option<PathBuf> {
+    if let Some(rest) = location.strip_prefix("file://") {
+        return Some(PathBuf::from(rest));
+    }
+    if let Some(rest) = location.strip_prefix("file:") {
+        return Some(PathBuf::from(rest));
+    }
+    if location.contains("://") {
+        return None;
+    }
+    Some(PathBuf::from(location))
+}
+
+/// Recursively descend `dir` exactly `remaining_cols.len()` levels, expecting each level to be a
+/// `key=value` directory name; pushes one `/`-joined `col1=v1/col2=v2/…` string per matching leaf
+/// onto `out`. A `spec` entry restricts that column's level to the matching value; directories that
+/// don't parse as `key=value` (or whose key doesn't match the expected column) are skipped.
+fn walk_hive_partitions(
+    dir: &std::path::Path,
+    remaining_cols: &[String],
+    spec: &[(String, String)],
+    acc: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    let Some((col, rest_cols)) = remaining_cols.split_first() else {
+        out.push(acc.join("/"));
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((k, v)) = name.split_once('=') else {
+            continue;
+        };
+        if !k.eq_ignore_ascii_case(col) {
+            continue;
+        }
+        if let Some((_, want)) = spec.iter().find(|(sk, _)| sk.eq_ignore_ascii_case(col)) {
+            if want != v {
+                continue;
+            }
+        }
+        acc.push(format!("{k}={v}"));
+        walk_hive_partitions(&entry.path(), rest_cols, spec, acc, out);
+        acc.pop();
+    }
 }
 
 /// Build a DataFusion [`ListingTable`] over `urls` — the one place the Parquet/Delta/Iceberg
@@ -2420,6 +4013,579 @@ mod tests {
         let batches = engine.sql("SELECT 1 AS x").await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn default_current_catalog_and_namespace() {
+        let engine = Engine::new();
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "spark_catalog");
+        assert_eq!(namespace, vec!["default".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn use_namespace_updates_current_namespace() {
+        let engine = Engine::new();
+        let batches = engine.sql("USE somedb").await.unwrap();
+        assert!(batches.is_empty(), "USE should yield no batches");
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        // Current catalog is unchanged (bare `USE <db>` only switches the namespace).
+        assert_eq!(catalog, "spark_catalog");
+        assert_eq!(namespace, vec!["somedb".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn use_unknown_catalog_errors() {
+        let engine = Engine::new();
+        let err = engine.sql("USE nonexistent_catalog.x").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Plan(_)),
+            "expected a Plan error, got {err:?}"
+        );
+        // Current catalog/namespace are unchanged after the failed USE.
+        let (catalog, namespace) = engine.current_catalog_and_namespace();
+        assert_eq!(catalog, "spark_catalog");
+        assert_eq!(namespace, vec!["default".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn create_table_using_records_comment_and_tblproperties() {
+        let engine = Engine::new();
+        let batches = engine
+            .sql("CREATE TABLE t(a int) USING parquet COMMENT 'hi' TBLPROPERTIES ('k'='v')")
+            .await
+            .unwrap();
+        assert!(batches.is_empty(), "CREATE should yield no batches");
+        let meta = engine
+            .created_table_meta("t")
+            .expect("created_table_meta should find t");
+        assert_eq!(meta.format, "parquet");
+        assert_eq!(meta.comment, Some("hi".to_string()));
+        assert_eq!(meta.properties.get("k").map(String::as_str), Some("v"));
+    }
+
+    /// The core `SHOW CREATE TABLE` bug fix: previously any `SHOW CREATE TABLE` fell through to
+    /// DataFusion's planner and died on "SHOW CREATE TABLE is not supported unless
+    /// information_schema is enabled" (see the plan doc this lands from). It must now round-trip a
+    /// `CREATE TABLE … USING parquet … COMMENT … TBLPROPERTIES (…)` table into a single
+    /// `createtab_stmt` column reconstructing the DDL, matching
+    /// `spark-tests/results/show-create-table.sql.out`'s general shape.
+    #[tokio::test]
+    async fn show_create_table_reconstructs_ddl() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE t(a INT, b STRING) USING parquet COMMENT 'hi' TBLPROPERTIES ('k'='v')")
+            .await
+            .unwrap();
+        let batches = engine.sql("SHOW CREATE TABLE t").await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "createtab_stmt");
+        let ddl = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert!(
+            ddl.starts_with("CREATE TABLE spark_catalog.default.t ("),
+            "ddl was: {ddl}"
+        );
+        assert!(ddl.contains("a INT"), "ddl was: {ddl}");
+        assert!(ddl.contains("b STRING"), "ddl was: {ddl}");
+        assert!(ddl.contains("USING parquet"), "ddl was: {ddl}");
+        assert!(ddl.contains("COMMENT 'hi'"), "ddl was: {ddl}");
+        assert!(ddl.contains("TBLPROPERTIES"), "ddl was: {ddl}");
+        assert!(ddl.contains("'k' = 'v'"), "ddl was: {ddl}");
+    }
+
+    /// Regression test: `created_tables` must be keyed the same way `created_table_meta` looks it
+    /// up (bare, unquoted table name) — a backtick-quoted `CREATE TABLE` name used to be stored
+    /// under its raw source span (`` `t2` ``), so a following `SHOW CREATE TABLE`/`SHOW
+    /// TBLPROPERTIES t2` (unquoted lookup) would miss the entry and wrongly report
+    /// `TABLE_OR_VIEW_NOT_FOUND` even though the table exists and its COMMENT/TBLPROPERTIES were
+    /// captured at CREATE time.
+    #[tokio::test]
+    async fn show_create_table_finds_backtick_quoted_created_table() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE `t2`(a INT) USING parquet COMMENT 'hey'")
+            .await
+            .unwrap();
+        let batches = engine.sql("SHOW CREATE TABLE t2").await.unwrap();
+        let ddl = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert!(ddl.contains("COMMENT 'hey'"), "ddl was: {ddl}");
+
+        let props = engine.sql("SHOW TBLPROPERTIES t2").await.unwrap();
+        assert_eq!(props[0].num_rows(), 0, "no TBLPROPERTIES were set");
+    }
+
+    /// `SHOW CREATE TABLE` on an unknown table returns a clean `TABLE_OR_VIEW_NOT_FOUND`-style
+    /// plan error rather than falling through to DataFusion's broken `information_schema` error.
+    #[tokio::test]
+    async fn show_create_table_unknown_table_errors_cleanly() {
+        let engine = Engine::new();
+        let err = engine.sql("SHOW CREATE TABLE nope").await.unwrap_err();
+        assert!(
+            matches!(err, Error::Plan(_)),
+            "expected a Plan error, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("TABLE_OR_VIEW_NOT_FOUND"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `SHOW TBLPROPERTIES` answers from the locally captured `TBLPROPERTIES (…)` for a
+    /// `CREATE TABLE … USING` table, both for the bare (list-all) and single-key forms.
+    #[tokio::test]
+    async fn show_tblproperties_lists_and_looks_up_local_table() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE t(a INT) USING parquet TBLPROPERTIES ('k'='v', 'k2'='v2')")
+            .await
+            .unwrap();
+
+        let all = engine.sql("SHOW TBLPROPERTIES t").await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].schema().field(0).name(), "key");
+        assert_eq!(all[0].schema().field(1).name(), "value");
+        let keys = all[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = all[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: std::collections::HashMap<String, String> = (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect();
+        assert_eq!(got.get("k").map(String::as_str), Some("v"));
+        assert_eq!(got.get("k2").map(String::as_str), Some("v2"));
+
+        let one = engine.sql("SHOW TBLPROPERTIES t('k')").await.unwrap();
+        assert_eq!(one[0].num_rows(), 1);
+        let key = one[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        let value = one[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(key, "k");
+        assert_eq!(value, "v");
+
+        // A missing key doesn't error — Spark reports it as the property's own "value".
+        let missing = engine.sql("SHOW TBLPROPERTIES t('nope')").await.unwrap();
+        let missing_value = missing[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert!(
+            missing_value.contains("does not have property"),
+            "unexpected value: {missing_value}"
+        );
+    }
+
+    /// Two corpus-caught bugs in the `TBLPROPERTIES(…)` path, exercised together since they're on
+    /// the same statement: (1) `spark-tests/inputs/show-tblproperties.sql` declares
+    /// `TBLPROPERTIES('p1'='v1', password = 'password')` with `password` as a *bare* (unquoted)
+    /// key — `parse_properties` used to require every key to be a quoted string literal and
+    /// silently stopped parsing at the first bare key, dropping it and everything after it. (2)
+    /// Spark redacts any property whose key matches `password`/`secret` (case-insensitively) to
+    /// `*********(redacted)` in both `SHOW TBLPROPERTIES` and `SHOW CREATE TABLE`'s
+    /// `TBLPROPERTIES (...)` clause, so a credential never round-trips back out in plaintext.
+    #[tokio::test]
+    async fn show_tblproperties_parses_bare_keys_and_redacts_secrets() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE t(a INT) USING parquet TBLPROPERTIES ('p1'='v1', password = 'password', secretKey = 'shh')")
+            .await
+            .unwrap();
+
+        let all = engine.sql("SHOW TBLPROPERTIES t").await.unwrap();
+        let keys = all[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = all[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: std::collections::HashMap<String, String> = (0..keys.len())
+            .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+            .collect();
+        // The bare key was parsed at all (not dropped) …
+        assert_eq!(got.get("p1").map(String::as_str), Some("v1"));
+        assert!(got.contains_key("password"), "got {got:?}");
+        assert!(got.contains_key("secretKey"), "got {got:?}");
+        // … and its value is redacted, not the literal secret.
+        assert_eq!(
+            got.get("password").map(String::as_str),
+            Some("*********(redacted)")
+        );
+        assert_eq!(
+            got.get("secretKey").map(String::as_str),
+            Some("*********(redacted)")
+        );
+
+        let ddl = engine.sql("SHOW CREATE TABLE t").await.unwrap();
+        let ddl_str = ddl[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert!(ddl_str.contains("'p1' = 'v1'"), "ddl was: {ddl_str}");
+        assert!(
+            ddl_str.contains("'password' = '*********(redacted)'"),
+            "ddl was: {ddl_str}"
+        );
+        assert!(
+            !ddl_str.contains("'password' = 'password'"),
+            "ddl leaked the secret: {ddl_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_catalogs_includes_spark_catalog() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        let batches = engine.sql("SHOW CATALOGS").await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "catalog");
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert!(got.contains(&"spark_catalog"), "got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn show_tables_bare_and_like_filter_local_tables() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE show_t1(a INT) USING parquet")
+            .await
+            .unwrap();
+        engine
+            .sql("CREATE TABLE show_t2(a INT) USING parquet")
+            .await
+            .unwrap();
+        engine
+            .sql("CREATE TABLE other(a INT) USING parquet")
+            .await
+            .unwrap();
+
+        let all = engine.sql("SHOW TABLES").await.unwrap();
+        let names = all[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert!(got.contains(&"show_t1"), "got {got:?}");
+        assert!(got.contains(&"other"), "got {got:?}");
+
+        let filtered = engine.sql("SHOW TABLES LIKE 'show_t%'").await.unwrap();
+        let names = filtered[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert!(got.contains(&"show_t1") && got.contains(&"show_t2"));
+        assert!(!got.contains(&"other"), "got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn show_columns_lists_schema_field_names() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE cols_t(a INT, b STRING) USING parquet")
+            .await
+            .unwrap();
+        let batches = engine.sql("SHOW COLUMNS IN cols_t").await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "col_name");
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert_eq!(got, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn show_functions_includes_builtin_and_udf() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        let batches = engine.sql("SHOW FUNCTIONS").await.unwrap();
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert!(
+            got.contains(&"upper") || got.contains(&"abs"),
+            "got {got:?}"
+        );
+    }
+
+    /// Plain `DESCRIBE TABLE` returns Spark's `col_name`/`data_type`/`comment` shape, previously
+    /// unreachable (fell through to DataFusion's own `column_name`/`data_type`/`is_nullable`
+    /// shape).
+    #[tokio::test]
+    async fn describe_table_lists_columns_spark_shape() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE desc_t(a INT, b STRING) USING parquet")
+            .await
+            .unwrap();
+        for q in ["DESCRIBE desc_t", "DESC TABLE desc_t", "DESC desc_t"] {
+            let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].schema().field(0).name(), "col_name");
+            assert_eq!(batches[0].schema().field(1).name(), "data_type");
+            assert_eq!(batches[0].schema().field(2).name(), "comment");
+            let names = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let types = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), "a");
+            assert_eq!(types.value(0), "int");
+            assert_eq!(names.value(1), "b");
+            assert_eq!(types.value(1), "string");
+        }
+    }
+
+    /// `DESCRIBE TABLE EXTENDED` appends the `# Detailed Table Information` block, populating the
+    /// fields weft can answer (Catalog/Database/Table/Type/Provider/Comment/Table Properties) from
+    /// the `created_tables` registry — reusing the same metadata `SHOW CREATE TABLE` reads.
+    #[tokio::test]
+    async fn describe_table_extended_includes_detailed_information() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE ext_t(a INT) USING parquet COMMENT 'hi' TBLPROPERTIES ('k'='v')")
+            .await
+            .unwrap();
+        for q in ["DESCRIBE EXTENDED ext_t", "DESC FORMATTED ext_t"] {
+            let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+            let names = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let rows: Vec<(String, String)> = (0..names.len())
+                .map(|i| (names.value(i).to_string(), values.value(i).to_string()))
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|(k, _)| k == "# Detailed Table Information"),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Catalog".to_string(), "spark_catalog".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Database".to_string(), "default".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Table".to_string(), "ext_t".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Type".to_string(), "MANAGED".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Provider".to_string(), "parquet".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Comment".to_string(), "hi".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+            assert!(
+                rows.contains(&("Table Properties".to_string(), "[k=v]".to_string())),
+                "{q}: rows were {rows:?}"
+            );
+        }
+    }
+
+    /// `DESC TABLE ... AS JSON` without `EXTENDED` is Spark's `DESCRIBE_JSON_NOT_EXTENDED` error;
+    /// with `EXTENDED` it returns a single `json_metadata` column.
+    #[tokio::test]
+    async fn describe_table_as_json_requires_extended() {
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE json_t(a INT) USING parquet")
+            .await
+            .unwrap();
+        let err = engine.sql("DESC json_t AS JSON").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("DESCRIBE_JSON_NOT_EXTENDED"),
+            "unexpected error: {err}"
+        );
+        let batches = engine.sql("DESC EXTENDED json_t AS JSON").await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "json_metadata");
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    /// `DESCRIBE QUERY <select>` / bare `DESC <select>` reuse `Engine::schema()` and report the
+    /// same Spark `col_name`/`data_type`/`comment` shape as `DESCRIBE TABLE`.
+    #[tokio::test]
+    async fn describe_query_reports_select_schema() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        for q in [
+            "DESCRIBE QUERY SELECT 1 AS x, 'a' AS y",
+            "DESC SELECT 1 AS x, 'a' AS y",
+        ] {
+            let batches = engine.sql(q).await.unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(batches[0].schema().field(0).name(), "col_name");
+            let names = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let types = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), "x");
+            assert_eq!(types.value(0), "int");
+            assert_eq!(names.value(1), "y");
+            assert_eq!(types.value(1), "string");
+        }
+    }
+
+    /// `DESCRIBE DATABASE`/`DESCRIBE CATALOG` — minimal `info_name`/`info_value` shape, using only
+    /// the fields weft actually knows.
+    #[tokio::test]
+    async fn describe_database_and_catalog_minimal_fields() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        let batches = engine.sql("DESCRIBE DATABASE default").await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "info_name");
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Namespace Name");
+
+        let err = engine
+            .sql("DESCRIBE DATABASE nonexistent_db_xyz")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)));
+
+        let batches = engine.sql("DESCRIBE CATALOG spark_catalog").await.unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "spark_catalog");
+    }
+
+    /// `DESCRIBE FUNCTION` reports session UDFs (with their SQL body) and built-ins (name + "N/A"
+    /// rather than a fabricated description); an unknown function errors.
+    #[tokio::test]
+    async fn describe_function_session_and_builtin() {
+        use arrow::array::{Array, StringArray};
+        let engine = Engine::new();
+        engine
+            .sql("CREATE FUNCTION my_add(x INT, y INT) RETURNS INT RETURN x + y")
+            .await
+            .unwrap();
+        let batches = engine.sql("DESCRIBE FUNCTION my_add").await.unwrap();
+        let rows: Vec<String> = (0..batches[0].num_rows())
+            .map(|i| {
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(i)
+                    .to_string()
+            })
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("my_add")), "{rows:?}");
+
+        let batches = engine.sql("DESCRIBE FUNCTION upper").await.unwrap();
+        let rows: Vec<String> = (0..batches[0].num_rows())
+            .map(|i| {
+                batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(i)
+                    .to_string()
+            })
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("N/A")), "{rows:?}");
+
+        let err = engine
+            .sql("DESCRIBE FUNCTION nonexistent_fn_xyz")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Plan(_)));
+    }
+
+    #[test]
+    fn sql_like_match_percent_and_underscore() {
+        assert!(sql_like_match("show_t%", "show_t1"));
+        assert!(sql_like_match("show_t%", "show_t2"));
+        assert!(!sql_like_match("show_t%", "other"));
+        assert!(sql_like_match("a_c", "abc"));
+        assert!(!sql_like_match("a_c", "abbc"));
+        assert!(sql_like_match("%", "anything"));
     }
 
     /// `CREATE TABLE … USING <fmt>` must lower to real, format-backed storage that round-trips

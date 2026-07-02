@@ -82,6 +82,12 @@ pub struct TableMetadata {
     pub storage_options: HashMap<String, String>,
     /// Partition column names (informational for v1; Parquet hive-partitioning is inferred).
     pub partition_columns: Vec<String>,
+    /// Table-level comment/description, when the catalog has one (e.g. Hive's table-level
+    /// comment field, Glue's `Description`). `None` when the source doesn't have one set.
+    pub comment: Option<String>,
+    /// Table properties / parameters (e.g. Hive's `parameters` map, Glue's `Parameters` map).
+    /// Empty when the source doesn't surface these.
+    pub properties: HashMap<String, String>,
 }
 
 impl TableMetadata {
@@ -94,6 +100,8 @@ impl TableMetadata {
             schema: None,
             storage_options: HashMap::new(),
             partition_columns: Vec::new(),
+            comment: None,
+            properties: HashMap::new(),
         }
     }
 
@@ -112,6 +120,18 @@ impl TableMetadata {
     /// Builder: attach partition columns.
     pub fn with_partition_columns(mut self, cols: Vec<String>) -> Self {
         self.partition_columns = cols;
+        self
+    }
+
+    /// Builder: attach a table-level comment/description.
+    pub fn with_comment(mut self, comment: Option<String>) -> Self {
+        self.comment = comment;
+        self
+    }
+
+    /// Builder: attach table properties/parameters.
+    pub fn with_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties = properties;
         self
     }
 }

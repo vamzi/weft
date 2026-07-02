@@ -164,11 +164,26 @@ impl CatalogProvider for GlueCatalog {
         let part_cols = t["PartitionKeys"].as_array();
         let schema = columns_to_schema(glue_column_pairs(data_cols, part_cols));
 
+        let comment = t["Description"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let properties: HashMap<String, String> = t["Parameters"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let md = TableMetadata::new(
             format!("{}.{db}.{table}", self.name),
             location.to_string(),
             format,
-        );
+        )
+        .with_comment(comment)
+        .with_properties(properties);
         Ok(match schema {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,
