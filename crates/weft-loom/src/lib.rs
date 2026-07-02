@@ -2409,7 +2409,9 @@ impl Engine {
                 let (cat, ns, tbl) = self.resolve_table_ref(&segments);
                 let qualified = format!("{cat}.{}.{tbl}", ns.join("."));
                 let props: HashMap<String, String> = if cat == weft_catalog::DEFAULT_CATALOG {
-                    self.created_table_meta(&tbl).map(|m| m.properties).unwrap_or_default()
+                    self.created_table_meta(&tbl)
+                        .map(|m| m.properties)
+                        .unwrap_or_default()
                 } else {
                     self.load_catalog_table(&cat, &ns, &tbl).await?.properties
                 };
@@ -2623,7 +2625,10 @@ impl Engine {
                         "table_properties": properties,
                         "partition_columns": partition_columns,
                     });
-                    return Ok(vec![single_col_batch("json_metadata", vec![json.to_string()])?]);
+                    return Ok(vec![single_col_batch(
+                        "json_metadata",
+                        vec![json.to_string()],
+                    )?]);
                 }
                 let mut rows: Vec<(String, String, String)> = schema
                     .fields()
@@ -2637,7 +2642,11 @@ impl Engine {
                     })
                     .collect();
                 if !partition_columns.is_empty() {
-                    rows.push(("# Partition Information".to_string(), String::new(), String::new()));
+                    rows.push((
+                        "# Partition Information".to_string(),
+                        String::new(),
+                        String::new(),
+                    ));
                     rows.push((
                         "# col_name".to_string(),
                         "data_type".to_string(),
@@ -2906,12 +2915,15 @@ impl Engine {
                 "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
             ))
         })?;
-        provider.load_table(namespace, table).await.map_err(|e| match e {
-            Error::Plan(_) => Error::Plan(format!(
-                "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
-            )),
-            other => other,
-        })
+        provider
+            .load_table(namespace, table)
+            .await
+            .map_err(|e| match e {
+                Error::Plan(_) => Error::Plan(format!(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{qualified}` cannot be found"
+                )),
+                other => other,
+            })
     }
 
     /// Look up the [`CreatedTableMeta`] captured for a table created locally via
@@ -2993,10 +3005,7 @@ enum ShowStmt {
         like: Option<String>,
     },
     /// `SHOW TBLPROPERTIES <table>[('key')]`.
-    TblProperties {
-        table: String,
-        key: Option<String>,
-    },
+    TblProperties { table: String, key: Option<String> },
     /// `SHOW TABLE EXTENDED [IN|FROM <database>] LIKE '<pattern>'[ PARTITION (…)]` (the trailing
     /// `PARTITION` clause is accepted but not yet reflected in the result — see
     /// [`parse_show_table_extended`]).
@@ -3102,9 +3111,7 @@ fn parse_show_tables(rest: &[&str]) -> Option<ShowStmt> {
             database: None,
             like,
         }),
-        [in_kw, name]
-            if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") =>
-        {
+        [in_kw, name] if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") => {
             let mut segs = parse_qualified_name(name).into_iter();
             let catalog = segs.next()?;
             let database = segs.next();
@@ -3121,7 +3128,9 @@ fn parse_show_tables(rest: &[&str]) -> Option<ShowStmt> {
 /// `SHOW COLUMNS IN|FROM <table>[ IN|FROM <namespace>]`.
 fn parse_show_columns(rest: &[&str]) -> Option<ShowStmt> {
     match rest {
-        [in_kw, table] if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") => {
+        [in_kw, table]
+            if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") =>
+        {
             Some(ShowStmt::Columns {
                 table: (*table).to_string(),
                 namespace: None,
@@ -3148,9 +3157,7 @@ fn parse_show_views(rest: &[&str]) -> Option<ShowStmt> {
             database: None,
             like,
         }),
-        [in_kw, name]
-            if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") =>
-        {
+        [in_kw, name] if in_kw.eq_ignore_ascii_case("in") || in_kw.eq_ignore_ascii_case("from") => {
             Some(ShowStmt::Views {
                 database: Some((*name).to_string()),
                 like,
@@ -3224,7 +3231,9 @@ fn parse_show_create_table(rest: &[&str]) -> Option<ShowStmt> {
         }),
         // `AS SERDE` (Hive-serde output format) isn't distinguished from the plain form — weft
         // has no serde-specific rendering, so both produce the same DDL reconstruction.
-        [as_kw, serde_kw] if as_kw.eq_ignore_ascii_case("as") && serde_kw.eq_ignore_ascii_case("serde") => {
+        [as_kw, serde_kw]
+            if as_kw.eq_ignore_ascii_case("as") && serde_kw.eq_ignore_ascii_case("serde") =>
+        {
             Some(ShowStmt::CreateTable {
                 table: (*table).to_string(),
             })
@@ -3377,7 +3386,10 @@ fn parse_describe(query: &str) -> Option<DescribeStmt> {
 
     if first.eq_ignore_ascii_case("database") || first.eq_ignore_ascii_case("schema") {
         let mut i = 1;
-        if rest.get(i).is_some_and(|t| t.eq_ignore_ascii_case("extended")) {
+        if rest
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("extended"))
+        {
             i += 1;
         }
         let name_tok = *rest.get(i)?;
@@ -3409,7 +3421,10 @@ fn parse_describe(query: &str) -> Option<DescribeStmt> {
     if first.eq_ignore_ascii_case("function") {
         let mut i = 1;
         let mut extended = false;
-        if rest.get(i).is_some_and(|t| t.eq_ignore_ascii_case("extended")) {
+        if rest
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("extended"))
+        {
             extended = true;
             i += 1;
         }
@@ -3449,14 +3464,14 @@ fn parse_describe(query: &str) -> Option<DescribeStmt> {
     }
     let name = (*rest.get(i)?).to_string();
     i += 1;
-    let spaced = rest[i..]
-        .join(" ")
-        .replace('(', " ( ")
-        .replace(')', " ) ");
+    let spaced = rest[i..].join(" ").replace('(', " ( ").replace(')', " ) ");
     let ptoks: Vec<&str> = spaced.split_whitespace().collect();
     let mut j = 0;
     let mut partition = None;
-    if ptoks.first().is_some_and(|t| t.eq_ignore_ascii_case("partition")) && ptoks.get(1) == Some(&"(")
+    if ptoks
+        .first()
+        .is_some_and(|t| t.eq_ignore_ascii_case("partition"))
+        && ptoks.get(1) == Some(&"(")
     {
         let close = ptoks.iter().position(|t| *t == ")")?;
         partition = Some(parse_partition_spec_tokens(&ptoks[2..close]));
@@ -3464,7 +3479,9 @@ fn parse_describe(query: &str) -> Option<DescribeStmt> {
     }
     let mut as_json = false;
     if ptoks.get(j).is_some_and(|t| t.eq_ignore_ascii_case("as"))
-        && ptoks.get(j + 1).is_some_and(|t| t.eq_ignore_ascii_case("json"))
+        && ptoks
+            .get(j + 1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("json"))
     {
         as_json = true;
         j += 2;
@@ -4247,7 +4264,10 @@ mod tests {
             ddl_str.contains("'password' = '*********(redacted)'"),
             "ddl was: {ddl_str}"
         );
-        assert!(!ddl_str.contains("'password' = 'password'"), "ddl leaked the secret: {ddl_str}");
+        assert!(
+            !ddl_str.contains("'password' = 'password'"),
+            "ddl leaked the secret: {ddl_str}"
+        );
     }
 
     #[tokio::test]
@@ -4333,7 +4353,10 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         let got: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
-        assert!(got.contains(&"upper") || got.contains(&"abs"), "got {got:?}");
+        assert!(
+            got.contains(&"upper") || got.contains(&"abs"),
+            "got {got:?}"
+        );
     }
 
     /// Plain `DESCRIBE TABLE` returns Spark's `col_name`/`data_type`/`comment` shape, previously
@@ -4501,10 +4524,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Plan(_)));
 
-        let batches = engine
-            .sql("DESCRIBE CATALOG spark_catalog")
-            .await
-            .unwrap();
+        let batches = engine.sql("DESCRIBE CATALOG spark_catalog").await.unwrap();
         let values = batches[0]
             .column(1)
             .as_any()
