@@ -151,8 +151,11 @@ impl CatalogProvider for HiveCatalog {
         let schema_cols = t.columns.iter().chain(t.partition_typed.iter()).cloned();
         let schema = columns_to_schema(schema_cols);
 
+        let properties: HashMap<String, String> = t.parameters.iter().cloned().collect();
         let md = TableMetadata::new(format!("{}.{db}.{table}", self.name), location, format)
-            .with_partition_columns(t.partition_columns.clone());
+            .with_partition_columns(t.partition_columns.clone())
+            .with_comment(t.comment().map(str::to_string))
+            .with_properties(properties);
         Ok(match schema {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,

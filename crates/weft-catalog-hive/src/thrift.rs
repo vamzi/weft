@@ -45,7 +45,9 @@ pub struct HiveTable {
     /// `tableType` (e.g. `EXTERNAL_TABLE`, `MANAGED_TABLE`, `VIRTUAL_VIEW`).
     pub table_type: Option<String>,
     /// `parameters` — table properties; `table_type=ICEBERG` / `spark.sql.sources.provider=delta`
-    /// here are the most reliable format signals.
+    /// here are the most reliable format signals. Hive Metastore has no dedicated table-level
+    /// comment field on the `Table` struct itself — `COMMENT '...'` on `CREATE TABLE` is stored
+    /// as the `comment` key in this same map, hence [`HiveTable::comment`] below.
     pub parameters: Vec<(String, String)>,
     /// `sd.cols` — the data columns as `(name, hive_type_string)`, in declaration order. The
     /// catalog-declared schema the engine coerces files to.
@@ -64,6 +66,12 @@ impl HiveTable {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The table-level comment, i.e. the `parameters["comment"]` entry Hive Metastore stores
+    /// `CREATE TABLE ... COMMENT '...'` under (there is no separate Thrift field for it).
+    pub fn comment(&self) -> Option<&str> {
+        self.param("comment")
     }
 }
 
