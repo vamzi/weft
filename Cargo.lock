@@ -4841,6 +4841,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "futures",
  "object_store",
  "rayon",
  "regex",

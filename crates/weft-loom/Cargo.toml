@@ -38,6 +38,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # DataFusion trait method is sync, but Glue/Hive/object-store writes are async) — needs `rt` in
 # [dependencies], not just as a test-only dev-dependency.
 tokio = { version = "1", features = ["rt"] }
+# `StreamExt::next` to drain a DataFusion `SendableRecordBatchStream` batch-by-batch in the CTAS
+# write path (stream the SELECT straight to storage instead of collecting it into driver memory).
+# Same 0.3 line the rest of the tree already pulls (weft-execution), so the lock is unchanged.
+futures = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

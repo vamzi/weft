@@ -1843,34 +1843,40 @@ impl Engine {
 
     /// CTAS: execute SELECT, write result as format files, then CREATE EXTERNAL TABLE.
     async fn run_create_table_ctas(&self, ctas: &spark_create_table::LoweredCtas) -> Result<()> {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use futures::StreamExt;
+
         std::fs::create_dir_all(&ctas.table_dir).map_err(|e| Error::Execution(e.to_string()))?;
-        let batches = self
-            .plan_spark(&ctas.select_sql)
-            .await?
-            .collect()
+        // Stream the SELECT straight to the output file instead of collecting the whole result into
+        // driver memory first. A large `CREATE TABLE AS SELECT * FROM bigtable` otherwise buffers
+        // the entire source table in RAM (via `df.collect()`) and OOMs the driver; streaming holds
+        // at most one record batch at a time. The stream's own schema drives the writer so each
+        // batch matches exactly (as `batches[0].schema()` did before).
+        let df = self.plan_spark(&ctas.select_sql).await?;
+        let mut stream = df
+            .execute_stream()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
-        if !batches.is_empty() {
-            let ext = match ctas.fmt.as_str() {
-                "json" => "json",
-                "csv" => "csv",
-                _ => "parquet",
-            };
-            let file = ctas.table_dir.join(format!("part-00000.{ext}"));
-            use datafusion::parquet::arrow::ArrowWriter;
-            let schema = batches[0].schema();
-            let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
-            let mut writer = ArrowWriter::try_new(f, schema, None)
-                .map_err(|e| Error::Execution(e.to_string()))?;
-            for b in &batches {
-                writer
-                    .write(b)
-                    .map_err(|e| Error::Execution(e.to_string()))?;
-            }
+
+        let ext = match ctas.fmt.as_str() {
+            "json" => "json",
+            "csv" => "csv",
+            _ => "parquet",
+        };
+        let file = ctas.table_dir.join(format!("part-00000.{ext}"));
+        let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
+        let mut writer = ArrowWriter::try_new(f, stream.schema(), None)
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
             writer
-                .close()
+                .write(&batch)
                 .map_err(|e| Error::Execution(e.to_string()))?;
         }
+        writer
+            .close()
+            .map_err(|e| Error::Execution(e.to_string()))?;
+
         let ddl = normalize_spark_sql(&ctas.ddl);
         self.ctx
             .sql(ddl.as_ref())
@@ -4724,6 +4730,25 @@ mod tests {
             rows, 2,
             "a 1-part name must use the local warehouse, not be misrouted as catalog-qualified"
         );
+    }
+
+    #[tokio::test]
+    async fn local_ctas_streams_select_to_readable_table() {
+        // A local-warehouse `CREATE TABLE ... USING <fmt> AS SELECT ...` runs through the streaming
+        // write path (`run_create_table_ctas`): the SELECT is drained batch-by-batch straight to the
+        // output file, never fully collected into driver memory (so a large source can't OOM the
+        // driver). Prove the table is created and reads back every row of the SELECT.
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE ctas_t USING parquet AS SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .expect("streamed CTAS should succeed");
+        let out = engine
+            .sql("SELECT id FROM ctas_t ORDER BY id")
+            .await
+            .expect("select from the CTAS table");
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3, "the streamed CTAS must persist all rows of the SELECT");
     }
 
     #[tokio::test]
