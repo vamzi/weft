@@ -109,3 +109,23 @@ Databricks dialect. Some Unparser output is **invalid on round-trip**:
 | coverage gates | yes | clickbench, clickbench-grpc, correctness |
 | Spark SQL parity ratchet | yes | `weft-parity ratchet --baseline parity/baseline.json` |
 | line coverage | no (informational) | `cargo llvm-cov --workspace --html` |
+
+## Daily maintenance routine
+
+A Cursor **Scheduled Agent** runs a daily bug / security-vuln / dependency-CVE /
+maintenance pass over this repo. It is grounded on a deterministic scan and bounded by
+strict guardrails — it opens **draft PRs + one triage issue** and merges nothing.
+
+- **Playbook (the contract):** `.cursor/rules/daily-maintenance.mdc` — procedure, the
+  finding→delivery routing table, and the hard guardrails (never push to `main`, one
+  concern per PR, ≤5 PRs/day, no exploit detail in public since this repo is public →
+  security findings go to a private GitHub Security Advisory).
+- **Scan (run it yourself too):** `bash scripts/daily-maintenance.sh` runs the cheap-core
+  gates (fmt, clippy, test, `cargo audit`, `cargo deny`, dep-update check) and writes
+  machine-readable reports to `target/daily-maintenance/`. It deliberately skips the heavy
+  bench/parity gates in `scripts/ci-local.sh`.
+- **Env:** `.cursor/environment.json` boots Rust 1.90 and installs `cargo-audit` +
+  `cargo-deny`. Policy for the latter is `deny.toml` (starts permissive, tightened over
+  time by the daily `chore(deps)` PRs).
+- **Scheduling** is configured in the Cursor dashboard (not version-controlled); the
+  repo owns *what* runs, the dashboard only fixes *when*.
