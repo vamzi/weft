@@ -463,7 +463,7 @@ impl WeftService {
         &self,
         rel: &sc::Relation,
         operation_id: Option<&str>,
-    ) -> std::result::Result<(Vec<RecordBatch>, weft_loom::QueryStats), Status> {
+    ) -> std::result::Result<(Vec<RecordBatch>, Option<weft_loom::QueryStats>), Status> {
         if let Some(sc::relation::RelType::ShowString(s)) = rel.rel_type.as_ref() {
             let child = s
                 .input
@@ -471,25 +471,24 @@ impl WeftService {
                 .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
             let (batches, _) = self.base_relation_batches(child, operation_id).await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
-            return Ok((
-                vec![show_string_batch(text)],
-                weft_loom::QueryStats::default(),
-            ));
+            return Ok((vec![show_string_batch(text)], None));
         }
         // `spark.catalog.*` operations (listTables, currentCatalog, setCurrentDatabase, …).
         if let Some(sc::relation::RelType::Catalog(cat)) = rel.rel_type.as_ref() {
             let batches = catalog::handle_catalog(&self.engine, &self.registry, cat).await?;
-            return Ok((batches, weft_loom::QueryStats::default()));
+            return Ok((batches, None));
         }
         self.base_relation_batches(rel, operation_id).await
     }
 
-    /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks.
+    /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks. The second
+    /// tuple element is the executed-plan stats (rows / bytes scanned / duration) — `Some` only for
+    /// a metrics-capturing scan query, `None` otherwise (so we never emit fabricated zero metrics).
     async fn base_relation_batches(
         &self,
         rel: &sc::Relation,
         operation_id: Option<&str>,
-    ) -> std::result::Result<(Vec<RecordBatch>, weft_loom::QueryStats), Status> {
+    ) -> std::result::Result<(Vec<RecordBatch>, Option<weft_loom::QueryStats>), Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
@@ -520,7 +519,8 @@ impl WeftService {
                             let rows: i64 = dist.iter().map(|b| b.num_rows() as i64).sum();
                             t.finish_success(rows);
                         }
-                        return Ok((dist, weft_loom::QueryStats::default()));
+                        // Distributed execution doesn't surface DataFusion scan metrics → no stats.
+                        return Ok((dist, None));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -547,22 +547,25 @@ impl WeftService {
                 // DDL / CTAS / INSERT — routes through `engine.sql`, which intercepts the forms
                 // DataFusion can't plan; those carry no scan metrics.
                 let exec = if is_scan_query(&sql.query) {
-                    self.engine.sql_with_stats(&sql.query).await
-                } else {
+                    // Metrics-capturing path: rows / bytes scanned / duration from the executed plan.
                     self.engine
-                        .sql(&sql.query)
+                        .sql_with_stats(&sql.query)
                         .await
-                        .map(|b| (b, weft_loom::QueryStats::default()))
+                        .map(|(b, s)| (b, Some(s)))
+                } else {
+                    // SHOW / DESCRIBE / DDL / CTAS / INSERT: no scan metrics — don't fabricate any.
+                    self.engine.sql(&sql.query).await.map(|b| (b, None))
                 };
-                let (mut batches, stats) = match exec {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if let Some(t) = local_tracker {
-                            t.finish_error(e.to_string());
+                let (mut batches, stats): (Vec<RecordBatch>, Option<weft_loom::QueryStats>) =
+                    match exec {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(t) = local_tracker {
+                                t.finish_error(e.to_string());
+                            }
+                            return Err(err_to_status(e));
                         }
-                        return Err(err_to_status(e));
-                    }
-                };
+                    };
                 // A 0-row result must still carry its schema so the client gets a typed (empty)
                 // table. Re-derive the schema only for queries — `engine.schema` plans via
                 // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
@@ -600,7 +603,7 @@ impl WeftService {
                 if batches.is_empty() {
                     batches.push(RecordBatch::new_empty(schema));
                 }
-                Ok((batches, weft_loom::QueryStats::default()))
+                Ok((batches, None))
             }
             // Everything else (Project/Filter/Aggregate/Join/… — the DataFrame API) lowers to a
             // DataFusion logical plan and executes. A 0-row result still carries its schema.
@@ -655,7 +658,8 @@ impl WeftService {
                     );
                     t.finish_success(rows);
                 }
-                Ok((batches, weft_loom::QueryStats::default()))
+                // DataFrame-API path: `execute_logical_plan` doesn't retain the plan for metrics.
+                Ok((batches, None))
             }
         }
     }
@@ -771,7 +775,7 @@ impl SparkConnectService for WeftService {
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
                 let (batches, stats) = self.eval_relation(rel, Some(&operation_id)).await?;
-                self.stream_batches(&session_id, &operation_id, &batches, Some(&stats))?
+                self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };

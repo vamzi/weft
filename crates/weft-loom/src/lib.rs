@@ -2114,6 +2114,15 @@ impl Engine {
     /// display/result path — it does not run `sql`'s SHOW/DDL/CTAS/INSERT interception, so callers
     /// use it only for queries they have already classified as row-returning.
     pub async fn sql_with_stats(&self, query: &str) -> Result<(Vec<RecordBatch>, QueryStats)> {
+        // Same guard `Engine::sql` applies: Spark rejects multi-column `COUNT(DISTINCT a, b)` at
+        // analysis time, but DataFusion *panics* while planning it. Reject up front so this path
+        // (reached for scan queries via the Spark Connect metrics route) returns a clean
+        // `Error::Plan` instead of panicking the driver task — matching `Engine::sql`.
+        if is_multi_arg_count_distinct(query) {
+            return Err(Error::Plan(
+                "COUNT(DISTINCT) does not support multiple columns".into(),
+            ));
+        }
         let start = std::time::Instant::now();
         let df = self.plan_spark(query).await?;
         let plan = df
@@ -4832,6 +4841,21 @@ mod tests {
             stats.bytes_scanned > 0,
             "a parquet scan should report bytes_scanned, got {}",
             stats.bytes_scanned
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_with_stats_rejects_multi_arg_count_distinct() {
+        // `sql_with_stats` is reached for scan queries via the Spark Connect metrics route; it must
+        // apply the same guard as `Engine::sql` so `COUNT(DISTINCT a, b)` returns a clean error
+        // instead of panicking DataFusion's planner (which would kill the driver task).
+        let engine = Engine::new();
+        let result = engine
+            .sql_with_stats("SELECT COUNT(DISTINCT a, b) FROM t")
+            .await;
+        assert!(
+            matches!(result, Err(Error::Plan(_))),
+            "multi-arg COUNT(DISTINCT) must be a clean Plan error, got {result:?}"
         );
     }
 
