@@ -331,7 +331,8 @@ async fn metadata_to_provider(
             ensure_remote_store(state, &url);
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
-            crate::build_listing_table(state, vec![url], opts, md.schema.clone())
+            let (opts, file_schema) = apply_partition_columns(opts, md);
+            crate::build_listing_table(state, vec![url], opts, file_schema)
                 .await
                 .map_err(weft_to_df)
         }
@@ -340,7 +341,8 @@ async fn metadata_to_provider(
             ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
-            crate::build_listing_table(state, vec![url], opts, md.schema.clone())
+            let (opts, file_schema) = apply_partition_columns(opts, md);
+            crate::build_listing_table(state, vec![url], opts, file_schema)
                 .await
                 .map_err(weft_to_df)
         }
@@ -349,7 +351,8 @@ async fn metadata_to_provider(
             ensure_remote_store(state, &url);
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
-            crate::build_listing_table(state, vec![url], opts, md.schema.clone())
+            let (opts, file_schema) = apply_partition_columns(opts, md);
+            crate::build_listing_table(state, vec![url], opts, file_schema)
                 .await
                 .map_err(weft_to_df)
         }
@@ -367,6 +370,59 @@ async fn metadata_to_provider(
             parquet_files_provider(state, &md.location, files, md.schema.clone()).await
         }
     }
+}
+
+/// Configure Hive-style partition columns on a listing table. Glue (and other Hive metastores)
+/// append partition columns to the declared schema, but their values live in the object *path*
+/// (e.g. `.../year=2015/month=01/part.parquet`), not inside the data files. So we (1) declare them
+/// as table partition columns on the `ListingOptions` — DataFusion derives their values from the
+/// path — and (2) hand `build_listing_table` the *file* schema with those columns removed, so the
+/// reader doesn't look for them in the files. Without a declared schema (Parquet inference) or with
+/// no partition columns, this is a no-op passing the metadata schema through unchanged.
+fn apply_partition_columns(
+    opts: datafusion::datasource::listing::ListingOptions,
+    md: &TableMetadata,
+) -> (
+    datafusion::datasource::listing::ListingOptions,
+    Option<SchemaRef>,
+) {
+    match &md.schema {
+        Some(schema) if !md.partition_columns.is_empty() => {
+            let (file_schema, part_cols) = split_partition_schema(schema, &md.partition_columns);
+            (opts.with_table_partition_cols(part_cols), Some(file_schema))
+        }
+        _ => (opts, md.schema.clone()),
+    }
+}
+
+/// Split a Hive-partitioned table's declared schema into `(file_schema, partition_cols)`: the file
+/// schema is every field that is *not* a partition column, and `partition_cols` is the
+/// `(name, type)` pairs for the partition columns, emitted in the declared partition order. Types
+/// come from the declared schema (Glue records them on `PartitionKeys`).
+fn split_partition_schema(
+    schema: &SchemaRef,
+    partition_columns: &[String],
+) -> (
+    SchemaRef,
+    Vec<(String, datafusion::arrow::datatypes::DataType)>,
+) {
+    use datafusion::arrow::datatypes::Schema;
+    let part_set: std::collections::HashSet<&str> =
+        partition_columns.iter().map(String::as_str).collect();
+    let mut file_fields = Vec::new();
+    let mut part_types = HashMap::new();
+    for f in schema.fields() {
+        if part_set.contains(f.name().as_str()) {
+            part_types.insert(f.name().clone(), f.data_type().clone());
+        } else {
+            file_fields.push(f.clone());
+        }
+    }
+    let part_cols = partition_columns
+        .iter()
+        .filter_map(|n| part_types.get(n).map(|dt| (n.clone(), dt.clone())))
+        .collect();
+    (Arc::new(Schema::new(file_fields)), part_cols)
 }
 
 /// Ensure an object store is registered on the session's runtime for a remote table location so
@@ -647,6 +703,107 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!((c, s), (4, 10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a Hive-partitioned parquet layout: `<dir>/region=<r>/part-0.parquet`, each file
+    /// holding only the DATA column `x` (the partition column `region` lives in the path).
+    fn write_partitioned_parquet_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("weft-cat-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        for (region, vals) in [("west", vec![1_i64, 2]), ("east", vec![10, 20, 30])] {
+            let pdir = dir.join(format!("region={region}"));
+            std::fs::create_dir_all(&pdir).unwrap();
+            let batch =
+                RecordBatch::try_new(file_schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap();
+            let f = std::fs::File::create(pdir.join("part-0.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(f, file_schema.clone(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        dir
+    }
+
+    /// A fake catalog exposing one Hive-partitioned table whose declared schema is `x` + the
+    /// partition column `region` (Glue's convention: partition columns appended to the schema).
+    struct PartitionedFakeCatalog {
+        location: String,
+    }
+
+    #[async_trait]
+    impl WeftCatalog for PartitionedFakeCatalog {
+        fn name(&self) -> &str {
+            "fakepart"
+        }
+        async fn list_namespaces(&self, _parent: &[String]) -> CatResult<Vec<Vec<String>>> {
+            Ok(vec![vec!["ns".to_string()]])
+        }
+        async fn list_tables(&self, _ns: &[String]) -> CatResult<Vec<String>> {
+            Ok(vec!["events".to_string()])
+        }
+        async fn load_table(&self, ns: &[String], table: &str) -> CatResult<TableMetadata> {
+            if ns == ["ns"] && table == "events" {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("x", DataType::Int64, false),
+                    Field::new("region", DataType::Utf8, false),
+                ]));
+                Ok(TableMetadata::new(
+                    "fakepart.ns.events",
+                    self.location.clone(),
+                    TableFormat::Parquet,
+                )
+                .with_schema(schema)
+                .with_partition_columns(vec!["region".to_string()]))
+            } else {
+                Err(Error::Plan(format!(
+                    "no such table: {}.{table}",
+                    ns.join(".")
+                )))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hive_partitioned_read_derives_partition_column_from_path() {
+        // The partition column `region` is in the *path*, not the data files. Before A4 it was in
+        // the declared schema but never registered as a table partition column, so it scanned as
+        // NULL (or failed). Now a filter on it must prune to the matching partition and sum only
+        // that partition's rows.
+        let dir = write_partitioned_parquet_dir();
+        let location = format!("file://{}", dir.to_string_lossy());
+        let engine = crate::Engine::new();
+        engine.register_catalog("fakepart", Arc::new(PartitionedFakeCatalog { location }));
+
+        let west = engine
+            .sql("SELECT SUM(x) AS s FROM fakepart.ns.events WHERE region = 'west'")
+            .await
+            .unwrap();
+        let s = west[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // If `region` scanned as NULL (the pre-A4 bug), the filter matches nothing and SUM is NULL
+        // (value 0); a correct partition-from-path read sums only the `region=west` rows.
+        assert_eq!(
+            s.value(0),
+            3,
+            "west partition sums 1 + 2 (region derived from the path)"
+        );
+
+        let total = engine
+            .sql("SELECT SUM(x) AS s FROM fakepart.ns.events")
+            .await
+            .unwrap();
+        let t = total[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(t, 63, "all partitions: 1+2 + 10+20+30");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

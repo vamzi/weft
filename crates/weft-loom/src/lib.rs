@@ -4805,7 +4805,10 @@ mod tests {
             .await
             .expect("select from the CTAS table");
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows, 3, "the streamed CTAS must persist all rows of the SELECT");
+        assert_eq!(
+            rows, 3,
+            "the streamed CTAS must persist all rows of the SELECT"
+        );
     }
 
     #[tokio::test]
