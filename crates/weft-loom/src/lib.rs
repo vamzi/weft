@@ -1519,6 +1519,35 @@ pub struct CreatedTableMeta {
     pub partition_columns: Vec<String>,
 }
 
+/// Execution statistics for a completed query — the substrate for Databricks-style observability
+/// (query time, rows returned, bytes scanned). Populated from DataFusion's `ExecutionPlan` metrics
+/// by [`Engine::sql_with_stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryStats {
+    /// Wall-clock execution time in milliseconds.
+    pub duration_ms: u64,
+    /// Total rows produced by the query.
+    pub output_rows: u64,
+    /// Bytes read from storage by the plan's scan nodes.
+    pub bytes_scanned: u64,
+}
+
+/// Sum a named DataFusion metric (e.g. `bytes_scanned`) across every node of an executed physical
+/// plan tree. Metrics are per-operator — `bytes_scanned` lives on scan leaves — so we walk the whole
+/// tree and total the matching counters. Returns 0 when the metric is absent (e.g. an in-memory
+/// scan that reports no bytes).
+fn aggregate_plan_metric(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &str) -> u64 {
+    let mut total = plan
+        .metrics()
+        .and_then(|set| set.sum_by_name(name))
+        .map(|v| v.as_usize() as u64)
+        .unwrap_or(0);
+    for child in plan.children() {
+        total += aggregate_plan_metric(child.as_ref(), name);
+    }
+    total
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -2074,6 +2103,34 @@ impl Engine {
         datafusion::physical_plan::collect(plan, self.ctx.task_ctx())
             .await
             .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Run a row-returning `query` and return its result batches **plus** execution statistics —
+    /// the substrate for Databricks-style observability (duration, rows, bytes scanned).
+    ///
+    /// Unlike [`Engine::sql`], this builds the physical plan explicitly and *retains* it, so
+    /// DataFusion's per-operator metrics can be read after execution (`plan.metrics()`); `df.collect()`
+    /// drops the plan, so `bytes_scanned` and friends are otherwise lost. Intended for the
+    /// display/result path — it does not run `sql`'s SHOW/DDL/CTAS/INSERT interception, so callers
+    /// use it only for queries they have already classified as row-returning.
+    pub async fn sql_with_stats(&self, query: &str) -> Result<(Vec<RecordBatch>, QueryStats)> {
+        let start = std::time::Instant::now();
+        let df = self.plan_spark(query).await?;
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        let batches = datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        let output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let stats = QueryStats {
+            duration_ms: start.elapsed().as_millis() as u64,
+            output_rows,
+            // Scan nodes carry `bytes_scanned`; sum it across the executed plan tree.
+            bytes_scanned: aggregate_plan_metric(plan.as_ref(), "bytes_scanned"),
+        };
+        Ok((batches, stats))
     }
 
     /// Register an in-memory table of `batches` under `name` — the worker-side landing zone
@@ -4749,6 +4806,30 @@ mod tests {
             .expect("select from the CTAS table");
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 3, "the streamed CTAS must persist all rows of the SELECT");
+    }
+
+    #[tokio::test]
+    async fn sql_with_stats_reports_rows_and_bytes_scanned() {
+        // Persist a parquet table (via the streaming CTAS path), then scan it through
+        // `sql_with_stats`: the retained physical plan's scan node must report the rows returned
+        // and a non-zero `bytes_scanned` read from storage — the metrics `df.collect()` drops.
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE stats_t USING parquet AS SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .expect("ctas should succeed");
+        let (batches, stats) = engine
+            .sql_with_stats("SELECT a FROM stats_t")
+            .await
+            .expect("sql_with_stats should succeed");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+        assert_eq!(stats.output_rows, 3, "output_rows must match the result");
+        assert!(
+            stats.bytes_scanned > 0,
+            "a parquet scan should report bytes_scanned, got {}",
+            stats.bytes_scanned
+        );
     }
 
     #[tokio::test]
