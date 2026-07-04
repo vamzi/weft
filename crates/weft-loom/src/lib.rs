@@ -1519,6 +1519,35 @@ pub struct CreatedTableMeta {
     pub partition_columns: Vec<String>,
 }
 
+/// Execution statistics for a completed query — the substrate for Databricks-style observability
+/// (query time, rows returned, bytes scanned). Populated from DataFusion's `ExecutionPlan` metrics
+/// by [`Engine::sql_with_stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryStats {
+    /// Wall-clock execution time in milliseconds.
+    pub duration_ms: u64,
+    /// Total rows produced by the query.
+    pub output_rows: u64,
+    /// Bytes read from storage by the plan's scan nodes.
+    pub bytes_scanned: u64,
+}
+
+/// Sum a named DataFusion metric (e.g. `bytes_scanned`) across every node of an executed physical
+/// plan tree. Metrics are per-operator — `bytes_scanned` lives on scan leaves — so we walk the whole
+/// tree and total the matching counters. Returns 0 when the metric is absent (e.g. an in-memory
+/// scan that reports no bytes).
+fn aggregate_plan_metric(plan: &dyn datafusion::physical_plan::ExecutionPlan, name: &str) -> u64 {
+    let mut total = plan
+        .metrics()
+        .and_then(|set| set.sum_by_name(name))
+        .map(|v| v.as_usize() as u64)
+        .unwrap_or(0);
+    for child in plan.children() {
+        total += aggregate_plan_metric(child.as_ref(), name);
+    }
+    total
+}
+
 /// The CPU execution engine: a DataFusion [`SessionContext`] today, growing native
 /// operators behind the same surface in Phase 1.
 pub struct Engine {
@@ -1843,34 +1872,40 @@ impl Engine {
 
     /// CTAS: execute SELECT, write result as format files, then CREATE EXTERNAL TABLE.
     async fn run_create_table_ctas(&self, ctas: &spark_create_table::LoweredCtas) -> Result<()> {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use futures::StreamExt;
+
         std::fs::create_dir_all(&ctas.table_dir).map_err(|e| Error::Execution(e.to_string()))?;
-        let batches = self
-            .plan_spark(&ctas.select_sql)
-            .await?
-            .collect()
+        // Stream the SELECT straight to the output file instead of collecting the whole result into
+        // driver memory first. A large `CREATE TABLE AS SELECT * FROM bigtable` otherwise buffers
+        // the entire source table in RAM (via `df.collect()`) and OOMs the driver; streaming holds
+        // at most one record batch at a time. The stream's own schema drives the writer so each
+        // batch matches exactly (as `batches[0].schema()` did before).
+        let df = self.plan_spark(&ctas.select_sql).await?;
+        let mut stream = df
+            .execute_stream()
             .await
             .map_err(|e| Error::Execution(e.to_string()))?;
-        if !batches.is_empty() {
-            let ext = match ctas.fmt.as_str() {
-                "json" => "json",
-                "csv" => "csv",
-                _ => "parquet",
-            };
-            let file = ctas.table_dir.join(format!("part-00000.{ext}"));
-            use datafusion::parquet::arrow::ArrowWriter;
-            let schema = batches[0].schema();
-            let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
-            let mut writer = ArrowWriter::try_new(f, schema, None)
-                .map_err(|e| Error::Execution(e.to_string()))?;
-            for b in &batches {
-                writer
-                    .write(b)
-                    .map_err(|e| Error::Execution(e.to_string()))?;
-            }
+
+        let ext = match ctas.fmt.as_str() {
+            "json" => "json",
+            "csv" => "csv",
+            _ => "parquet",
+        };
+        let file = ctas.table_dir.join(format!("part-00000.{ext}"));
+        let f = std::fs::File::create(&file).map_err(|e| Error::Execution(e.to_string()))?;
+        let mut writer = ArrowWriter::try_new(f, stream.schema(), None)
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| Error::Execution(e.to_string()))?;
             writer
-                .close()
+                .write(&batch)
                 .map_err(|e| Error::Execution(e.to_string()))?;
         }
+        writer
+            .close()
+            .map_err(|e| Error::Execution(e.to_string()))?;
+
         let ddl = normalize_spark_sql(&ctas.ddl);
         self.ctx
             .sql(ddl.as_ref())
@@ -2068,6 +2103,43 @@ impl Engine {
         datafusion::physical_plan::collect(plan, self.ctx.task_ctx())
             .await
             .map_err(|e| Error::Execution(e.to_string()))
+    }
+
+    /// Run a row-returning `query` and return its result batches **plus** execution statistics —
+    /// the substrate for Databricks-style observability (duration, rows, bytes scanned).
+    ///
+    /// Unlike [`Engine::sql`], this builds the physical plan explicitly and *retains* it, so
+    /// DataFusion's per-operator metrics can be read after execution (`plan.metrics()`); `df.collect()`
+    /// drops the plan, so `bytes_scanned` and friends are otherwise lost. Intended for the
+    /// display/result path — it does not run `sql`'s SHOW/DDL/CTAS/INSERT interception, so callers
+    /// use it only for queries they have already classified as row-returning.
+    pub async fn sql_with_stats(&self, query: &str) -> Result<(Vec<RecordBatch>, QueryStats)> {
+        // Same guard `Engine::sql` applies: Spark rejects multi-column `COUNT(DISTINCT a, b)` at
+        // analysis time, but DataFusion *panics* while planning it. Reject up front so this path
+        // (reached for scan queries via the Spark Connect metrics route) returns a clean
+        // `Error::Plan` instead of panicking the driver task — matching `Engine::sql`.
+        if is_multi_arg_count_distinct(query) {
+            return Err(Error::Plan(
+                "COUNT(DISTINCT) does not support multiple columns".into(),
+            ));
+        }
+        let start = std::time::Instant::now();
+        let df = self.plan_spark(query).await?;
+        let plan = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        let batches = datafusion::physical_plan::collect(plan.clone(), self.ctx.task_ctx())
+            .await
+            .map_err(|e| Error::Execution(e.to_string()))?;
+        let output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let stats = QueryStats {
+            duration_ms: start.elapsed().as_millis() as u64,
+            output_rows,
+            // Scan nodes carry `bytes_scanned`; sum it across the executed plan tree.
+            bytes_scanned: aggregate_plan_metric(plan.as_ref(), "bytes_scanned"),
+        };
+        Ok((batches, stats))
     }
 
     /// Register an in-memory table of `batches` under `name` — the worker-side landing zone
@@ -4723,6 +4795,67 @@ mod tests {
         assert_eq!(
             rows, 2,
             "a 1-part name must use the local warehouse, not be misrouted as catalog-qualified"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ctas_streams_select_to_readable_table() {
+        // A local-warehouse `CREATE TABLE ... USING <fmt> AS SELECT ...` runs through the streaming
+        // write path (`run_create_table_ctas`): the SELECT is drained batch-by-batch straight to the
+        // output file, never fully collected into driver memory (so a large source can't OOM the
+        // driver). Prove the table is created and reads back every row of the SELECT.
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE ctas_t USING parquet AS SELECT 1 AS id UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .expect("streamed CTAS should succeed");
+        let out = engine
+            .sql("SELECT id FROM ctas_t ORDER BY id")
+            .await
+            .expect("select from the CTAS table");
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 3,
+            "the streamed CTAS must persist all rows of the SELECT"
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_with_stats_reports_rows_and_bytes_scanned() {
+        // Persist a parquet table (via the streaming CTAS path), then scan it through
+        // `sql_with_stats`: the retained physical plan's scan node must report the rows returned
+        // and a non-zero `bytes_scanned` read from storage — the metrics `df.collect()` drops.
+        let engine = Engine::new();
+        engine
+            .sql("CREATE TABLE stats_t USING parquet AS SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .await
+            .expect("ctas should succeed");
+        let (batches, stats) = engine
+            .sql_with_stats("SELECT a FROM stats_t")
+            .await
+            .expect("sql_with_stats should succeed");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3);
+        assert_eq!(stats.output_rows, 3, "output_rows must match the result");
+        assert!(
+            stats.bytes_scanned > 0,
+            "a parquet scan should report bytes_scanned, got {}",
+            stats.bytes_scanned
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_with_stats_rejects_multi_arg_count_distinct() {
+        // `sql_with_stats` is reached for scan queries via the Spark Connect metrics route; it must
+        // apply the same guard as `Engine::sql` so `COUNT(DISTINCT a, b)` returns a clean error
+        // instead of panicking DataFusion's planner (which would kill the driver task).
+        let engine = Engine::new();
+        let result = engine
+            .sql_with_stats("SELECT COUNT(DISTINCT a, b) FROM t")
+            .await;
+        assert!(
+            matches!(result, Err(Error::Plan(_))),
+            "multi-arg COUNT(DISTINCT) must be a clean Plan error, got {result:?}"
         );
     }
 

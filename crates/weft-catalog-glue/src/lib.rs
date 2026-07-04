@@ -163,6 +163,18 @@ impl CatalogProvider for GlueCatalog {
         let data_cols = t["StorageDescriptor"]["Columns"].as_array();
         let part_cols = t["PartitionKeys"].as_array();
         let schema = columns_to_schema(glue_column_pairs(data_cols, part_cols));
+        // Partition-column NAMES (Hive layout: values live in the object path, e.g.
+        // `.../year=2015/month=01/`, not inside the data files). The engine must know these so it
+        // reads them from the path instead of expecting them in the Parquet — otherwise a
+        // partitioned table (typical of the monthly taxi dumps) scans as NULLs or fails. The types
+        // come along in `schema` (Glue appends partition columns to the declared schema).
+        let partition_columns: Vec<String> = part_cols
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c["Name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let comment = t["Description"]
             .as_str()
@@ -183,7 +195,8 @@ impl CatalogProvider for GlueCatalog {
             format,
         )
         .with_comment(comment)
-        .with_properties(properties);
+        .with_properties(properties)
+        .with_partition_columns(partition_columns);
         Ok(match schema {
             Some(s) => md.with_schema(Arc::new(s)),
             None => md,

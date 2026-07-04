@@ -245,6 +245,7 @@ impl WeftService {
         session_id: &str,
         operation_id: &str,
         batches: &[RecordBatch],
+        stats: Option<&weft_loom::QueryStats>,
     ) -> std::result::Result<Vec<sc::ExecutePlanResponse>, Status> {
         let mut responses = Vec::new();
         for batch in batches {
@@ -287,6 +288,11 @@ impl WeftService {
         );
         if let Some(first) = batches.first() {
             complete.schema = Some(types::schema_to_spark(first.schema().as_ref()));
+        }
+        // Carry per-query execution metrics (duration / rows / bytes scanned) on the terminal
+        // response so a client (the gateway) can surface Databricks-style observability.
+        if let Some(stats) = stats {
+            complete.metrics = Some(stats_to_metrics(stats));
         }
         responses.push(complete);
         Ok(responses)
@@ -457,29 +463,32 @@ impl WeftService {
         &self,
         rel: &sc::Relation,
         operation_id: Option<&str>,
-    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+    ) -> std::result::Result<(Vec<RecordBatch>, Option<weft_loom::QueryStats>), Status> {
         if let Some(sc::relation::RelType::ShowString(s)) = rel.rel_type.as_ref() {
             let child = s
                 .input
                 .as_deref()
                 .ok_or_else(|| Status::invalid_argument("ShowString.input missing"))?;
-            let batches = self.base_relation_batches(child, operation_id).await?;
+            let (batches, _) = self.base_relation_batches(child, operation_id).await?;
             let text = show_string(&batches, s.num_rows, s.truncate)?;
-            return Ok(vec![show_string_batch(text)]);
+            return Ok((vec![show_string_batch(text)], None));
         }
         // `spark.catalog.*` operations (listTables, currentCatalog, setCurrentDatabase, …).
         if let Some(sc::relation::RelType::Catalog(cat)) = rel.rel_type.as_ref() {
-            return catalog::handle_catalog(&self.engine, &self.registry, cat).await;
+            let batches = catalog::handle_catalog(&self.engine, &self.registry, cat).await?;
+            return Ok((batches, None));
         }
         self.base_relation_batches(rel, operation_id).await
     }
 
-    /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks.
+    /// Evaluate a `Sql` or `LocalRelation` to record batches, with observability hooks. The second
+    /// tuple element is the executed-plan stats (rows / bytes scanned / duration) — `Some` only for
+    /// a metrics-capturing scan query, `None` otherwise (so we never emit fabricated zero metrics).
     async fn base_relation_batches(
         &self,
         rel: &sc::Relation,
         operation_id: Option<&str>,
-    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+    ) -> std::result::Result<(Vec<RecordBatch>, Option<weft_loom::QueryStats>), Status> {
         match rel.rel_type.as_ref() {
             Some(sc::relation::RelType::Sql(sql)) => {
                 let workers = self.workers_from_config();
@@ -510,7 +519,8 @@ impl WeftService {
                             let rows: i64 = dist.iter().map(|b| b.num_rows() as i64).sum();
                             t.finish_success(rows);
                         }
-                        return Ok(dist);
+                        // Distributed execution doesn't surface DataFusion scan metrics → no stats.
+                        return Ok((dist, None));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -532,15 +542,33 @@ impl WeftService {
                     t.task_started(0, tid, "driver");
                 }
                 let start = std::time::Instant::now();
-                let mut batches = match self.engine.sql(&sql.query).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        if let Some(t) = local_tracker {
-                            t.finish_error(e.to_string());
-                        }
-                        return Err(err_to_status(e));
-                    }
+                // A plain scan query goes through `sql_with_stats` so the executed plan's metrics
+                // (bytes scanned, rows, duration) are captured. Everything else — SHOW / DESCRIBE /
+                // DDL / CTAS / INSERT — routes through `engine.sql`, which intercepts the forms
+                // DataFusion can't plan; those carry no scan metrics.
+                let exec = if is_scan_query(&sql.query) {
+                    // Metrics-capturing path: rows / bytes scanned / duration from the executed plan.
+                    self.engine
+                        .sql_with_stats(&sql.query)
+                        .await
+                        .map(|(b, s)| (b, Some(s)))
+                } else {
+                    // SHOW / DESCRIBE / DDL / CTAS / INSERT: no scan metrics — don't fabricate any.
+                    self.engine.sql(&sql.query).await.map(|b| (b, None))
                 };
+                let (mut batches, stats): (Vec<RecordBatch>, Option<weft_loom::QueryStats>) =
+                    match exec {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(t) = local_tracker {
+                                t.finish_error(e.to_string());
+                            }
+                            return Err(err_to_status(e));
+                        }
+                    };
+                // A 0-row result must still carry its schema so the client gets a typed (empty)
+                // table. Re-derive the schema only for queries — `engine.schema` plans via
+                // `ctx.sql`, which would re-execute a DDL statement (a query has no side effect).
                 if batches.is_empty() && is_query(&sql.query) {
                     let schema = self
                         .engine
@@ -562,7 +590,7 @@ impl WeftService {
                     );
                     t.finish_success(rows);
                 }
-                Ok(batches)
+                Ok((batches, stats))
             }
             Some(sc::relation::RelType::LocalRelation(lr)) => {
                 let data = lr.data.as_deref().unwrap_or_default();
@@ -575,7 +603,7 @@ impl WeftService {
                 if batches.is_empty() {
                     batches.push(RecordBatch::new_empty(schema));
                 }
-                Ok(batches)
+                Ok((batches, None))
             }
             // Everything else (Project/Filter/Aggregate/Join/… — the DataFrame API) lowers to a
             // DataFusion logical plan and executes. A 0-row result still carries its schema.
@@ -630,7 +658,8 @@ impl WeftService {
                     );
                     t.finish_success(rows);
                 }
-                Ok(batches)
+                // DataFrame-API path: `execute_logical_plan` doesn't retain the plan for metrics.
+                Ok((batches, None))
             }
         }
     }
@@ -745,8 +774,8 @@ impl SparkConnectService for WeftService {
             },
             // A relation (Sql, LocalRelation, ShowString, …): evaluate it and stream the result.
             Some(sc::plan::OpType::Root(rel)) => {
-                let batches = self.eval_relation(rel, Some(&operation_id)).await?;
-                self.stream_batches(&session_id, &operation_id, &batches)?
+                let (batches, stats) = self.eval_relation(rel, Some(&operation_id)).await?;
+                self.stream_batches(&session_id, &operation_id, &batches, stats.as_ref())?
             }
             _ => return Err(Status::unimplemented("empty or unsupported plan")),
         };
@@ -1220,6 +1249,55 @@ fn is_query(sql: &str) -> bool {
         kw.as_str(),
         "SELECT" | "WITH" | "VALUES" | "TABLE" | "FROM" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
     )
+}
+
+/// A row-returning scan query that plans directly through DataFusion, so its executed physical plan
+/// carries scan metrics (`bytes_scanned`). Deliberately narrower than [`is_query`]: it excludes
+/// SHOW/DESCRIBE/EXPLAIN, which `engine.sql` intercepts *before* planning (DataFusion can't plan the
+/// Spark spellings) and which carry no scan metrics anyway. Used to decide whether to execute via
+/// `sql_with_stats` (metrics-capturing) or plain `engine.sql`.
+fn is_scan_query(sql: &str) -> bool {
+    let kw = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(kw.as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE")
+}
+
+/// Build a Spark Connect `Metrics` message from engine [`weft_loom::QueryStats`] — one synthetic
+/// operator ("weft") carrying duration / rows / bytes-scanned counters, enough for a client to
+/// render per-query observability.
+fn stats_to_metrics(stats: &weft_loom::QueryStats) -> sc::execute_plan_response::Metrics {
+    use sc::execute_plan_response::metrics::{MetricObject, MetricValue};
+    let mv = |name: &str, value: i64, ty: &str| MetricValue {
+        name: name.to_string(),
+        value,
+        metric_type: ty.to_string(),
+    };
+    let execution_metrics = std::collections::HashMap::from([
+        (
+            "duration_ms".to_string(),
+            mv("duration_ms", stats.duration_ms as i64, "timing"),
+        ),
+        (
+            "output_rows".to_string(),
+            mv("output_rows", stats.output_rows as i64, "sum"),
+        ),
+        (
+            "bytes_scanned".to_string(),
+            mv("bytes_scanned", stats.bytes_scanned as i64, "size"),
+        ),
+    ]);
+    sc::execute_plan_response::Metrics {
+        metrics: vec![MetricObject {
+            name: "weft".to_string(),
+            plan_id: 0,
+            parent: 0,
+            execution_metrics,
+        }],
+    }
 }
 
 /// Materialize Arrow "view" layouts (`Utf8View`/`BinaryView`) to their canonical equivalents
