@@ -25,6 +25,7 @@ async fn main() {
     let result = match cmd {
         Some("worker") => run_worker(&args).await,
         Some("driver") => run_driver(&args).await,
+        Some("history-server") => run_history_server(&args).await,
         // `weft spark server ...` (and the bare `server` alias) keep the Spark Connect path.
         _ if args.iter().any(|a| a == "server") => run_server(&args).await,
         _ => {
@@ -41,7 +42,8 @@ async fn main() {
 fn usage() {
     eprintln!("weft {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
-    eprintln!("  weft spark server --port <PORT>");
+    eprintln!("  weft spark server --port <PORT> [--ui-port <PORT>] [--no-ui]");
+    eprintln!("  weft history-server --dir <LOG_DIR> [--port <PORT>]");
     eprintln!("  weft worker --port <PORT> [--data <parquet> --table <name>]");
     eprintln!(
         "  weft driver --workers <h:p,h:p> --partial-sql <SQL> --final-sql <SQL> --hash-keys <c,c>"
@@ -52,17 +54,48 @@ async fn run_server(args: &[String]) -> weft_common::Result<()> {
     let port = flag(args, "--port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50051);
+    let ui_port = if args.iter().any(|a| a == "--no-ui") {
+        None
+    } else {
+        Some(
+            flag(args, "--ui-port")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4040),
+        )
+    };
     let catalogs = catalog_conf(args);
     if !catalogs.is_empty() {
         eprintln!("Declared {} catalog config entrie(s)", catalogs.len());
     }
     eprintln!("Weft Spark Connect server listening on sc://0.0.0.0:{port}");
+    if let Some(ui) = ui_port {
+        eprintln!("Weft UI at http://0.0.0.0:{ui}");
+    }
     serve(ServerConfig {
         port,
+        ui_port,
         catalogs,
         ..Default::default()
     })
     .await
+}
+
+async fn run_history_server(args: &[String]) -> weft_common::Result<()> {
+    use std::sync::Arc;
+    use weft_observability::AppStateStore;
+    use weft_ui_server::{serve as serve_ui, UiServerConfig};
+
+    let port: u16 = flag(args, "--port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18080);
+    let dir = flag(args, "--dir")
+        .or_else(|| std::env::var("WEFT_EVENT_LOG_DIR").ok())
+        .ok_or_else(|| {
+            weft_common::Error::Io("history-server requires --dir or WEFT_EVENT_LOG_DIR".into())
+        })?;
+    let store = Arc::new(AppStateStore::load_event_log(std::path::Path::new(&dir)));
+    eprintln!("Weft history server on http://0.0.0.0:{port} (log: {dir})");
+    serve_ui(UiServerConfig { port, store }).await
 }
 
 /// Collect startup catalog config from repeated `--catalog-conf key=value` flags and the

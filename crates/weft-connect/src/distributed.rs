@@ -1,12 +1,13 @@
 //! Route distributable SQL through the driver/worker cluster.
 
 use weft_common::{Error, Result};
-use weft_execution::driver::{run_stages, Cluster};
+use weft_execution::driver::{run_stages_obs, Cluster};
 use weft_execution::flight::sync_udfs_to_worker;
 use weft_execution::membership::resolve_membership;
 use weft_execution::plan::plan_distributed;
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
+use weft_observability::QueryTracker;
 
 /// If workers or K8s service discovery is configured and `sql` is auto-splittable, run distributed.
 /// Returns `Ok(None)` when the query should fall back to single-node execution.
@@ -16,6 +17,7 @@ pub async fn try_run_distributed(
     sql: &str,
     replicated: &[&str],
     udf_json: Option<&str>,
+    tracker: Option<&QueryTracker>,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let membership = resolve_membership(workers);
     let endpoints = membership.endpoints();
@@ -35,8 +37,40 @@ pub async fn try_run_distributed(
         }
     }
 
+    // Register executors and stage DAG in observability.
+    if let Some(t) = tracker {
+        let op = t.operation_id().to_string();
+        for ep in &endpoints {
+            let host = ep
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            t.store()
+                .emit(weft_observability::ExecutionEvent::ExecutorRegistered {
+                    executor_id: host.to_string(),
+                    host_port: host.to_string(),
+                });
+        }
+        for stage in &dq.stages {
+            t.store()
+                .emit(weft_observability::ExecutionEvent::StageStarted {
+                    operation_id: op.clone(),
+                    stage_id: stage.stage_id as i32,
+                    name: truncate_sql(&stage.sql),
+                    num_tasks: endpoints.len() as i32,
+                    submission_time_ms: weft_observability::now_ms(),
+                });
+        }
+        if let Ok(plan) = engine.logical_plan(sql).await {
+            if let Ok(text) = engine.explain(&plan, true).await {
+                t.set_plan(text, None);
+            }
+        }
+    }
+
     let cluster = Cluster::from_membership(membership);
-    let mut batches = run_stages(&cluster, &dq.stages).await?;
+    let store = tracker.map(|t| t.store().clone());
+    let operation_id = tracker.map(|t| t.operation_id().to_string());
+    let mut batches = run_stages_obs(&cluster, &dq.stages, store, operation_id).await?;
 
     if let Some(finalize) = dq.finalize_sql {
         engine
@@ -66,6 +100,15 @@ pub fn parse_worker_list(config_value: Option<&str>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn truncate_sql(s: &str) -> String {
+    let t = s.trim().replace('\n', " ");
+    if t.chars().count() <= 120 {
+        t
+    } else {
+        format!("{}…", t.chars().take(119).collect::<String>())
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,8 @@ weft-spark-compat = { path = "crates/weft-spark-compat" }
 weft-streaming   = { path = "crates/weft-streaming" }
 weft-orchestrator = { path = "crates/weft-orchestrator" }
 weft-gateway     = { path = "crates/weft-gateway" }
+weft-observability = { path = "crates/weft-observability" }
+weft-ui-server   = { path = "crates/weft-ui-server" }
 
 [profile.release]
 opt-level = 3
