@@ -460,7 +460,7 @@ fn ensure_remote_store(
         return Ok(());
     }
     let os_url = url.object_store(); // canonical `s3://bucket` key
-    // `os_url` is the canonical `s3://bucket/` — pull the bucket from the authority.
+                                     // `os_url` is the canonical `s3://bucket/` — pull the bucket from the authority.
     let bucket = os_url
         .as_str()
         .strip_prefix("s3://")
@@ -480,7 +480,9 @@ fn ensure_remote_store(
         // role to assume, which DataFusion's registry has no way to honor simultaneously — that's
         // a real misconfiguration to surface, not something to paper over by silently keeping
         // whichever table happened to resolve first.
-        let mut registry = REGISTERED_BUCKET_ROLES.lock().expect("bucket-role registry poisoned");
+        let mut registry = REGISTERED_BUCKET_ROLES
+            .lock()
+            .expect("bucket-role registry poisoned");
         let map = registry.get_or_insert_with(HashMap::new);
         return match map.get(&bucket) {
             Some(registered) if *registered == requested_role => Ok(()),
@@ -503,7 +505,9 @@ fn ensure_remote_store(
         .with_region(region.clone());
     if let Some(role_arn) = &requested_role {
         let session_name = storage_options
-            .and_then(|opts| opts.get(crate::assume_role_credentials::ASSUMED_ROLE_SESSION_NAME_KEY))
+            .and_then(|opts| {
+                opts.get(crate::assume_role_credentials::ASSUMED_ROLE_SESSION_NAME_KEY)
+            })
             .cloned();
         let provider = crate::assume_role_credentials::AssumeRoleCredentialProvider::new(
             role_arn.clone(),
@@ -1308,8 +1312,7 @@ mod tests {
         // Bucket name unique to this test — REGISTERED_BUCKET_ROLES is a process-wide static
         // shared across every test in this binary, so reusing a name any other test touches would
         // make this test's outcome depend on test execution order.
-        let url =
-            ListingTableUrl::parse("s3://weft-loom-test-mismatch-bucket/table-a/").unwrap();
+        let url = ListingTableUrl::parse("s3://weft-loom-test-mismatch-bucket/table-a/").unwrap();
 
         let mut opts_role_a = HashMap::new();
         opts_role_a.insert(
@@ -1329,8 +1332,14 @@ mod tests {
         let err = ensure_remote_store(&state, &url, Some(&opts_role_b))
             .expect_err("a second, conflicting role for the same bucket must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("role-a"), "error should name the already-registered role: {msg}");
-        assert!(msg.contains("role-b"), "error should name the conflicting requested role: {msg}");
+        assert!(
+            msg.contains("role-a"),
+            "error should name the already-registered role: {msg}"
+        );
+        assert!(
+            msg.contains("role-b"),
+            "error should name the conflicting requested role: {msg}"
+        );
 
         // Same bucket, same role again — must succeed (idempotent, not just "first wins").
         ensure_remote_store(&state, &url, Some(&opts_role_a))
@@ -1338,8 +1347,9 @@ mod tests {
 
         // Same bucket, no role requested this time (e.g. a second table with no assume-role
         // config) — also a mismatch against the registered role-a identity, must be rejected.
-        let err = ensure_remote_store(&state, &url, None)
-            .expect_err("no-role-requested must be rejected when the bucket is already role-scoped");
+        let err = ensure_remote_store(&state, &url, None).expect_err(
+            "no-role-requested must be rejected when the bucket is already role-scoped",
+        );
         assert!(
             format!("{err}").contains("role-a"),
             "error should name the already-registered role"

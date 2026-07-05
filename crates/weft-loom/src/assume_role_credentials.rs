@@ -63,12 +63,17 @@ impl AssumeRoleCredentialProvider {
     /// A cached credential, if one exists and isn't within `REFRESH_MARGIN` of expiring. Never
     /// holds the lock across an `.await` — read it, decide, drop it, all synchronously.
     fn fresh_cached(&self) -> Option<Arc<AwsCredential>> {
-        let guard = self.cached.read().expect("assume-role credential cache poisoned");
+        let guard = self
+            .cached
+            .read()
+            .expect("assume-role credential cache poisoned");
         let (cred, expiry) = guard.as_ref()?;
         (SystemTime::now() + REFRESH_MARGIN < *expiry).then(|| cred.clone())
     }
 
-    async fn refresh(&self) -> Result<Arc<AwsCredential>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn refresh(
+        &self,
+    ) -> Result<Arc<AwsCredential>, Box<dyn std::error::Error + Send + Sync>> {
         // Serialize the actual STS call: only the caller that acquires this lock first proceeds
         // to AssumeRole; everyone else queues here, then finds a fresh cache entry (written by
         // the lock-holder below) and returns immediately without ever calling STS themselves.
@@ -98,8 +103,10 @@ impl AssumeRoleCredentialProvider {
             token: Some(sts_creds.session_token),
         });
 
-        *self.cached.write().expect("assume-role credential cache poisoned") =
-            Some((cred.clone(), expiry));
+        *self
+            .cached
+            .write()
+            .expect("assume-role credential cache poisoned") = Some((cred.clone(), expiry));
         Ok(cred)
     }
 }
