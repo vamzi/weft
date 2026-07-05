@@ -283,6 +283,7 @@ async fn register_table_async(
         metadata.format,
         &schema,
         batches,
+        &metadata.storage_options,
     )
     .await?;
 
@@ -328,7 +329,7 @@ async fn metadata_to_provider(
     match md.format {
         TableFormat::Parquet => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
-            ensure_remote_store(state, &url);
+            ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
                 .with_file_extension(".parquet");
             let (opts, file_schema) = apply_partition_columns(opts, md);
@@ -338,7 +339,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Csv => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
-            ensure_remote_store(state, &url);
+            ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts =
                 ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv");
             let (opts, file_schema) = apply_partition_columns(opts, md);
@@ -348,7 +349,7 @@ async fn metadata_to_provider(
         }
         TableFormat::Json => {
             let url = ListingTableUrl::parse(&md.location).map_err(loc_err(md))?;
-            ensure_remote_store(state, &url);
+            ensure_remote_store(state, &url, Some(&md.storage_options))?;
             let opts =
                 ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
             let (opts, file_schema) = apply_partition_columns(opts, md);
@@ -425,22 +426,40 @@ fn split_partition_schema(
     (Arc::new(Schema::new(file_fields)), part_cols)
 }
 
+/// Tracks which assumed-role identity (if any) each S3 bucket was registered with, for the
+/// lifetime of this process. DataFusion's object-store registry (`RuntimeEnv::register_object_store`)
+/// is keyed purely by `scheme://authority` (i.e. just the bucket) — it has no concept of two
+/// different credential identities coexisting for the same bucket within one session. If table A
+/// and table B live in the same bucket but declare different `fs.s3a.assumed.role.arn` values (or
+/// one declares one and the other doesn't), whichever is resolved first silently decides the
+/// identity for BOTH for the rest of the session unless something checks for the mismatch — this
+/// map is that check (see `ensure_remote_store`). One weft engine process backs one cluster
+/// (`weft-cl-<id>`), so process-wide scope here matches the session it's actually protecting.
+static REGISTERED_BUCKET_ROLES: std::sync::Mutex<Option<HashMap<String, Option<String>>>> =
+    std::sync::Mutex::new(None);
+
 /// Ensure an object store is registered on the session's runtime for a remote table location so
 /// DataFusion can read it. Currently handles `s3://` — credentials come from the environment or the
-/// EC2 instance role (IMDS) via object_store's default provider; no static keys. Registering on the
-/// shared runtime is idempotent and persists for the session, so query-time resolution finds it.
-/// `file://` and bare paths need nothing and are skipped.
+/// EC2 instance role (IMDS) via object_store's default provider; no static keys, UNLESS
+/// `storage_options` names `fs.s3a.assumed.role.arn` (Hadoop-AWS's assume-role config, resolved to
+/// a temporary session via `crate::assume_role_credentials::AssumeRoleCredentialProvider` — see
+/// its module docs). Registering on the shared runtime is idempotent and persists for the session,
+/// so query-time resolution finds it. `file://` and bare paths need nothing and are skipped.
+///
+/// Errors (rather than silently proceeding) if `bucket` was already registered under a DIFFERENT
+/// assumed-role identity than this call requests — seeing `Ok(())` from this function is a
+/// guarantee that the session's registered store for this bucket matches `storage_options`, not
+/// just "some store exists for this bucket." See `REGISTERED_BUCKET_ROLES`'s doc comment for why
+/// that guarantee needs an explicit check instead of being automatic.
 fn ensure_remote_store(
     state: &SessionState,
     url: &datafusion::datasource::listing::ListingTableUrl,
-) {
+    storage_options: Option<&HashMap<String, String>>,
+) -> DfResult<()> {
     if url.scheme() != "s3" {
-        return;
+        return Ok(());
     }
     let os_url = url.object_store(); // canonical `s3://bucket` key
-    if state.runtime_env().object_store(&os_url).is_ok() {
-        return; // already registered for this bucket
-    }
     // `os_url` is the canonical `s3://bucket/` — pull the bucket from the authority.
     let bucket = os_url
         .as_str()
@@ -449,20 +468,66 @@ fn ensure_remote_store(
         .unwrap_or("")
         .to_string();
     if bucket.is_empty() {
-        return;
+        return Ok(());
     }
+    let requested_role = storage_options
+        .and_then(|opts| opts.get(crate::assume_role_credentials::ASSUMED_ROLE_ARN_KEY))
+        .cloned();
+
+    if state.runtime_env().object_store(&os_url).is_ok() {
+        // Already registered for this bucket — confirm it was registered with the SAME identity
+        // this call is asking for. A mismatch means two tables in this bucket disagree on which
+        // role to assume, which DataFusion's registry has no way to honor simultaneously — that's
+        // a real misconfiguration to surface, not something to paper over by silently keeping
+        // whichever table happened to resolve first.
+        let mut registry = REGISTERED_BUCKET_ROLES.lock().expect("bucket-role registry poisoned");
+        let map = registry.get_or_insert_with(HashMap::new);
+        return match map.get(&bucket) {
+            Some(registered) if *registered == requested_role => Ok(()),
+            // Registered before this tracking map existed in this process's lifetime (shouldn't
+            // happen in practice — both paths go through this same function — but fails open
+            // rather than blocking reads that were working fine before this check existed).
+            None => Ok(()),
+            Some(registered) => Err(DataFusionError::Plan(format!(
+                "bucket `{bucket}` is already registered in this session using a different S3 \
+                 identity (assumed role {registered:?}) than this table requests \
+                 ({requested_role:?}) — DataFusion can only have one active identity per bucket \
+                 per session; two tables in the same bucket must agree on `fs.s3a.assumed.role.arn`"
+            ))),
+        };
+    }
+
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
-    match object_store::aws::AmazonS3Builder::from_env()
+    let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
-        .with_region(region)
-        .build()
-    {
+        .with_region(region.clone());
+    if let Some(role_arn) = &requested_role {
+        let session_name = storage_options
+            .and_then(|opts| opts.get(crate::assume_role_credentials::ASSUMED_ROLE_SESSION_NAME_KEY))
+            .cloned();
+        let provider = crate::assume_role_credentials::AssumeRoleCredentialProvider::new(
+            role_arn.clone(),
+            session_name,
+            region,
+        );
+        builder = builder.with_credentials(std::sync::Arc::new(provider));
+    }
+    match builder.build() {
         Ok(store) => {
             state
                 .runtime_env()
                 .register_object_store(os_url.as_ref(), Arc::new(store));
+            REGISTERED_BUCKET_ROLES
+                .lock()
+                .expect("bucket-role registry poisoned")
+                .get_or_insert_with(HashMap::new)
+                .insert(bucket, requested_role);
+            Ok(())
         }
-        Err(e) => eprintln!("warn: could not register S3 object store for `{bucket}`: {e}"),
+        Err(e) => {
+            eprintln!("warn: could not register S3 object store for `{bucket}`: {e}");
+            Ok(())
+        }
     }
 }
 
@@ -480,13 +545,14 @@ async fn write_batches_to_location(
     format: TableFormat,
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
+    storage_options: &HashMap<String, String>,
 ) -> DfResult<()> {
     use datafusion::datasource::listing::ListingTableUrl;
     use object_store::ObjectStoreExt;
 
     let url = ListingTableUrl::parse(location)
         .map_err(|e| DataFusionError::Plan(format!("bad table location `{location}`: {e}")))?;
-    ensure_remote_store(state, &url);
+    ensure_remote_store(state, &url, Some(storage_options))?;
     let store = state.runtime_env().object_store(&url)?;
 
     let ext = match format {
@@ -1225,5 +1291,58 @@ mod tests {
         // All 5 rows resolved (not NULL) and summed across both physical types.
         assert_eq!((c, s), (5, 36)); // 1+2+3+10+20
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the bug a code review caught: DataFusion's object-store registry is
+    /// keyed purely by bucket, so registering a second, differently-configured (or unconfigured)
+    /// identity for a bucket that already has one registered must be rejected, not silently
+    /// accepted with the FIRST table's identity — otherwise two tables in one bucket with
+    /// different `fs.s3a.assumed.role.arn` values would silently share whichever one resolved
+    /// first, a real cross-permission-boundary bug.
+    #[tokio::test]
+    async fn ensure_remote_store_rejects_mismatched_role_for_already_registered_bucket() {
+        use datafusion::datasource::listing::ListingTableUrl;
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        // Bucket name unique to this test — REGISTERED_BUCKET_ROLES is a process-wide static
+        // shared across every test in this binary, so reusing a name any other test touches would
+        // make this test's outcome depend on test execution order.
+        let url =
+            ListingTableUrl::parse("s3://weft-loom-test-mismatch-bucket/table-a/").unwrap();
+
+        let mut opts_role_a = HashMap::new();
+        opts_role_a.insert(
+            crate::assume_role_credentials::ASSUMED_ROLE_ARN_KEY.to_string(),
+            "arn:aws:iam::123456789012:role/weft-poolctl/role-a".to_string(),
+        );
+        ensure_remote_store(&state, &url, Some(&opts_role_a))
+            .expect("first registration for a fresh bucket must succeed");
+
+        // Same bucket, different assumed role — DataFusion has no way to honor both
+        // simultaneously, so this must be a loud error, not a silent reuse of role-a's identity.
+        let mut opts_role_b = HashMap::new();
+        opts_role_b.insert(
+            crate::assume_role_credentials::ASSUMED_ROLE_ARN_KEY.to_string(),
+            "arn:aws:iam::123456789012:role/weft-poolctl/role-b".to_string(),
+        );
+        let err = ensure_remote_store(&state, &url, Some(&opts_role_b))
+            .expect_err("a second, conflicting role for the same bucket must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("role-a"), "error should name the already-registered role: {msg}");
+        assert!(msg.contains("role-b"), "error should name the conflicting requested role: {msg}");
+
+        // Same bucket, same role again — must succeed (idempotent, not just "first wins").
+        ensure_remote_store(&state, &url, Some(&opts_role_a))
+            .expect("re-requesting the SAME role for an already-registered bucket must succeed");
+
+        // Same bucket, no role requested this time (e.g. a second table with no assume-role
+        // config) — also a mismatch against the registered role-a identity, must be rejected.
+        let err = ensure_remote_store(&state, &url, None)
+            .expect_err("no-role-requested must be rejected when the bucket is already role-scoped");
+        assert!(
+            format!("{err}").contains("role-a"),
+            "error should name the already-registered role"
+        );
     }
 }
