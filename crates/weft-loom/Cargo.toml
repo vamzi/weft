@@ -36,12 +36,21 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # `register_table`'s CTAS write path builds its own fresh runtime on a dedicated OS thread (the
 # DataFusion trait method is sync, but Glue/Hive/object-store writes are async) — needs `rt` in
-# [dependencies], not just as a test-only dev-dependency.
-tokio = { version = "1", features = ["rt"] }
+# [dependencies], not just as a test-only dev-dependency. `sync` adds `tokio::sync::Mutex`, used by
+# assume_role_credentials.rs to serialize concurrent STS AssumeRole calls (held across an await —
+# a std::sync::Mutex must never be held across one).
+tokio = { version = "1", features = ["rt", "sync"] }
 # `StreamExt::next` to drain a DataFusion `SendableRecordBatchStream` batch-by-batch in the CTAS
 # write path (stream the SELECT straight to storage instead of collecting it into driver memory).
 # Same 0.3 line the rest of the tree already pulls (weft-execution), so the lock is unchanged.
 futures = "0.3"
+# `sts:AssumeRole` for the Hadoop-AWS `fs.s3a.assumed.role.arn` config equivalent (see
+# assume_role_credentials.rs) — hand-rolling signed STS calls isn't worth the correctness risk
+# for this one call type, so this pulls in the official SDK rather than extending object_store's
+# own (crate-private) request-signing code. Pinned (not "1") to versions whose MSRV matches this
+# workspace's toolchain — newer releases require a rustc this repo doesn't pin to yet.
+aws-config = "=1.8.13"
+aws-sdk-sts = "=1.97.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

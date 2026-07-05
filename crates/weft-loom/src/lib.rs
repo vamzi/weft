@@ -23,6 +23,10 @@ use weft_common::{Error, Result};
 
 pub mod catalog_bridge;
 
+/// `sts:AssumeRole` credential provider for S3 access (Hadoop-AWS `fs.s3a.assumed.role.arn`
+/// equivalent) — see [`assume_role_credentials::AssumeRoleCredentialProvider`].
+mod assume_role_credentials;
+
 /// Case-insensitive file→table column matching for catalog-declared schemas (Glue/Hive parity).
 mod schema_adapt;
 
