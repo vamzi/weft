@@ -1,7 +1,7 @@
 //! Route distributable SQL through the driver/worker cluster.
 
 use weft_common::{Error, Result};
-use weft_execution::driver::{run_stages_obs, Cluster};
+use weft_execution::driver::{run_stages_obs, Cluster, ExchangeMode, StageDef};
 use weft_execution::flight::sync_udfs_to_worker;
 use weft_execution::membership::resolve_membership;
 use weft_execution::plan::plan_distributed;
@@ -30,6 +30,7 @@ pub async fn try_run_distributed(
         Err(Error::Unsupported(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    let cluster = Cluster::from_membership(membership);
 
     if let Some(json) = udf_json.filter(|s| !s.is_empty() && *s != "[]") {
         for ep in &endpoints {
@@ -56,7 +57,7 @@ pub async fn try_run_distributed(
                     operation_id: op.clone(),
                     stage_id: stage.stage_id as i32,
                     name: truncate_sql(&stage.sql),
-                    num_tasks: endpoints.len() as i32,
+                    num_tasks: stage_num_tasks(stage, &dq.stages, &cluster),
                     submission_time_ms: weft_observability::now_ms(),
                 });
         }
@@ -67,7 +68,6 @@ pub async fn try_run_distributed(
         }
     }
 
-    let cluster = Cluster::from_membership(membership);
     let store = tracker.map(|t| t.store().clone());
     let operation_id = tracker.map(|t| t.operation_id().to_string());
     let mut batches = run_stages_obs(&cluster, &dq.stages, store, operation_id).await?;
@@ -80,6 +80,20 @@ pub async fn try_run_distributed(
     }
 
     Ok(Some(batches))
+}
+
+fn stage_num_tasks(stage: &StageDef, stages: &[StageDef], cluster: &Cluster) -> i32 {
+    if stage.exchange == ExchangeMode::Forward {
+        return 1;
+    }
+    let is_output = !stages
+        .iter()
+        .any(|s| s.upstream_stage_ids.contains(&stage.stage_id));
+    if is_output && !stage.upstream_stage_ids.is_empty() {
+        cluster.num_partitions as i32
+    } else {
+        cluster.worker_count().max(1) as i32
+    }
 }
 
 /// Parse `spark.weft.workers` or `WEFT_WORKERS` (comma-separated `host:port` list).
@@ -120,5 +134,18 @@ mod tests {
         let w = parse_worker_list(Some("127.0.0.1:50561,127.0.0.1:50562"));
         assert_eq!(w.len(), 2);
         assert!(w[0].starts_with("http://"));
+    }
+
+    #[test]
+    fn forward_stage_reports_one_task() {
+        let cluster = Cluster::new(vec![
+            "http://127.0.0.1:50561".into(),
+            "http://127.0.0.1:50562".into(),
+        ]);
+        let stage = StageDef {
+            exchange: ExchangeMode::Forward,
+            ..StageDef::default()
+        };
+        assert_eq!(stage_num_tasks(&stage, &[stage.clone()], &cluster), 1);
     }
 }

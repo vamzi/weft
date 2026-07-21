@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan};
 use datafusion::sql::unparser::Unparser;
 use weft_common::{Error, Result};
+// Error used by plan_distributed fallback match.
 use weft_loom::Engine;
 
 use crate::driver::StageDef;
@@ -52,14 +53,31 @@ pub struct DistributedQuery {
     pub finalize_sql: Option<String>,
 }
 
-/// Derive a distributed plan for `sql`, or [`Error::Unsupported`] if its shape isn't handled yet.
+/// Derive a distributed plan for `sql`.
+///
+/// Tries the shape-based aggregator / broadcast / shuffle-join splitter first. When that returns
+/// [`Error::Unsupported`], falls back to a single-stage
+/// [`ExchangeMode::Forward`](crate::driver::ExchangeMode) plan (full SQL on one worker) via
+/// [`super::physical_splitter::plan_forward`]. The Forward path requires the scheduled worker to
+/// hold a complete copy of every referenced table (Sail shared-storage / full-replicate model).
 ///
 /// `replicated` names base tables that are present in **full** on every worker (small dimension
 /// tables). A join is auto-derived as a **broadcast join** — it runs locally per worker — as long as
-/// every table but one is replicated (so exactly one table is sharded). Joins between two *sharded*
-/// tables need an explicit shuffle-join plan (see `tests/distributed_join.rs`); auto-deriving those
-/// is a follow-up.
+/// every table but one is replicated (so exactly one table is sharded).
 pub async fn plan_distributed(
+    engine: &Engine,
+    sql: &str,
+    replicated: &[&str],
+) -> Result<DistributedQuery> {
+    match plan_distributed_shaped(engine, sql, replicated).await {
+        Ok(dq) => Ok(dq),
+        Err(Error::Unsupported(_)) => super::physical_splitter::plan_forward(engine, sql).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Shape-based splitter only (no Forward fallback). Used by tests that assert Unsupported.
+pub async fn plan_distributed_shaped(
     engine: &Engine,
     sql: &str,
     replicated: &[&str],

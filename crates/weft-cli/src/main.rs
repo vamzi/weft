@@ -270,3 +270,41 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
     args.get(i + 1).cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn local_cluster_mode_parses_workers() {
+        let parsed = server_mode(&args(&[
+            "weft",
+            "spark",
+            "server",
+            "--mode",
+            "local-cluster",
+            "--workers",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(parsed, ServerMode::LocalCluster { workers: 3 });
+    }
+
+    #[test]
+    fn local_cluster_mode_rejects_zero_workers() {
+        let parsed = server_mode(&args(&[
+            "weft",
+            "spark",
+            "server",
+            "--mode",
+            "local-cluster",
+            "--workers",
+            "0",
+        ]));
+        assert!(parsed.is_err());
+    }
+}
