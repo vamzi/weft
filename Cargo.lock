@@ -5427,6 +5427,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "prost 0.14.4",
+ "serde_json",
  "tokio",
  "tonic 0.14.6",
  "weft-common",

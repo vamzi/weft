@@ -32,7 +32,7 @@ use weft_loom::arrow::datatypes::{Schema, SchemaRef};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
-use crate::shuffle::protocol::{self, ShuffleReadTicket, StageTicket};
+use crate::shuffle::protocol::{self, ShuffleExchangeHeader, ShuffleReadTicket, StageTicket};
 use crate::shuffle::spill::{BucketCache, SpillStore};
 use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 
@@ -42,6 +42,10 @@ pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
 pub const ACTION_REGISTER_UDFS: &str = "register_udfs";
 /// Flight `do_action` type: liveness probe (driver heartbeats).
 pub const ACTION_HEALTH: &str = "health";
+/// Flight `do_action` type: liveness + slot probe.
+pub const ACTION_HEARTBEAT: &str = "heartbeat";
+/// Flight `do_action` type: accept/report simple task status payloads.
+pub const ACTION_TASK_STATUS: &str = "task_status";
 
 /// One stage's cached output: schema + partitioned buckets (memory or spilled).
 type CachedStage = (SchemaRef, BucketCache);
@@ -54,6 +58,9 @@ pub struct Worker {
     engine: Arc<Engine>,
     stage_outputs: StageCache,
     spill: Option<SpillStore>,
+    task_slots: usize,
+    active_tasks: Arc<Mutex<usize>>,
+    last_task_status: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Worker {
@@ -63,6 +70,9 @@ impl Worker {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
             spill: SpillStore::from_env(),
+            task_slots: worker_task_slots(),
+            active_tasks: Arc::new(Mutex::new(0)),
+            last_task_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,6 +88,74 @@ impl Worker {
             .expect("stage cache poisoned")
             .clear();
     }
+
+    fn active_task_count(&self) -> usize {
+        *self.active_tasks.lock().expect("task counter poisoned")
+    }
+
+    fn heartbeat_payload(&self) -> String {
+        serde_json::json!({
+            "ok": true,
+            "slots_total": self.task_slots,
+            "slots_used": self.active_task_count(),
+        })
+        .to_string()
+    }
+
+    fn task_status_payload(&self) -> String {
+        let last_task_status = self
+            .last_task_status
+            .lock()
+            .expect("task status poisoned")
+            .as_ref()
+            .map(|body| String::from_utf8_lossy(body).into_owned());
+        serde_json::json!({
+            "ok": true,
+            "slots_total": self.task_slots,
+            "slots_used": self.active_task_count(),
+            "last_task_status": last_task_status,
+        })
+        .to_string()
+    }
+
+    fn try_acquire_task_slot(&self) -> std::result::Result<TaskSlotGuard, Status> {
+        let mut active = self.active_tasks.lock().expect("task counter poisoned");
+        if *active >= self.task_slots {
+            return Err(Status::resource_exhausted(format!(
+                "no task slots available ({}/{})",
+                *active, self.task_slots
+            )));
+        }
+        *active += 1;
+        Ok(TaskSlotGuard {
+            active_tasks: self.active_tasks.clone(),
+        })
+    }
+}
+
+struct TaskSlotGuard {
+    active_tasks: Arc<Mutex<usize>>,
+}
+
+impl Drop for TaskSlotGuard {
+    fn drop(&mut self) {
+        let mut active = self.active_tasks.lock().expect("task counter poisoned");
+        *active = active.saturating_sub(1);
+    }
+}
+
+/// Number of concurrent stage tasks this worker should admit.
+pub fn worker_task_slots() -> usize {
+    std::env::var("WEFT_WORKER_TASK_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .max(1)
 }
 
 type FlightStream<T> =
@@ -101,6 +179,13 @@ fn batches_to_stream(batches: Vec<RecordBatch>) -> FlightStream<FlightData> {
         .build(input)
         .map_err(|e| Status::internal(e.to_string()))
         .boxed()
+}
+
+fn action_response(body: impl Into<Vec<u8>>) -> Response<FlightStream<arrow_flight::Result>> {
+    let body = arrow_flight::Result {
+        body: body.into().into(),
+    };
+    Response::new(futures::stream::iter(vec![Ok(body)]).boxed())
 }
 
 impl Worker {
@@ -180,6 +265,45 @@ impl Worker {
         }
         batches
     }
+
+    /// Append one pushed shuffle partition to the stage cache so future pull-based
+    /// `ShuffleReadTicket`s observe the same data.
+    fn cache_pushed_partition(
+        &self,
+        header: ShuffleExchangeHeader,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        let mut guard = self.stage_outputs.lock().expect("stage cache poisoned");
+        match guard.get_mut(&header.stage_id) {
+            Some((existing_schema, cache)) => {
+                if existing_schema.as_ref() != schema.as_ref() {
+                    return Err(Error::Execution(format!(
+                        "do_exchange schema mismatch for stage {} partition {}",
+                        header.stage_id, header.partition_id
+                    )));
+                }
+                cache.append_partition(
+                    existing_schema.clone(),
+                    header.stage_id,
+                    header.partition_id,
+                    batches,
+                    self.spill.as_ref(),
+                )
+            }
+            None => {
+                let cache = BucketCache::from_partition(
+                    schema.clone(),
+                    header.stage_id,
+                    header.partition_id,
+                    batches,
+                    self.spill.as_ref(),
+                )?;
+                guard.insert(header.stage_id, (schema, cache));
+                Ok(())
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -206,7 +330,10 @@ impl FlightService for Worker {
                 .sql(&sql)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?,
-            protocol::Ticket::Stage(t) => self.run_stage(t).await?,
+            protocol::Ticket::Stage(t) => {
+                let _slot = self.try_acquire_task_slot()?;
+                self.run_stage(t).await?
+            }
             protocol::Ticket::ShuffleRead(r) => self.read_shuffle(r),
         };
         Ok(Response::new(batches_to_stream(batches)))
@@ -256,26 +383,23 @@ impl FlightService for Worker {
         match action.r#type.as_str() {
             ACTION_CLEAR_STAGES => {
                 self.clear_stages();
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+                Ok(action_response(b"ok".to_vec()))
             }
             ACTION_REGISTER_UDFS => {
                 let payload = String::from_utf8_lossy(&action.body);
                 self.engine
                     .register_udfs_json(&payload)
                     .map_err(|e| Status::internal(e.to_string()))?;
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+                Ok(action_response(b"ok".to_vec()))
             }
-            ACTION_HEALTH => {
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+            ACTION_HEALTH => Ok(action_response(b"ok".to_vec())),
+            ACTION_HEARTBEAT => Ok(action_response(self.heartbeat_payload().into_bytes())),
+            ACTION_TASK_STATUS => {
+                if !action.body.is_empty() {
+                    *self.last_task_status.lock().expect("task status poisoned") =
+                        Some(action.body.to_vec());
+                }
+                Ok(action_response(self.task_status_payload().into_bytes()))
             }
             other => Err(Status::unimplemented(format!(
                 "flight do_action `{other}` not implemented"
@@ -288,13 +412,50 @@ impl FlightService for Worker {
     ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
         unimpl("list_actions")
     }
-    /// The streaming shuffle exchange — left as a documented stub. The MVP uses the simpler
-    /// pull-based `do_get(ShuffleReadTicket)` path instead of a `do_exchange` handshake.
+    /// Streaming shuffle exchange. The first frame is a metadata-only exchange header
+    /// (`stage_id` + `partition_id`), followed by normal Arrow IPC FlightData frames. The received
+    /// batches are appended into the same stage cache used by pull-based `ShuffleReadTicket`.
     async fn do_exchange(
         &self,
-        _r: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
-        unimpl("do_exchange")
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("do_exchange header: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("do_exchange missing header"))?;
+        let header_bytes = if first.app_metadata.is_empty() {
+            first.data_header.as_ref()
+        } else {
+            first.app_metadata.as_ref()
+        };
+        let header = ShuffleExchangeHeader::decode(header_bytes)
+            .map_err(|e| Status::invalid_argument(format!("decode do_exchange header: {e}")))?;
+
+        let mut rb = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|s| FlightError::Tonic(Box::new(s))),
+        );
+        let mut batches = Vec::new();
+        while let Some(batch) = rb.next().await {
+            batches.push(batch.map_err(|e| Status::internal(format!("flight decode: {e}")))?);
+        }
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .or_else(|| rb.schema().cloned())
+            .ok_or_else(|| Status::invalid_argument("do_exchange missing Arrow schema"))?;
+
+        self.cache_pushed_partition(header, schema, batches)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let ack = FlightData {
+            flight_descriptor: None,
+            data_header: Vec::new().into(),
+            app_metadata: b"ok".to_vec().into(),
+            data_body: Vec::new().into(),
+        };
+        Ok(Response::new(futures::stream::iter(vec![Ok(ack)]).boxed()))
     }
 }
 
@@ -334,14 +495,23 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
     Err(last_err.unwrap_or_else(|| Error::Execution("do_get failed".into())))
 }
 
-async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
-    // Build the channel via tonic directly (arrow-flight's generated client has no `connect`).
+/// Connect to a Flight worker with short timeouts so CI port conflicts fail fast instead of
+/// hanging on the default TCP SYN retry window (~minutes).
+async fn connect_flight(
+    endpoint: String,
+) -> Result<FlightServiceClient<tonic::transport::Channel>> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(30))
         .connect()
         .await
         .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    let mut client = FlightServiceClient::new(channel);
+    Ok(FlightServiceClient::new(channel))
+}
+
+async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
+    let mut client = connect_flight(endpoint).await?;
     let ticket = Ticket {
         ticket: ticket_bytes.into(),
     };
@@ -385,13 +555,43 @@ pub async fn health_check_worker(endpoint: String) -> Result<()> {
     do_action(endpoint, ACTION_HEALTH, b"").await
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerHeartbeat {
+    pub slots_total: Option<usize>,
+    pub slots_used: Option<usize>,
+}
+
+impl WorkerHeartbeat {
+    pub fn has_available_slot(&self) -> bool {
+        match (self.slots_total, self.slots_used) {
+            (Some(total), Some(used)) => used < total,
+            _ => true,
+        }
+    }
+}
+
+/// Heartbeat probe. New workers return slot metadata; older `ok`-only workers are accepted.
+pub async fn heartbeat_worker(endpoint: String) -> Result<WorkerHeartbeat> {
+    let bodies = do_action_collect(endpoint, ACTION_HEARTBEAT, b"").await?;
+    Ok(parse_heartbeat_bodies(&bodies))
+}
+
+/// Send or fetch the worker's simple task status payload.
+pub async fn task_status_worker(endpoint: String, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+    do_action_collect(endpoint, ACTION_TASK_STATUS, payload).await
+}
+
 async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<()> {
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
-        .map_err(|e| Error::Io(format!("endpoint: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    let mut client = FlightServiceClient::new(channel);
+    do_action_collect(endpoint, action_type, body).await?;
+    Ok(())
+}
+
+async fn do_action_collect(
+    endpoint: String,
+    action_type: &str,
+    body: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    let mut client = connect_flight(endpoint).await?;
     let action = Action {
         r#type: action_type.to_string(),
         body: body.to_vec().into(),
@@ -401,10 +601,40 @@ async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<(
         .await
         .map_err(|e| Error::Execution(format!("do_action: {}", e.message())))?
         .into_inner();
+    let mut bodies = Vec::new();
     while let Some(item) = stream.next().await {
-        item.map_err(|e| Error::Execution(format!("do_action stream: {e}")))?;
+        bodies.push(
+            item.map_err(|e| Error::Execution(format!("do_action stream: {e}")))?
+                .body
+                .to_vec(),
+        );
     }
-    Ok(())
+    Ok(bodies)
+}
+
+fn parse_heartbeat_bodies(bodies: &[Vec<u8>]) -> WorkerHeartbeat {
+    bodies
+        .iter()
+        .find_map(|body| parse_heartbeat_payload(body))
+        .unwrap_or_default()
+}
+
+fn parse_heartbeat_payload(body: &[u8]) -> Option<WorkerHeartbeat> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if text.is_empty() || text == "ok" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(WorkerHeartbeat {
+        slots_total: value
+            .get("slots_total")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        slots_used: value
+            .get("slots_used")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+    })
 }
 
 /// Driver: send raw `sql` to a worker over Flight and collect the result (single-stage path).
@@ -456,19 +686,138 @@ pub async fn pull_bucket_with_retry(
     Err(last.unwrap_or_else(|| Error::Execution("pull_bucket failed".into())))
 }
 
+/// Push one shuffle bucket to a worker over Flight `do_exchange`.
+///
+/// The receiver appends the batches into its local cache under `(stage_id, target_partition)`, so
+/// the same data remains readable via [`pull_bucket`] as a fallback path.
+pub async fn push_bucket(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
+    push_bucket_with_schema(endpoint, stage_id, target_partition, schema, batches).await
+}
+
+/// Push one shuffle bucket with an explicit schema, useful when the bucket has zero rows.
+pub async fn push_bucket_with_schema(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    const MAX_TRIES: u32 = 3;
+    let mut last = None;
+    for attempt in 0..MAX_TRIES {
+        match push_bucket_once(
+            endpoint.clone(),
+            stage_id,
+            target_partition,
+            schema.clone(),
+            batches.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if is_pull_retryable(&e) && attempt + 1 < MAX_TRIES => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Execution("push_bucket failed".into())))
+}
+
+async fn push_bucket_once(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let header = exchange_header_frame(stage_id, target_partition);
+    let mut frames = vec![header];
+    let input = futures::stream::iter(batches.into_iter().map(Ok::<_, FlightError>));
+    let mut encoded = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(input);
+    while let Some(frame) = encoded.next().await {
+        frames.push(frame.map_err(|e| Error::Execution(format!("flight encode: {e}")))?);
+    }
+
+    let mut client = connect_flight(endpoint).await?;
+    let mut stream = client
+        .do_exchange(futures::stream::iter(frames))
+        .await
+        .map_err(|e| Error::Execution(format!("do_exchange: {}", e.message())))?
+        .into_inner();
+    while let Some(item) = stream.next().await {
+        item.map_err(|e| Error::Execution(format!("do_exchange stream: {e}")))?;
+    }
+    Ok(())
+}
+
+fn exchange_header_frame(stage_id: u32, partition_id: u32) -> FlightData {
+    let header = ShuffleExchangeHeader {
+        stage_id,
+        partition_id,
+    }
+    .encode();
+    FlightData {
+        flight_descriptor: None,
+        data_header: Vec::new().into(),
+        app_metadata: header.to_vec().into(),
+        data_body: Vec::new().into(),
+    }
+}
+
 fn is_pull_retryable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
-    s.contains("connect") || s.contains("unavailable") || s.contains("do_get")
+    s.contains("connect")
+        || s.contains("unavailable")
+        || s.contains("do_get")
+        || s.contains("do_exchange")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use weft_loom::arrow::array::Int32Array;
+    use weft_loom::arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn heartbeat_payload_parses_slots() {
+        let heartbeat =
+            parse_heartbeat_payload(br#"{"ok":true,"slots_total":4,"slots_used":2}"#).unwrap();
+        assert_eq!(heartbeat.slots_total, Some(4));
+        assert_eq!(heartbeat.slots_used, Some(2));
+        assert!(heartbeat.has_available_slot());
+
+        let full =
+            parse_heartbeat_payload(br#"{"ok":true,"slots_total":4,"slots_used":4}"#).unwrap();
+        assert!(!full.has_available_slot());
+    }
+
+    #[test]
+    fn ok_heartbeat_is_backward_compatible() {
+        let heartbeat = parse_heartbeat_bodies(&[b"ok".to_vec()]);
+        assert_eq!(heartbeat, WorkerHeartbeat::default());
+        assert!(heartbeat.has_available_slot());
+    }
 
     #[tokio::test]
     async fn distributed_single_stage_roundtrip() {
-        let port = 50561;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -501,7 +850,10 @@ mod tests {
 
     #[tokio::test]
     async fn stage_ticket_runs_as_leaf() {
-        let port = 50562;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -539,7 +891,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_shuffle_bucket_carries_producer_schema() {
-        let port = 50563;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -610,5 +965,54 @@ mod tests {
             }
         }
         out.expect("consumer over empty typed bucket should plan and run");
+    }
+
+    #[tokio::test]
+    async fn do_exchange_pushes_partition_then_pull_reads_it() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let mut pushed = false;
+        for _ in 0..50 {
+            match push_bucket_with_schema(
+                endpoint.clone(),
+                99,
+                2,
+                schema.clone(),
+                vec![batch.clone()],
+            )
+            .await
+            {
+                Ok(()) => {
+                    pushed = true;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        assert!(pushed, "worker did not accept do_exchange push");
+
+        let pulled = pull_bucket(endpoint, 99, 2).await.unwrap();
+        assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let values = pulled[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 10);
+        assert_eq!(values.value(2), 30);
     }
 }

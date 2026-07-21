@@ -61,8 +61,9 @@ pub struct ServerConfig {
     /// `spark.sql.catalog.prod.type=hive`). Seeds the session config so external catalogs are
     /// live before the first client connects; clients can still add more via the `Config` RPC.
     pub catalogs: std::collections::HashMap<String, String>,
-    /// Arrow Flight worker endpoints for distributed execution (`host:port`, comma-separated in
-    /// env as `WEFT_WORKERS`). When non-empty, auto-splittable queries route through the driver.
+    /// Arrow Flight worker endpoints for distributed execution (`host:port` or
+    /// `http(s)://host:port`, comma-separated in env as `WEFT_WORKERS`). When non-empty,
+    /// auto-splittable queries route through the driver.
     pub workers: Vec<String>,
 }
 

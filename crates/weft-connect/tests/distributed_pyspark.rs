@@ -13,9 +13,10 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
-const PORT: u16 = 50570;
-const W0: u16 = 50571;
-const W1: u16 = 50572;
+// Keep clear of weft-execution distributed_* tests (50571–50634 range).
+const PORT: u16 = 50870;
+const W0: u16 = 50871;
+const W1: u16 = 50872;
 
 fn make_batch(start: i64, end: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -41,6 +42,8 @@ async fn distributed_groupby_via_connect() {
         let e = Arc::new(Engine::new());
         e.register_batches("t", vec![make_batch(start, end)])
             .unwrap();
+        e.register_batches("full_t", vec![make_batch(0, N)])
+            .unwrap();
         let ee = e.clone();
         tokio::spawn(async move {
             let _ = serve_worker(port, ee).await;
@@ -50,6 +53,9 @@ async fn distributed_groupby_via_connect() {
     let driver_engine = Arc::new(Engine::new());
     driver_engine
         .register_batches("t", vec![make_batch(0, N)])
+        .unwrap();
+    driver_engine
+        .register_batches("full_t", vec![make_batch(0, N)])
         .unwrap();
 
     let mut service = WeftService::with_engine(driver_engine);
@@ -68,6 +74,9 @@ async fn distributed_groupby_via_connect() {
     single
         .register_batches("t", vec![make_batch(0, N)])
         .unwrap();
+    single
+        .register_batches("full_t", vec![make_batch(0, N)])
+        .unwrap();
     let expected_rows: usize = single
         .sql("SELECT k, SUM(v) AS s FROM t GROUP BY k")
         .await
@@ -78,6 +87,18 @@ async fn distributed_groupby_via_connect() {
 
     let mut client = connect(&format!("http://127.0.0.1:{PORT}")).await;
     let batches = exec_sql(&mut client, "SELECT k, SUM(v) AS s FROM t GROUP BY k").await;
+    let got_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(got_rows, expected_rows);
+
+    let forward_sql = "SELECT k, v FROM full_t WHERE v < 3 ORDER BY v";
+    let expected_rows: usize = single
+        .sql(forward_sql)
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    let batches = exec_sql(&mut client, forward_sql).await;
     let got_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(got_rows, expected_rows);
 }

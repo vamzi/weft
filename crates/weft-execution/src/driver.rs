@@ -6,7 +6,8 @@
 //! owner, pulling upstream buckets and returning results.
 //!
 //! Shuffle partition count defaults to worker count but can be overridden via
-//! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`).
+//! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`) or, when that is unset,
+//! `WEFT_DEFAULT_PARALLELISM`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +29,12 @@ pub fn shuffle_partitions(worker_count: usize) -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n: &u32| n > 0)
+        .or_else(|| {
+            std::env::var("WEFT_DEFAULT_PARALLELISM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &u32| n > 0)
+        })
         .unwrap_or(worker_count.max(1) as u32)
 }
 
@@ -82,6 +89,15 @@ impl Cluster {
     }
 }
 
+/// How a stage exchanges data with downstream stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExchangeMode {
+    #[default]
+    Hash,
+    Broadcast,
+    Forward,
+}
+
 /// One stage of a distributed query.
 #[derive(Debug, Clone)]
 pub struct StageDef {
@@ -89,6 +105,38 @@ pub struct StageDef {
     pub sql: String,
     pub upstream_stage_ids: Vec<u32>,
     pub hash_key_cols: Vec<u32>,
+    pub exchange: ExchangeMode,
+    pub plan_fragment: Option<Vec<u8>>,
+}
+
+impl Default for StageDef {
+    fn default() -> Self {
+        Self {
+            stage_id: 0,
+            sql: String::new(),
+            upstream_stage_ids: Vec::new(),
+            hash_key_cols: Vec::new(),
+            exchange: ExchangeMode::Hash,
+            plan_fragment: None,
+        }
+    }
+}
+
+impl StageDef {
+    pub fn new(
+        stage_id: u32,
+        sql: impl Into<String>,
+        upstream_stage_ids: Vec<u32>,
+        hash_key_cols: Vec<u32>,
+    ) -> Self {
+        Self {
+            stage_id,
+            sql: sql.into(),
+            upstream_stage_ids,
+            hash_key_cols,
+            ..Self::default()
+        }
+    }
 }
 
 /// A two-stage distributed aggregation plan: `partial-agg → hash shuffle → final-agg`.
@@ -102,18 +150,13 @@ pub struct DistributedPlan {
 impl DistributedPlan {
     pub fn into_stages(&self) -> Vec<StageDef> {
         vec![
-            StageDef {
-                stage_id: 0,
-                sql: self.partial_sql.clone(),
-                upstream_stage_ids: vec![],
-                hash_key_cols: self.hash_key_cols.clone(),
-            },
-            StageDef {
-                stage_id: 1,
-                sql: self.final_sql.clone(),
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(
+                0,
+                self.partial_sql.clone(),
+                vec![],
+                self.hash_key_cols.clone(),
+            ),
+            StageDef::new(1, self.final_sql.clone(), vec![0], vec![]),
         ]
     }
 }
@@ -290,21 +333,110 @@ pub async fn run_stages_obs(
         }
     }
 
-    // Output stage: per-worker scatter (global agg) or per-partition rendezvous shuffle.
+    // Output stage:
+    // - Forward: run once on a single worker (full-SQL / Sail shared-storage coverage path)
+    // - scatter (no upstreams, no hash keys): every worker runs local SQL (global partial agg)
+    // - else: per-partition rendezvous shuffle read
     let scatter_output = output.upstream_stage_ids.is_empty() && output.hash_key_cols.is_empty();
     let mut out = Vec::new();
     refresh_cluster_workers(&mut cluster);
     let w = cluster.num_partitions;
-    if scatter_output {
+    if output.exchange == ExchangeMode::Forward {
+        let endpoint =
+            cluster.workers.first().cloned().ok_or_else(|| {
+                Error::Execution("forward stage requires at least one worker".into())
+            })?;
+        let host = executor_id(&endpoint);
+        let stage_id = output.stage_id as i32;
+        let task_id = alloc_task_id(&store, 0);
+        emit_task_started(&store, &operation_id, stage_id, task_id, &host);
+        let ticket = stage_ticket(output, 0, 1, &cluster, false);
+        let start = std::time::Instant::now();
+        match run_stage_with_retry(&cluster.membership, endpoint, ticket, &lineage, &stage_map)
+            .await
+        {
+            Ok(batches) => {
+                let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                emit_task_finished(
+                    &store,
+                    &operation_id,
+                    stage_id,
+                    task_id,
+                    &host,
+                    TaskStatus::Success,
+                    start.elapsed().as_millis() as i64,
+                    0,
+                    0,
+                    rows,
+                );
+                out = batches;
+            }
+            Err(e) => {
+                emit_task_finished(
+                    &store,
+                    &operation_id,
+                    stage_id,
+                    task_id,
+                    &host,
+                    TaskStatus::Failed,
+                    start.elapsed().as_millis() as i64,
+                    0,
+                    0,
+                    0,
+                );
+                return Err(e);
+            }
+        }
+    } else if scatter_output {
         let mut futs = Vec::new();
         for (i, endpoint) in cluster.workers.iter().enumerate() {
             let ticket = stage_ticket(output, i as u32, w, &cluster, false);
             let membership = cluster.membership.clone();
             let ep = endpoint.clone();
+            let host = executor_id(&ep);
             let lineage = lineage.clone();
             let stage_map = stage_map.clone();
+            let store_c = store.clone();
+            let op_c = operation_id.clone();
+            let stage_id = output.stage_id as i32;
+            let task_id = alloc_task_id(&store, i as i64);
+            emit_task_started(&store, &operation_id, stage_id, task_id, &host);
             futs.push(async move {
-                run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await
+                let start = std::time::Instant::now();
+                let result =
+                    run_stage_with_retry(&membership, ep, ticket, &lineage, &stage_map).await;
+                match &result {
+                    Ok(batches) => {
+                        let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Success,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            0,
+                            rows,
+                        );
+                    }
+                    Err(_) => {
+                        emit_task_finished(
+                            &store_c,
+                            &op_c,
+                            stage_id,
+                            task_id,
+                            &host,
+                            TaskStatus::Failed,
+                            start.elapsed().as_millis() as i64,
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                }
+                result
             });
         }
         for r in futures::future::join_all(futs).await {
@@ -326,20 +458,65 @@ pub async fn run_stages_obs(
             let cluster = cluster.clone();
             let lineage = lineage.clone();
             let stage_map = stage_map.clone();
+            let host = executor_id(&endpoint);
+            let store_c = store.clone();
+            let op_c = operation_id.clone();
+            let stage_id = output.stage_id as i32;
+            let task_ids: Vec<(u32, i64)> = parts
+                .iter()
+                .copied()
+                .map(|p| {
+                    let task_id = alloc_task_id(&store, p as i64);
+                    emit_task_started(&store, &operation_id, stage_id, task_id, &host);
+                    (p, task_id)
+                })
+                .collect();
             ep_futs.push(async move {
                 let mut local = Vec::new();
-                for p in parts {
+                for (p, task_id) in task_ids {
                     let ticket = stage_ticket(&output, p, w, &cluster, false);
-                    local.extend(
-                        run_stage_with_retry(
-                            &membership,
-                            endpoint.clone(),
-                            ticket,
-                            &lineage,
-                            &stage_map,
-                        )
-                        .await?,
-                    );
+                    let start = std::time::Instant::now();
+                    match run_stage_with_retry(
+                        &membership,
+                        endpoint.clone(),
+                        ticket,
+                        &lineage,
+                        &stage_map,
+                    )
+                    .await
+                    {
+                        Ok(batches) => {
+                            let rows: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
+                            emit_task_finished(
+                                &store_c,
+                                &op_c,
+                                stage_id,
+                                task_id,
+                                &host,
+                                TaskStatus::Success,
+                                start.elapsed().as_millis() as i64,
+                                rows * 8,
+                                0,
+                                rows,
+                            );
+                            local.extend(batches);
+                        }
+                        Err(e) => {
+                            emit_task_finished(
+                                &store_c,
+                                &op_c,
+                                stage_id,
+                                task_id,
+                                &host,
+                                TaskStatus::Failed,
+                                start.elapsed().as_millis() as i64,
+                                0,
+                                0,
+                                0,
+                            );
+                            return Err(e);
+                        }
+                    }
                 }
                 Ok::<_, Error>(local)
             });
@@ -347,6 +524,19 @@ pub async fn run_stages_obs(
         for r in futures::future::join_all(ep_futs).await {
             out.extend(r?);
         }
+    }
+
+    if let (Some(ref s), Some(ref op)) = (&store, &operation_id) {
+        s.emit(ExecutionEvent::StageFinished {
+            operation_id: op.clone(),
+            stage_id: output.stage_id as i32,
+            status: StageStatus::Complete,
+            completion_time_ms: now_ms(),
+            shuffle_read_bytes: 0,
+            shuffle_write_bytes: 0,
+            input_rows: 0,
+            output_rows: out.iter().map(|b| b.num_rows() as i64).sum(),
+        });
     }
 
     // Evict stage caches on all workers after the query completes.
@@ -361,6 +551,66 @@ pub async fn run_stages_obs(
         data
     };
     Ok(unify_schema(out))
+}
+
+fn executor_id(endpoint: &str) -> String {
+    endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
+}
+
+fn alloc_task_id(store: &Option<SharedStore>, fallback: i64) -> i64 {
+    store
+        .as_ref()
+        .map(|s| s.alloc_task_id())
+        .unwrap_or(fallback)
+}
+
+fn emit_task_started(
+    store: &Option<SharedStore>,
+    operation_id: &Option<String>,
+    stage_id: i32,
+    task_id: i64,
+    executor_id: &str,
+) {
+    if let (Some(s), Some(op)) = (store, operation_id) {
+        s.emit(ExecutionEvent::TaskStarted {
+            operation_id: op.clone(),
+            stage_id,
+            task_id,
+            executor_id: executor_id.to_string(),
+            launch_time_ms: now_ms(),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_task_finished(
+    store: &Option<SharedStore>,
+    operation_id: &Option<String>,
+    stage_id: i32,
+    task_id: i64,
+    executor_id: &str,
+    status: TaskStatus,
+    duration_ms: i64,
+    shuffle_read_bytes: i64,
+    shuffle_write_bytes: i64,
+    output_rows: i64,
+) {
+    if let (Some(s), Some(op)) = (store, operation_id) {
+        s.emit(ExecutionEvent::TaskFinished {
+            operation_id: op.clone(),
+            stage_id,
+            task_id,
+            executor_id: executor_id.to_string(),
+            status,
+            duration_ms,
+            shuffle_read_bytes,
+            shuffle_write_bytes,
+            output_rows,
+        });
+    }
 }
 
 /// Refresh worker list from live membership (autoscaling between stage barriers).
@@ -408,7 +658,7 @@ fn stage_ticket(
             cluster.workers.clone()
         },
         stage_sql: stage.sql.clone(),
-        plan_fragment: vec![],
+        plan_fragment: stage.plan_fragment.clone().unwrap_or_default(),
         hash_key_cols: stage.hash_key_cols.clone(),
         upstream_stage_ids: stage.upstream_stage_ids.clone(),
         produce,
@@ -437,5 +687,17 @@ mod tests {
         let o1 = cluster.owner_endpoint(1).unwrap();
         assert!(o0 == "a:1" || o0 == "b:1");
         assert!(o1 == "a:1" || o1 == "b:1");
+    }
+
+    #[test]
+    fn stage_def_constructor_sets_additive_defaults() {
+        let mut stage = StageDef::new(7, "SELECT 1", vec![3], vec![0]);
+        assert_eq!(stage.exchange, ExchangeMode::Hash);
+        assert_eq!(stage.plan_fragment, None);
+
+        stage.plan_fragment = Some(vec![1, 2, 3]);
+        let cluster = Cluster::new(vec!["a:1".into()]);
+        let ticket = stage_ticket(&stage, 0, 1, &cluster, true);
+        assert_eq!(ticket.plan_fragment, vec![1, 2, 3]);
     }
 }
