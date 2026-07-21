@@ -32,7 +32,7 @@ use weft_loom::arrow::datatypes::{Schema, SchemaRef};
 use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 
-use crate::shuffle::protocol::{self, ShuffleReadTicket, StageTicket};
+use crate::shuffle::protocol::{self, ShuffleExchangeHeader, ShuffleReadTicket, StageTicket};
 use crate::shuffle::spill::{BucketCache, SpillStore};
 use crate::shuffle::{hash_partition, SHUFFLE_INPUT_TABLE};
 
@@ -180,6 +180,45 @@ impl Worker {
         }
         batches
     }
+
+    /// Append one pushed shuffle partition to the stage cache so future pull-based
+    /// `ShuffleReadTicket`s observe the same data.
+    fn cache_pushed_partition(
+        &self,
+        header: ShuffleExchangeHeader,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        let mut guard = self.stage_outputs.lock().expect("stage cache poisoned");
+        match guard.get_mut(&header.stage_id) {
+            Some((existing_schema, cache)) => {
+                if existing_schema.as_ref() != schema.as_ref() {
+                    return Err(Error::Execution(format!(
+                        "do_exchange schema mismatch for stage {} partition {}",
+                        header.stage_id, header.partition_id
+                    )));
+                }
+                cache.append_partition(
+                    existing_schema.clone(),
+                    header.stage_id,
+                    header.partition_id,
+                    batches,
+                    self.spill.as_ref(),
+                )
+            }
+            None => {
+                let cache = BucketCache::from_partition(
+                    schema.clone(),
+                    header.stage_id,
+                    header.partition_id,
+                    batches,
+                    self.spill.as_ref(),
+                )?;
+                guard.insert(header.stage_id, (schema, cache));
+                Ok(())
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -288,13 +327,50 @@ impl FlightService for Worker {
     ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
         unimpl("list_actions")
     }
-    /// The streaming shuffle exchange — left as a documented stub. The MVP uses the simpler
-    /// pull-based `do_get(ShuffleReadTicket)` path instead of a `do_exchange` handshake.
+    /// Streaming shuffle exchange. The first frame is a metadata-only exchange header
+    /// (`stage_id` + `partition_id`), followed by normal Arrow IPC FlightData frames. The received
+    /// batches are appended into the same stage cache used by pull-based `ShuffleReadTicket`.
     async fn do_exchange(
         &self,
-        _r: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
-        unimpl("do_exchange")
+        let mut stream = request.into_inner();
+        let first = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("do_exchange header: {e}")))?
+            .ok_or_else(|| Status::invalid_argument("do_exchange missing header"))?;
+        let header_bytes = if first.app_metadata.is_empty() {
+            first.data_header.as_ref()
+        } else {
+            first.app_metadata.as_ref()
+        };
+        let header = ShuffleExchangeHeader::decode(header_bytes)
+            .map_err(|e| Status::invalid_argument(format!("decode do_exchange header: {e}")))?;
+
+        let mut rb = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(|s| FlightError::Tonic(Box::new(s))),
+        );
+        let mut batches = Vec::new();
+        while let Some(batch) = rb.next().await {
+            batches.push(batch.map_err(|e| Status::internal(format!("flight decode: {e}")))?);
+        }
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .or_else(|| rb.schema().cloned())
+            .ok_or_else(|| Status::invalid_argument("do_exchange missing Arrow schema"))?;
+
+        self.cache_pushed_partition(header, schema, batches)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let ack = FlightData {
+            flight_descriptor: None,
+            data_header: Vec::new().into(),
+            app_metadata: b"ok".to_vec().into(),
+            data_body: Vec::new().into(),
+        };
+        Ok(Response::new(futures::stream::iter(vec![Ok(ack)]).boxed()))
     }
 }
 
@@ -456,15 +532,116 @@ pub async fn pull_bucket_with_retry(
     Err(last.unwrap_or_else(|| Error::Execution("pull_bucket failed".into())))
 }
 
+/// Push one shuffle bucket to a worker over Flight `do_exchange`.
+///
+/// The receiver appends the batches into its local cache under `(stage_id, target_partition)`, so
+/// the same data remains readable via [`pull_bucket`] as a fallback path.
+pub async fn push_bucket(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(Schema::empty()));
+    push_bucket_with_schema(endpoint, stage_id, target_partition, schema, batches).await
+}
+
+/// Push one shuffle bucket with an explicit schema, useful when the bucket has zero rows.
+pub async fn push_bucket_with_schema(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    const MAX_TRIES: u32 = 3;
+    let mut last = None;
+    for attempt in 0..MAX_TRIES {
+        match push_bucket_once(
+            endpoint.clone(),
+            stage_id,
+            target_partition,
+            schema.clone(),
+            batches.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if is_pull_retryable(&e) && attempt + 1 < MAX_TRIES => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Execution("push_bucket failed".into())))
+}
+
+async fn push_bucket_once(
+    endpoint: String,
+    stage_id: u32,
+    target_partition: u32,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let header = exchange_header_frame(stage_id, target_partition);
+    let mut frames = vec![header];
+    let input = futures::stream::iter(batches.into_iter().map(Ok::<_, FlightError>));
+    let mut encoded = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(input);
+    while let Some(frame) = encoded.next().await {
+        frames.push(frame.map_err(|e| Error::Execution(format!("flight encode: {e}")))?);
+    }
+
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)
+        .map_err(|e| Error::Io(format!("endpoint: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
+    let mut client = FlightServiceClient::new(channel);
+    let mut stream = client
+        .do_exchange(futures::stream::iter(frames))
+        .await
+        .map_err(|e| Error::Execution(format!("do_exchange: {}", e.message())))?
+        .into_inner();
+    while let Some(item) = stream.next().await {
+        item.map_err(|e| Error::Execution(format!("do_exchange stream: {e}")))?;
+    }
+    Ok(())
+}
+
+fn exchange_header_frame(stage_id: u32, partition_id: u32) -> FlightData {
+    let header = ShuffleExchangeHeader {
+        stage_id,
+        partition_id,
+    }
+    .encode();
+    FlightData {
+        flight_descriptor: None,
+        data_header: Vec::new().into(),
+        app_metadata: header.to_vec().into(),
+        data_body: Vec::new().into(),
+    }
+}
+
 fn is_pull_retryable(err: &Error) -> bool {
     let s = err.to_string().to_ascii_lowercase();
-    s.contains("connect") || s.contains("unavailable") || s.contains("do_get")
+    s.contains("connect")
+        || s.contains("unavailable")
+        || s.contains("do_get")
+        || s.contains("do_exchange")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use weft_loom::arrow::array::Int32Array;
+    use weft_loom::arrow::datatypes::{DataType, Field};
 
     #[tokio::test]
     async fn distributed_single_stage_roundtrip() {
@@ -610,5 +787,51 @@ mod tests {
             }
         }
         out.expect("consumer over empty typed bucket should plan and run");
+    }
+
+    #[tokio::test]
+    async fn do_exchange_pushes_partition_then_pull_reads_it() {
+        let port = 50564;
+        let engine = Arc::new(Engine::new());
+        tokio::spawn(async move {
+            let _ = serve_worker(port, engine).await;
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let mut pushed = false;
+        for _ in 0..50 {
+            match push_bucket_with_schema(
+                endpoint.clone(),
+                99,
+                2,
+                schema.clone(),
+                vec![batch.clone()],
+            )
+            .await
+            {
+                Ok(()) => {
+                    pushed = true;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        assert!(pushed, "worker did not accept do_exchange push");
+
+        let pulled = pull_bucket(endpoint, 99, 2).await.unwrap();
+        assert_eq!(pulled.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let values = pulled[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 10);
+        assert_eq!(values.value(2), 30);
     }
 }
