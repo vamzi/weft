@@ -182,17 +182,15 @@ async fn run_stage_inner_impl(
     {
         if let Err(e) = recompute_upstream_producers(membership, &ticket, lineage, stages).await {
             last_err = Some(e);
-        } else {
-            if worker_accepts_task(primary.clone()).await {
-                match run_stage_on_worker(primary.clone(), ticket.clone()).await {
-                    Ok(b) => return Ok(b),
-                    Err(e) => last_err = Some(e),
-                }
-            } else {
-                last_err = Some(Error::Execution(format!(
-                    "worker has no free task slots: {primary}"
-                )));
+        } else if worker_accepts_task(primary.clone()).await {
+            match run_stage_on_worker(primary.clone(), ticket.clone()).await {
+                Ok(b) => return Ok(b),
+                Err(e) => last_err = Some(e),
             }
+        } else {
+            last_err = Some(Error::Execution(format!(
+                "worker has no free task slots: {primary}"
+            )));
         }
     }
 

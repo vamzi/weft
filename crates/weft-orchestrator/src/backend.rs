@@ -273,6 +273,7 @@ impl ClusterBackend for K8sBackend {
                 return Ok(m.endpoints());
             }
         }
+        let _ = spec;
         let membership = StaticMembership::new(vec![]);
         Ok(membership.endpoints())
     }
