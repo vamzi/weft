@@ -84,7 +84,14 @@ async fn two_worker_shuffle_join_matches_single_node() {
     let expected = rows(&single.sql(SINGLE_SQL).await.unwrap());
 
     // Two workers; each holds half of orders AND half of customer under the base table names.
-    let (p0, p1) = (50581u16, 50582u16);
+    let p0 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let p1 = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
     let e0 = Arc::new(Engine::new());
     e0.register_batches("orders", vec![orders(0, ORDERS / 2, CUSTS)])
         .unwrap();

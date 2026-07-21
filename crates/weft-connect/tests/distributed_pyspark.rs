@@ -13,9 +13,10 @@ use weft_loom::arrow::record_batch::RecordBatch;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
-const PORT: u16 = 50570;
-const W0: u16 = 50571;
-const W1: u16 = 50572;
+// Keep clear of weft-execution distributed_* tests (50571–50634 range).
+const PORT: u16 = 50870;
+const W0: u16 = 50871;
+const W1: u16 = 50872;
 
 fn make_batch(start: i64, end: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![

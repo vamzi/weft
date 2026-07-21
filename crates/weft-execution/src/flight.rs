@@ -495,14 +495,23 @@ async fn do_get_batches(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<R
     Err(last_err.unwrap_or_else(|| Error::Execution("do_get failed".into())))
 }
 
-async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
-    // Build the channel via tonic directly (arrow-flight's generated client has no `connect`).
+/// Connect to a Flight worker with short timeouts so CI port conflicts fail fast instead of
+/// hanging on the default TCP SYN retry window (~minutes).
+async fn connect_flight(
+    endpoint: String,
+) -> Result<FlightServiceClient<tonic::transport::Channel>> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(30))
         .connect()
         .await
         .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    let mut client = FlightServiceClient::new(channel);
+    Ok(FlightServiceClient::new(channel))
+}
+
+async fn do_get_batches_once(endpoint: String, ticket_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
+    let mut client = connect_flight(endpoint).await?;
     let ticket = Ticket {
         ticket: ticket_bytes.into(),
     };
@@ -582,12 +591,7 @@ async fn do_action_collect(
     action_type: &str,
     body: &[u8],
 ) -> Result<Vec<Vec<u8>>> {
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
-        .map_err(|e| Error::Io(format!("endpoint: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    let mut client = FlightServiceClient::new(channel);
+    let mut client = connect_flight(endpoint).await?;
     let action = Action {
         r#type: action_type.to_string(),
         body: body.to_vec().into(),
@@ -748,12 +752,7 @@ async fn push_bucket_once(
         frames.push(frame.map_err(|e| Error::Execution(format!("flight encode: {e}")))?);
     }
 
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
-        .map_err(|e| Error::Io(format!("endpoint: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| Error::Io(format!("connect worker: {e}")))?;
-    let mut client = FlightServiceClient::new(channel);
+    let mut client = connect_flight(endpoint).await?;
     let mut stream = client
         .do_exchange(futures::stream::iter(frames))
         .await
@@ -815,7 +814,10 @@ mod tests {
 
     #[tokio::test]
     async fn distributed_single_stage_roundtrip() {
-        let port = 50561;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -848,7 +850,10 @@ mod tests {
 
     #[tokio::test]
     async fn stage_ticket_runs_as_leaf() {
-        let port = 50562;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -886,7 +891,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_shuffle_bucket_carries_producer_schema() {
-        let port = 50563;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
@@ -961,7 +969,10 @@ mod tests {
 
     #[tokio::test]
     async fn do_exchange_pushes_partition_then_pull_reads_it() {
-        let port = 50564;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
         let engine = Arc::new(Engine::new());
         tokio::spawn(async move {
             let _ = serve_worker(port, engine).await;
