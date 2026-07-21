@@ -19,6 +19,7 @@ datafusion = "54"        # SessionState/RuntimeEnv for deserializing physical-pl
 datafusion-proto = "54"  # serialize physical-plan fragments shipped in the Flight ticket
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 futures = "0.3"
+serde_json = "1"
 
 [features]
 default = []

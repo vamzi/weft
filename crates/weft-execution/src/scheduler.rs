@@ -8,7 +8,9 @@ use weft_common::{Error, Result};
 use weft_loom::arrow::record_batch::RecordBatch;
 
 use crate::driver::StageDef;
-use crate::flight::{health_check_worker, pull_bucket_with_retry, run_stage_on_worker};
+use crate::flight::{
+    health_check_worker, heartbeat_worker, pull_bucket_with_retry, run_stage_on_worker,
+};
 use crate::lineage::SharedLineage;
 use crate::membership::ClusterMembership;
 use crate::shuffle::protocol::StageTicket;
@@ -119,7 +121,7 @@ async fn run_stage_speculative(
             .filter(|e| e != &primary3)
             .collect();
         for alt in alts {
-            if health_check_worker(alt.clone()).await.is_ok() {
+            if worker_accepts_task(alt.clone()).await {
                 return run_stage_inner(&membership3, alt, ticket3.clone(), &lineage3, &stages3)
                     .await;
             }
@@ -147,6 +149,16 @@ async fn run_stage_inner_impl(
     let mut last_err = None;
 
     for attempt in 0..max {
+        if !worker_accepts_task(primary.clone()).await {
+            last_err = Some(Error::Execution(format!(
+                "worker has no free task slots: {primary}"
+            )));
+            if attempt + 1 < max {
+                tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                continue;
+            }
+            break;
+        }
         match run_stage_on_worker(primary.clone(), ticket.clone()).await {
             Ok(b) => {
                 if ticket.produce {
@@ -171,9 +183,15 @@ async fn run_stage_inner_impl(
         if let Err(e) = recompute_upstream_producers(membership, &ticket, lineage, stages).await {
             last_err = Some(e);
         } else {
-            match run_stage_on_worker(primary.clone(), ticket.clone()).await {
-                Ok(b) => return Ok(b),
-                Err(e) => last_err = Some(e),
+            if worker_accepts_task(primary.clone()).await {
+                match run_stage_on_worker(primary.clone(), ticket.clone()).await {
+                    Ok(b) => return Ok(b),
+                    Err(e) => last_err = Some(e),
+                }
+            } else {
+                last_err = Some(Error::Execution(format!(
+                    "worker has no free task slots: {primary}"
+                )));
             }
         }
     }
@@ -183,7 +201,7 @@ async fn run_stage_inner_impl(
         if tried.contains(&alt) {
             continue;
         }
-        if health_check_worker(alt.clone()).await.is_err() {
+        if !worker_accepts_task(alt.clone()).await {
             continue;
         }
         tried.push(alt.clone());
@@ -241,7 +259,7 @@ async fn recompute_upstream_producers(
                     consumer.upstream_endpoints.clone()
                 },
                 stage_sql: stage_def.sql.clone(),
-                plan_fragment: vec![],
+                plan_fragment: stage_def.plan_fragment.clone().unwrap_or_default(),
                 hash_key_cols: stage_def.hash_key_cols.clone(),
                 upstream_stage_ids: stage_def.upstream_stage_ids.clone(),
                 produce: true,
@@ -261,6 +279,19 @@ pub async fn healthy_endpoints(endpoints: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+async fn worker_accepts_task(endpoint: String) -> bool {
+    match heartbeat_worker(endpoint.clone()).await {
+        Ok(heartbeat) => heartbeat.has_available_slot(),
+        Err(e) if action_unimplemented(&e) => health_check_worker(endpoint).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn action_unimplemented(err: &Error) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("unimplemented") || s.contains("not implemented")
 }
 
 #[cfg(test)]

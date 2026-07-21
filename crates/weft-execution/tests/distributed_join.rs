@@ -117,12 +117,14 @@ async fn two_worker_shuffle_join_matches_single_node() {
             sql: "SELECT o_orderkey, o_custkey FROM orders".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![1],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT c_custkey, c_val FROM customer".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 2,
@@ -132,6 +134,7 @@ async fn two_worker_shuffle_join_matches_single_node() {
                 .into(),
             upstream_stage_ids: vec![0, 1],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 

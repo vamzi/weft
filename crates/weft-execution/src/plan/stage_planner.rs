@@ -235,24 +235,19 @@ fn shuffle_join_aggregation(p: &Peeled, sharded: &[&String]) -> Result<Distribut
 
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: sanitize_generated_sql(&left_sql),
-                upstream_stage_ids: vec![],
-                hash_key_cols: vec![left_key_idx],
-            },
-            StageDef {
-                stage_id: 1,
-                sql: sanitize_generated_sql(&right_sql),
-                upstream_stage_ids: vec![],
-                hash_key_cols: vec![right_key_idx],
-            },
-            StageDef {
-                stage_id: 2,
-                sql: final_sql,
-                upstream_stage_ids: vec![0, 1],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(
+                0,
+                sanitize_generated_sql(&left_sql),
+                vec![],
+                vec![left_key_idx],
+            ),
+            StageDef::new(
+                1,
+                sanitize_generated_sql(&right_sql),
+                vec![],
+                vec![right_key_idx],
+            ),
+            StageDef::new(2, final_sql, vec![0, 1], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -419,18 +414,8 @@ fn build_two_stage_grouped(p: &Peeled, tail: &str) -> Result<DistributedQuery> {
     let hash_key_cols: Vec<u32> = (0..group_sql.len() as u32).collect();
     Ok(DistributedQuery {
         stages: vec![
-            StageDef {
-                stage_id: 0,
-                sql: partial_sql,
-                upstream_stage_ids: vec![],
-                hash_key_cols,
-            },
-            StageDef {
-                stage_id: 1,
-                sql: final_sql,
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(0, partial_sql, vec![], hash_key_cols),
+            StageDef::new(1, final_sql, vec![0], vec![]),
         ],
         finalize_sql: build_finalize(p)?,
     })
@@ -523,12 +508,7 @@ fn global_aggregation_stages(p: &Peeled, replicated: &[&str]) -> Result<Distribu
     }
 
     Ok(DistributedQuery {
-        stages: vec![StageDef {
-            stage_id: 0,
-            sql: partial_sql,
-            upstream_stage_ids: vec![],
-            hash_key_cols: vec![],
-        }],
+        stages: vec![StageDef::new(0, partial_sql, vec![], vec![])],
         finalize_sql: Some(finalize),
     })
 }

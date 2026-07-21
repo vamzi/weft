@@ -106,6 +106,8 @@ pub async fn run(sf: f64, dir: &Path, num_workers: usize) {
                 upstream_stage_ids: s.upstream_stage_ids.iter().map(|u| u + base).collect(),
                 sql: s.sql.clone(),
                 hash_key_cols: s.hash_key_cols.clone(),
+                exchange: s.exchange,
+                plan_fragment: s.plan_fragment.clone(),
             })
             .collect();
 

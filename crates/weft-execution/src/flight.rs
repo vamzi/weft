@@ -42,6 +42,10 @@ pub const ACTION_CLEAR_STAGES: &str = "clear_stages";
 pub const ACTION_REGISTER_UDFS: &str = "register_udfs";
 /// Flight `do_action` type: liveness probe (driver heartbeats).
 pub const ACTION_HEALTH: &str = "health";
+/// Flight `do_action` type: liveness + slot probe.
+pub const ACTION_HEARTBEAT: &str = "heartbeat";
+/// Flight `do_action` type: accept/report simple task status payloads.
+pub const ACTION_TASK_STATUS: &str = "task_status";
 
 /// One stage's cached output: schema + partitioned buckets (memory or spilled).
 type CachedStage = (SchemaRef, BucketCache);
@@ -54,6 +58,9 @@ pub struct Worker {
     engine: Arc<Engine>,
     stage_outputs: StageCache,
     spill: Option<SpillStore>,
+    task_slots: usize,
+    active_tasks: Arc<Mutex<usize>>,
+    last_task_status: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Worker {
@@ -63,6 +70,9 @@ impl Worker {
             engine,
             stage_outputs: Arc::new(Mutex::new(HashMap::new())),
             spill: SpillStore::from_env(),
+            task_slots: worker_task_slots(),
+            active_tasks: Arc::new(Mutex::new(0)),
+            last_task_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,6 +88,74 @@ impl Worker {
             .expect("stage cache poisoned")
             .clear();
     }
+
+    fn active_task_count(&self) -> usize {
+        *self.active_tasks.lock().expect("task counter poisoned")
+    }
+
+    fn heartbeat_payload(&self) -> String {
+        serde_json::json!({
+            "ok": true,
+            "slots_total": self.task_slots,
+            "slots_used": self.active_task_count(),
+        })
+        .to_string()
+    }
+
+    fn task_status_payload(&self) -> String {
+        let last_task_status = self
+            .last_task_status
+            .lock()
+            .expect("task status poisoned")
+            .as_ref()
+            .map(|body| String::from_utf8_lossy(body).into_owned());
+        serde_json::json!({
+            "ok": true,
+            "slots_total": self.task_slots,
+            "slots_used": self.active_task_count(),
+            "last_task_status": last_task_status,
+        })
+        .to_string()
+    }
+
+    fn try_acquire_task_slot(&self) -> std::result::Result<TaskSlotGuard, Status> {
+        let mut active = self.active_tasks.lock().expect("task counter poisoned");
+        if *active >= self.task_slots {
+            return Err(Status::resource_exhausted(format!(
+                "no task slots available ({}/{})",
+                *active, self.task_slots
+            )));
+        }
+        *active += 1;
+        Ok(TaskSlotGuard {
+            active_tasks: self.active_tasks.clone(),
+        })
+    }
+}
+
+struct TaskSlotGuard {
+    active_tasks: Arc<Mutex<usize>>,
+}
+
+impl Drop for TaskSlotGuard {
+    fn drop(&mut self) {
+        let mut active = self.active_tasks.lock().expect("task counter poisoned");
+        *active = active.saturating_sub(1);
+    }
+}
+
+/// Number of concurrent stage tasks this worker should admit.
+pub fn worker_task_slots() -> usize {
+    std::env::var("WEFT_WORKER_TASK_SLOTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .max(1)
 }
 
 type FlightStream<T> =
@@ -101,6 +179,13 @@ fn batches_to_stream(batches: Vec<RecordBatch>) -> FlightStream<FlightData> {
         .build(input)
         .map_err(|e| Status::internal(e.to_string()))
         .boxed()
+}
+
+fn action_response(body: impl Into<Vec<u8>>) -> Response<FlightStream<arrow_flight::Result>> {
+    let body = arrow_flight::Result {
+        body: body.into().into(),
+    };
+    Response::new(futures::stream::iter(vec![Ok(body)]).boxed())
 }
 
 impl Worker {
@@ -245,7 +330,10 @@ impl FlightService for Worker {
                 .sql(&sql)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?,
-            protocol::Ticket::Stage(t) => self.run_stage(t).await?,
+            protocol::Ticket::Stage(t) => {
+                let _slot = self.try_acquire_task_slot()?;
+                self.run_stage(t).await?
+            }
             protocol::Ticket::ShuffleRead(r) => self.read_shuffle(r),
         };
         Ok(Response::new(batches_to_stream(batches)))
@@ -295,26 +383,23 @@ impl FlightService for Worker {
         match action.r#type.as_str() {
             ACTION_CLEAR_STAGES => {
                 self.clear_stages();
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+                Ok(action_response(b"ok".to_vec()))
             }
             ACTION_REGISTER_UDFS => {
                 let payload = String::from_utf8_lossy(&action.body);
                 self.engine
                     .register_udfs_json(&payload)
                     .map_err(|e| Status::internal(e.to_string()))?;
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+                Ok(action_response(b"ok".to_vec()))
             }
-            ACTION_HEALTH => {
-                let body = arrow_flight::Result {
-                    body: b"ok".to_vec().into(),
-                };
-                Ok(Response::new(futures::stream::iter(vec![Ok(body)]).boxed()))
+            ACTION_HEALTH => Ok(action_response(b"ok".to_vec())),
+            ACTION_HEARTBEAT => Ok(action_response(self.heartbeat_payload().into_bytes())),
+            ACTION_TASK_STATUS => {
+                if !action.body.is_empty() {
+                    *self.last_task_status.lock().expect("task status poisoned") =
+                        Some(action.body.to_vec());
+                }
+                Ok(action_response(self.task_status_payload().into_bytes()))
             }
             other => Err(Status::unimplemented(format!(
                 "flight do_action `{other}` not implemented"
@@ -461,7 +546,42 @@ pub async fn health_check_worker(endpoint: String) -> Result<()> {
     do_action(endpoint, ACTION_HEALTH, b"").await
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerHeartbeat {
+    pub slots_total: Option<usize>,
+    pub slots_used: Option<usize>,
+}
+
+impl WorkerHeartbeat {
+    pub fn has_available_slot(&self) -> bool {
+        match (self.slots_total, self.slots_used) {
+            (Some(total), Some(used)) => used < total,
+            _ => true,
+        }
+    }
+}
+
+/// Heartbeat probe. New workers return slot metadata; older `ok`-only workers are accepted.
+pub async fn heartbeat_worker(endpoint: String) -> Result<WorkerHeartbeat> {
+    let bodies = do_action_collect(endpoint, ACTION_HEARTBEAT, b"").await?;
+    Ok(parse_heartbeat_bodies(&bodies))
+}
+
+/// Send or fetch the worker's simple task status payload.
+pub async fn task_status_worker(endpoint: String, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+    do_action_collect(endpoint, ACTION_TASK_STATUS, payload).await
+}
+
 async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<()> {
+    do_action_collect(endpoint, action_type, body).await?;
+    Ok(())
+}
+
+async fn do_action_collect(
+    endpoint: String,
+    action_type: &str,
+    body: &[u8],
+) -> Result<Vec<Vec<u8>>> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(|e| Error::Io(format!("endpoint: {e}")))?
         .connect()
@@ -477,10 +597,40 @@ async fn do_action(endpoint: String, action_type: &str, body: &[u8]) -> Result<(
         .await
         .map_err(|e| Error::Execution(format!("do_action: {}", e.message())))?
         .into_inner();
+    let mut bodies = Vec::new();
     while let Some(item) = stream.next().await {
-        item.map_err(|e| Error::Execution(format!("do_action stream: {e}")))?;
+        bodies.push(
+            item.map_err(|e| Error::Execution(format!("do_action stream: {e}")))?
+                .body
+                .to_vec(),
+        );
     }
-    Ok(())
+    Ok(bodies)
+}
+
+fn parse_heartbeat_bodies(bodies: &[Vec<u8>]) -> WorkerHeartbeat {
+    bodies
+        .iter()
+        .find_map(|body| parse_heartbeat_payload(body))
+        .unwrap_or_default()
+}
+
+fn parse_heartbeat_payload(body: &[u8]) -> Option<WorkerHeartbeat> {
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if text.is_empty() || text == "ok" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(WorkerHeartbeat {
+        slots_total: value
+            .get("slots_total")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        slots_used: value
+            .get("slots_used")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+    })
 }
 
 /// Driver: send raw `sql` to a worker over Flight and collect the result (single-stage path).
@@ -642,6 +792,26 @@ mod tests {
     use super::*;
     use weft_loom::arrow::array::Int32Array;
     use weft_loom::arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn heartbeat_payload_parses_slots() {
+        let heartbeat =
+            parse_heartbeat_payload(br#"{"ok":true,"slots_total":4,"slots_used":2}"#).unwrap();
+        assert_eq!(heartbeat.slots_total, Some(4));
+        assert_eq!(heartbeat.slots_used, Some(2));
+        assert!(heartbeat.has_available_slot());
+
+        let full =
+            parse_heartbeat_payload(br#"{"ok":true,"slots_total":4,"slots_used":4}"#).unwrap();
+        assert!(!full.has_available_slot());
+    }
+
+    #[test]
+    fn ok_heartbeat_is_backward_compatible() {
+        let heartbeat = parse_heartbeat_bodies(&[b"ok".to_vec()]);
+        assert_eq!(heartbeat, WorkerHeartbeat::default());
+        assert!(heartbeat.has_available_slot());
+    }
 
     #[tokio::test]
     async fn distributed_single_stage_roundtrip() {

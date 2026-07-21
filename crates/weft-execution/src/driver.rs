@@ -6,7 +6,8 @@
 //! owner, pulling upstream buckets and returning results.
 //!
 //! Shuffle partition count defaults to worker count but can be overridden via
-//! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`).
+//! `WEFT_SHUFFLE_PARTITIONS` (like `spark.sql.shuffle.partitions`) or, when that is unset,
+//! `WEFT_DEFAULT_PARALLELISM`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +29,12 @@ pub fn shuffle_partitions(worker_count: usize) -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n: &u32| n > 0)
+        .or_else(|| {
+            std::env::var("WEFT_DEFAULT_PARALLELISM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &u32| n > 0)
+        })
         .unwrap_or(worker_count.max(1) as u32)
 }
 
@@ -82,6 +89,15 @@ impl Cluster {
     }
 }
 
+/// How a stage exchanges data with downstream stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExchangeMode {
+    #[default]
+    Hash,
+    Broadcast,
+    Forward,
+}
+
 /// One stage of a distributed query.
 #[derive(Debug, Clone)]
 pub struct StageDef {
@@ -89,6 +105,38 @@ pub struct StageDef {
     pub sql: String,
     pub upstream_stage_ids: Vec<u32>,
     pub hash_key_cols: Vec<u32>,
+    pub exchange: ExchangeMode,
+    pub plan_fragment: Option<Vec<u8>>,
+}
+
+impl Default for StageDef {
+    fn default() -> Self {
+        Self {
+            stage_id: 0,
+            sql: String::new(),
+            upstream_stage_ids: Vec::new(),
+            hash_key_cols: Vec::new(),
+            exchange: ExchangeMode::Hash,
+            plan_fragment: None,
+        }
+    }
+}
+
+impl StageDef {
+    pub fn new(
+        stage_id: u32,
+        sql: impl Into<String>,
+        upstream_stage_ids: Vec<u32>,
+        hash_key_cols: Vec<u32>,
+    ) -> Self {
+        Self {
+            stage_id,
+            sql: sql.into(),
+            upstream_stage_ids,
+            hash_key_cols,
+            ..Self::default()
+        }
+    }
 }
 
 /// A two-stage distributed aggregation plan: `partial-agg → hash shuffle → final-agg`.
@@ -102,18 +150,13 @@ pub struct DistributedPlan {
 impl DistributedPlan {
     pub fn into_stages(&self) -> Vec<StageDef> {
         vec![
-            StageDef {
-                stage_id: 0,
-                sql: self.partial_sql.clone(),
-                upstream_stage_ids: vec![],
-                hash_key_cols: self.hash_key_cols.clone(),
-            },
-            StageDef {
-                stage_id: 1,
-                sql: self.final_sql.clone(),
-                upstream_stage_ids: vec![0],
-                hash_key_cols: vec![],
-            },
+            StageDef::new(
+                0,
+                self.partial_sql.clone(),
+                vec![],
+                self.hash_key_cols.clone(),
+            ),
+            StageDef::new(1, self.final_sql.clone(), vec![0], vec![]),
         ]
     }
 }
@@ -408,7 +451,7 @@ fn stage_ticket(
             cluster.workers.clone()
         },
         stage_sql: stage.sql.clone(),
-        plan_fragment: vec![],
+        plan_fragment: stage.plan_fragment.clone().unwrap_or_default(),
         hash_key_cols: stage.hash_key_cols.clone(),
         upstream_stage_ids: stage.upstream_stage_ids.clone(),
         produce,
@@ -437,5 +480,17 @@ mod tests {
         let o1 = cluster.owner_endpoint(1).unwrap();
         assert!(o0 == "a:1" || o0 == "b:1");
         assert!(o1 == "a:1" || o1 == "b:1");
+    }
+
+    #[test]
+    fn stage_def_constructor_sets_additive_defaults() {
+        let mut stage = StageDef::new(7, "SELECT 1", vec![3], vec![0]);
+        assert_eq!(stage.exchange, ExchangeMode::Hash);
+        assert_eq!(stage.plan_fragment, None);
+
+        stage.plan_fragment = Some(vec![1, 2, 3]);
+        let cluster = Cluster::new(vec!["a:1".into()]);
+        let ticket = stage_ticket(&stage, 0, 1, &cluster, true);
+        assert_eq!(ticket.plan_fragment, vec![1, 2, 3]);
     }
 }

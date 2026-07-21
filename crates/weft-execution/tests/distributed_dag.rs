@@ -125,12 +125,14 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
             sql: "SELECT o_orderkey, o_custkey, o_region FROM orders".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![1],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT c_custkey, c_val FROM customer".into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 2,
@@ -139,6 +141,7 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
                 .into(),
             upstream_stage_ids: vec![0, 1],
             hash_key_cols: vec![0], // re-shuffle the join output by region
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 3,
@@ -146,6 +149,7 @@ async fn multi_shuffle_dag_with_intermediate_stage() {
                 .into(),
             upstream_stage_ids: vec![2],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 
@@ -208,12 +212,14 @@ async fn replicated_small_table_join() {
                 .into(),
             upstream_stage_ids: vec![],
             hash_key_cols: vec![0],
+            ..StageDef::default()
         },
         StageDef {
             stage_id: 1,
             sql: "SELECT k, SUM(s) AS s, SUM(n) AS n FROM shuffle_input GROUP BY k".into(),
             upstream_stage_ids: vec![0],
             hash_key_cols: vec![],
+            ..StageDef::default()
         },
     ];
 
