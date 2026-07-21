@@ -146,6 +146,9 @@ mod tests {
             exchange: ExchangeMode::Forward,
             ..StageDef::default()
         };
-        assert_eq!(stage_num_tasks(&stage, &[stage.clone()], &cluster), 1);
+        assert_eq!(
+            stage_num_tasks(&stage, std::slice::from_ref(&stage), &cluster),
+            1
+        );
     }
 }
