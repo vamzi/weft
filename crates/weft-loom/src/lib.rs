@@ -5131,7 +5131,6 @@ mod tests {
             .downcast_ref::<Date32Array>()
             .unwrap();
         assert_eq!(col.value(0), 8674); // 1993-10-01
-                                        // Year / month forms used by Q5/Q6/Q12/Q14/Q15/Q20.
         let y = engine
             .sql("SELECT date '1994-01-01' + interval '1' year AS d")
             .await
