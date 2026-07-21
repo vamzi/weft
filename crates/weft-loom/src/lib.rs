@@ -2198,13 +2198,13 @@ impl Engine {
     }
 
     /// Build the (unoptimized) logical plan for a SQL query, without executing it.
-    /// Used by Spark Connect `AnalyzePlan(Explain)` for a `spark.sql(...)` command.
+    /// Used by Spark Connect `AnalyzePlan(Explain)` for a `spark.sql(...)` command, and by the
+    /// distributed stage planner. Applies the same [`normalize_spark_sql`] front-end as
+    /// [`Engine::sql`] so ANSI interval leading precision (`day (3)`) and other Spark spellings
+    /// plan consistently on both paths.
     pub async fn logical_plan(&self, query: &str) -> Result<datafusion::logical_expr::LogicalPlan> {
-        self.ctx
-            .state()
-            .create_logical_plan(query)
-            .await
-            .map_err(|e| Error::Plan(e.to_string()))
+        let query = normalize_spark_sql(query);
+        self.create_logical_plan_spark(query.as_ref()).await
     }
 
     /// Render a Spark-style `EXPLAIN` string for a logical plan, for Spark Connect
