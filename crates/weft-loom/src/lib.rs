@@ -153,7 +153,8 @@ fn split_name_segments(name: &str) -> Vec<&str> {
 
 pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     // Passes run in order: (1) the leading-keyword DDL rewrite, (2) Spark single-quoted
-    // string-literal unescaping, (3) the typed-literal rewrite over the result. Unescaping runs
+    // string-literal unescaping, (3) the typed-literal rewrite over the result, (4) strip ANSI
+    // INTERVAL leading-precision qualifiers (`day (3)`) that DataFusion rejects. Unescaping runs
     // BEFORE the typed-literal pass for two reasons: the re-emitted literals use `''` quote-doubling
     // (which the typed-literal scanner understands) instead of Spark's `\'`, and a numeric token
     // freed by a mis-delimited `\'` can therefore never be mistaken for code and wrapped in a CAST.
@@ -162,16 +163,183 @@ pub fn normalize_spark_sql(query: &str) -> std::borrow::Cow<'_, str> {
     let unescaped = unescape_spark_string_literals(base);
     let base2 = unescaped.as_deref().unwrap_or(base);
     let typed = rewrite_spark_typed_literals(base2);
-    match typed {
-        Some(t) => std::borrow::Cow::Owned(t),
-        None => match unescaped {
-            Some(u) => std::borrow::Cow::Owned(u),
-            None => match stripped {
-                Some(s) => std::borrow::Cow::Owned(s),
-                None => std::borrow::Cow::Borrowed(query),
+    let base3 = typed.as_deref().unwrap_or(base2);
+    let interval = strip_interval_leading_precision(base3);
+    match interval {
+        Some(i) => std::borrow::Cow::Owned(i),
+        None => match typed {
+            Some(t) => std::borrow::Cow::Owned(t),
+            None => match unescaped {
+                Some(u) => std::borrow::Cow::Owned(u),
+                None => match stripped {
+                    Some(s) => std::borrow::Cow::Owned(s),
+                    None => std::borrow::Cow::Borrowed(query),
+                },
             },
         },
     }
+}
+
+/// Strip ANSI SQL-92 interval *leading precision* qualifiers that TPC-H emits
+/// (`interval '90' day (3)`) but DataFusion rejects (`Unsupported Interval Expression with
+/// leading_precision`). Only touches `INTERVAL '<literal>' <unit> (N)` — leaves function calls
+/// like `day(col)` alone. Returns `None` when nothing changed.
+fn strip_interval_leading_precision(sql: &str) -> Option<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    let mut changed = false;
+
+    while i < n {
+        // Copy quoted regions verbatim so string content is never rewritten.
+        if b[i] == b'\'' || b[i] == b'"' {
+            let quote = b[i];
+            let start = i;
+            i += 1;
+            while i < n {
+                if b[i] == quote {
+                    if i + 1 < n && b[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += utf8_len(b[i]).min(n - i);
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        if let Some(end) = match_interval_with_precision(b, i) {
+            // Emit INTERVAL … <unit> and skip the `(N)` precision.
+            out.push_str(&sql[i..end.unit_end]);
+            i = end.after_precision;
+            changed = true;
+            continue;
+        }
+
+        let len = utf8_len(b[i]).min(n - i);
+        out.push_str(&sql[i..i + len]);
+        i += len;
+    }
+
+    changed.then_some(out)
+}
+
+/// If `sql[i..]` starts with `INTERVAL '<lit>' <unit> (N)`, return the end of the unit token and
+/// the index just past the closing `)`.
+fn match_interval_with_precision(b: &[u8], i: usize) -> Option<IntervalPrecisionMatch> {
+    if !interval_keyword_at(b, i) {
+        return None;
+    }
+    let n = b.len();
+    let mut j = i + 8; // len("interval")
+
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= n || b[j] != b'\'' {
+        return None;
+    }
+    j += 1;
+    while j < n {
+        if b[j] == b'\'' {
+            if j + 1 < n && b[j + 1] == b'\'' {
+                j += 2;
+                continue;
+            }
+            j += 1;
+            break;
+        }
+        j += utf8_len(b[j]).min(n - j);
+    }
+
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let unit_len = interval_unit_len(&b[j..])?;
+    let unit_end = j + unit_len;
+    j = unit_end;
+
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= n || b[j] != b'(' {
+        return None;
+    }
+    j += 1;
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let dig_start = j;
+    while j < n && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == dig_start {
+        return None;
+    }
+    while j < n && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= n || b[j] != b')' {
+        return None;
+    }
+    Some(IntervalPrecisionMatch {
+        unit_end,
+        after_precision: j + 1,
+    })
+}
+
+struct IntervalPrecisionMatch {
+    unit_end: usize,
+    after_precision: usize,
+}
+
+fn interval_keyword_at(b: &[u8], i: usize) -> bool {
+    const KW: &[u8] = b"interval";
+    if i + KW.len() > b.len() {
+        return false;
+    }
+    if i > 0 {
+        let prev = b[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' {
+            return false;
+        }
+    }
+    if !b[i..i + KW.len()].eq_ignore_ascii_case(KW) {
+        return false;
+    }
+    let after = i + KW.len();
+    if after < b.len() {
+        let next = b[after];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+fn interval_unit_len(b: &[u8]) -> Option<usize> {
+    // Longer units first so `years` wins over `year`.
+    const UNITS: &[&[u8]] = &[
+        b"years", b"year", b"months", b"month", b"days", b"day", b"hours", b"hour", b"minutes",
+        b"minute", b"seconds", b"second",
+    ];
+    for u in UNITS {
+        if b.len() >= u.len() && b[..u.len()].eq_ignore_ascii_case(u) {
+            let after = u.len();
+            if after < b.len() {
+                let next = b[after];
+                if next.is_ascii_alphanumeric() || next == b'_' {
+                    continue;
+                }
+            }
+            return Some(u.len());
+        }
+    }
+    None
 }
 
 /// Reproduce Spark's parse-time `unescapeSQLString` over every single-quoted string literal, then
@@ -4909,9 +5077,75 @@ mod tests {
             "CREATE TABLE t(a INT)",
             "CREATE TEMPORARY FUNCTION f AS 'x'",
             "INSERT INTO t VALUES (1)",
+            // Bare INTERVAL without leading precision is already DataFusion-legal.
+            "SELECT date '1998-12-01' - interval '90' day AS d",
+            // day(col) must not be confused with INTERVAL day (N).
+            "SELECT day(ts) FROM t",
         ] {
             assert_eq!(normalize_spark_sql(q), q, "should not rewrite: {q}");
         }
+    }
+
+    #[test]
+    fn normalize_strips_interval_leading_precision() {
+        // TPC-H Q1 canonical form — ANSI day (3) leading precision.
+        assert_eq!(
+            normalize_spark_sql(
+                "SELECT date '1998-12-01' - interval '90' day (3) AS d"
+            ),
+            "SELECT date '1998-12-01' - interval '90' day AS d"
+        );
+        assert_eq!(
+            normalize_spark_sql(
+                "SELECT DATE '1998-12-01' - INTERVAL '63' DAY(3) AS d"
+            ),
+            "SELECT DATE '1998-12-01' - INTERVAL '63' DAY AS d"
+        );
+        // Precision must not be stripped from string content that merely looks similar.
+        let inside = "SELECT 'interval ''90'' day (3)' AS s";
+        assert_eq!(normalize_spark_sql(inside), inside);
+    }
+
+    #[tokio::test]
+    async fn tpch_interval_date_arithmetic() {
+        use arrow::array::{Array, Date32Array};
+        let engine = Engine::new();
+        // Q1 cutoff: 1998-12-01 − 90 days = 1998-09-02 (with and without ANSI precision).
+        for sql in [
+            "SELECT date '1998-12-01' - interval '90' day AS d",
+            "SELECT date '1998-12-01' - interval '90' day (3) AS d",
+        ] {
+            let batches = engine.sql(sql).await.unwrap();
+            let col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap();
+            // Date32 epoch days for 1998-09-02.
+            assert_eq!(col.value(0), 10471, "sql={sql}");
+        }
+        // Q4 / Q10 style month arithmetic.
+        let m = engine
+            .sql("SELECT date '1993-07-01' + interval '3' month AS d")
+            .await
+            .unwrap();
+        let col = m[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 8674); // 1993-10-01
+        // Year / month forms used by Q5/Q6/Q12/Q14/Q15/Q20.
+        let y = engine
+            .sql("SELECT date '1994-01-01' + interval '1' year AS d")
+            .await
+            .unwrap();
+        let col = y[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 9131); // 1995-01-01
     }
 
     #[test]
