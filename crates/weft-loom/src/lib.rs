@@ -5090,15 +5090,11 @@ mod tests {
     fn normalize_strips_interval_leading_precision() {
         // TPC-H Q1 canonical form — ANSI day (3) leading precision.
         assert_eq!(
-            normalize_spark_sql(
-                "SELECT date '1998-12-01' - interval '90' day (3) AS d"
-            ),
+            normalize_spark_sql("SELECT date '1998-12-01' - interval '90' day (3) AS d"),
             "SELECT date '1998-12-01' - interval '90' day AS d"
         );
         assert_eq!(
-            normalize_spark_sql(
-                "SELECT DATE '1998-12-01' - INTERVAL '63' DAY(3) AS d"
-            ),
+            normalize_spark_sql("SELECT DATE '1998-12-01' - INTERVAL '63' DAY(3) AS d"),
             "SELECT DATE '1998-12-01' - INTERVAL '63' DAY AS d"
         );
         // Precision must not be stripped from string content that merely looks similar.
@@ -5135,7 +5131,7 @@ mod tests {
             .downcast_ref::<Date32Array>()
             .unwrap();
         assert_eq!(col.value(0), 8674); // 1993-10-01
-        // Year / month forms used by Q5/Q6/Q12/Q14/Q15/Q20.
+                                        // Year / month forms used by Q5/Q6/Q12/Q14/Q15/Q20.
         let y = engine
             .sql("SELECT date '1994-01-01' + interval '1' year AS d")
             .await
