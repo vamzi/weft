@@ -39,7 +39,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build-test:
-    name: clippy + test + tpch
+    name: clippy + test + tpch + tpcds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
