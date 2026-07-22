@@ -47,6 +47,10 @@ The `weft` binary also has `worker` and `driver` subcommands for a Flight-based
 driver/worker cluster (`weft worker --port ...`, `weft driver --workers h:p,... --partial-sql ... --final-sql ...`).
 Not needed for the basic single-server flow.
 
+For **Kubernetes / EKS** (Helm: one connect-server + N workers, AWS CLI baked into the
+image), see [`docs/distributed-k8s.md`](docs/distributed-k8s.md). Local TPC-H distributed
+gate: `cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2`.
+
 ### CI gotchas (commit / push / PR)
 
 GitHub Actions gates live in `.github/workflows/ci.yml`. Before pushing, run
