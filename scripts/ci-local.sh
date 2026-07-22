@@ -25,6 +25,13 @@ cargo run -p weft-bench -- tpch
 echo "==> tpch-distributed"
 WEFT_TPCH_DIST_REQUIRE_ALL=1 cargo run -p weft-bench -- tpch-distributed --sf 0.01 --workers 2
 
+echo "==> tpcds (requires duckdb on PATH)"
+if ! command -v duckdb >/dev/null 2>&1; then
+  echo "duckdb CLI not found — install from https://duckdb.org/docs/installation/ (needed for dsdgen)" >&2
+  exit 1
+fi
+cargo run -p weft-bench -- tpcds --sf 0.01
+
 echo "==> clickbench (engine-direct)"
 cargo run -p weft-bench -- clickbench --rows 20000
 

@@ -63,6 +63,13 @@ jobs:
         run: cargo run -p weft-bench -- tpch-distributed --sf 0.05 --workers 3
         env:
           WEFT_TPCH_DIST_REQUIRE_ALL: "1"
+      - name: Install DuckDB CLI (TPC-DS dsdgen + oracle)
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.3.2/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          duckdb --version
+      - name: TPC-DS coverage (Q1–Q99, sf0.01, pass-set ratchet)
+        run: cargo run -p weft-bench -- tpcds --sf 0.01
       - name: Distributed correctness gate
         run: cargo run -p weft-bench -- correctness-distributed --rows 2000
 

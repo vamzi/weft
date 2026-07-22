@@ -32,6 +32,8 @@ use weft_loom::arrow::ipc::reader::StreamReader;
 use weft_loom::Engine;
 use weft_proto::spark::connect as sc;
 
+mod tpcds;
+mod tpcds_data;
 mod tpch;
 mod tpch_data;
 mod tpch_dist;
@@ -738,8 +740,16 @@ async fn main() {
                 tpch_dist::run(sf, Path::new(&dir), workers).await;
             }
         }
+        Some("tpcds") => {
+            let sf: f64 = flag(&args, "--sf").unwrap_or(0.01);
+            let dir = data
+                .unwrap_or_else(|| format!("{}/weft-tpcds-sf{sf}", std::env::temp_dir().display()));
+            tpcds::run(sf, Path::new(&dir)).await;
+        }
         Some(other) => {
-            eprintln!("unknown subcommand: {other}; try `clickbench` or `clickbench-grpc`");
+            eprintln!(
+                "unknown subcommand: {other}; try `clickbench`, `clickbench-grpc`, `tpch`, or `tpcds`"
+            );
             std::process::exit(2);
         }
     }
